@@ -38,6 +38,8 @@ python app.py
 
 Abra `http://127.0.0.1:8765`. Não exponha a porta na internet: o painel **não tem autenticação**.
 
+Cada clique em **Iniciar bot** executa um único ciclo de coleta e encerra automaticamente. Para buscar de novo, clique em **Iniciar bot** outra vez. Não existe agendamento recorrente nem intervalo automático; **Parar bot** interrompe o ciclo em andamento.
+
 ## Deploy com Neon/PostgreSQL
 
 - A aplicação usa SQLite local quando `DATABASE_URL` não está definida e PostgreSQL quando ela aponta para Neon.

@@ -11,7 +11,6 @@ import os
 import re
 import sqlite3
 import threading
-import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
@@ -50,7 +49,6 @@ COPILOT_UPLOADS_DIR = os.environ.get(
 FAVICON_PATH = os.path.join(ROOT, "assets", "public", "odradek-icon.png")
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8765"))
-POLL_SECONDS = 15 * 60
 LOG = logging.getLogger("odradek-scraper")
 
 # Estrutura persistente. As vagas são deduplicadas pela impressão digital; cartas e execuções
@@ -103,7 +101,6 @@ DEFAULT_SETTINGS = {
     "keywords": "software engineer, desenvolvedor, developer, backend, frontend, full stack, data engineer, devops",
     "locations": "remote, remoto, brazil, brasil, worldwide, anywhere",
     "sources": "remotive,remoteok",
-    "interval_minutes": "15",
     "ai_provider": "gemini",
     "ai_model": "gemini-2.5-flash",
     "candidate_name": "",
@@ -2293,7 +2290,7 @@ PROVIDERS = {"remotive": fetch_remotive, "remoteok": fetch_remoteok, "adzuna": f
 
 
 class Collector:
-    """Executa consultas em segundo plano e permite iniciar/parar pelo painel."""
+    """Executa uma única consulta por clique; uma nova coleta exige novo clique."""
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
@@ -2342,31 +2339,24 @@ class Collector:
                 log_event("info", "collector", "Parada solicitada; aguardando fim da busca atual.")
 
     def _loop(self) -> None:
-        while not self.stop_event.is_set():
+        """Roda um único ciclo e finaliza; não agenda novas buscas automaticamente."""
+        try:
             with self.lock:
                 self.next_run_at = None
             self._run_once()
-            if self.stop_event.is_set():
-                break
-            cfg = settings()
-            try:
-                seconds = max(1, int(cfg.get("interval_minutes", "15"))) * 60
-            except ValueError:
-                seconds = POLL_SECONDS
-            next_at = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+        except Exception as exc:
+            LOG.exception("Falha no ciclo de coleta")
+            self._set_progress(f"Coleta encerrada com erro: {exc.__class__.__name__}.")
+            log_event("error", "collector", f"Falha no ciclo: {exc}")
+        finally:
             with self.lock:
-                self.next_run_at = next_at.isoformat(timespec="seconds")
-                mins = seconds // 60
-                secs = seconds % 60
-                wait_label = f"{mins} min" if secs == 0 else f"{mins} min {secs}s"
-                self.message = f"Aguardando próxima busca ({wait_label})…"
-            if self.stop_event.wait(seconds):
-                break
-        with self.lock:
-            self.state = "stopped"
-            self.message = "Coleta parada"
-            self.next_run_at = None
-        log_event("info", "collector", "Coleta parada.")
+                self.state = "stopped"
+                self.next_run_at = None
+                if self.stop_event.is_set():
+                    self.message = "Coleta interrompida. Clique em Iniciar para executar outra vez."
+                elif "erro" not in self.message.casefold():
+                    self.message += " Clique em Iniciar para executar outra vez."
+            log_event("info", "collector", "Ciclo encerrado; nenhuma nova busca foi agendada.")
 
     def _run_once(self) -> None:
         started = now_iso()
@@ -3740,13 +3730,13 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
 <main class="content">{notice_html}
 
 <div id="tab-painel" class="tab-panel active">
-<section class="panel runbar"><div class="actions" style="margin:0"><form method="post" action="/start" class="js-process-form"><button>Iniciar bot</button></form><form method="post" action="/stop" class="js-process-form"><button class="stop">Parar bot</button></form><span class="runtime" id="runtime-message">{esc(status['message'])}</span>{collector_timer_html}</div></section>
+<section class="panel runbar"><div class="actions" style="margin:0"><form method="post" action="/start" class="js-process-form"><button>Iniciar bot</button></form><form method="post" action="/stop" class="js-process-form"><button class="stop">Parar bot</button></form><span class="runtime" id="runtime-message">{esc(status['message'])}</span><small class="hint">Uma coleta por clique; o bot para ao concluir.</small>{collector_timer_html}</div></section>
 <div class="stats" id="job-stats">{cards}</div>
 <section class="table-wrap"><table><thead><tr><th>Vaga</th><th>Localidade</th><th>Fonte</th><th>Idioma</th><th>Etapa</th><th>Carta e descrição</th><th>Data</th></tr></thead><tbody id="jobs-body">{rows}</tbody></table></section>
 <section class="panel" style="margin-top:18px"><h2>Execuções recentes</h2><ul class="history" id="run-history">{history}</ul></section>
 </div>
 
-<div id="tab-busca" class="tab-panel"><section class="panel"><h2>Busca &amp; coleta</h2><form method="post" action="/settings"><div class="form-grid"><label>Cargos e termos, separados por vírgula<textarea name="keywords" rows="3">{esc(cfg.get('keywords',''))}</textarea></label><label>Países/regiões aceitos<textarea name="locations" rows="3">{esc(cfg.get('locations',''))}</textarea></label><label>Fontes: remotive, remoteok, adzuna, apify<input name="sources" value="{esc(cfg.get('sources',''))}"></label><label>Intervalo de busca (minutos)<input name="interval_minutes" type="number" min="5" value="{esc(cfg.get('interval_minutes','15'))}"></label><label>Países Adzuna (ex.: br,us,gb,ca)<input name="adzuna_countries" value="{esc(cfg.get('adzuna_countries','br,us,gb,ca'))}"></label><label>Limite mensal Apify (USD)<input name="apify_monthly_credit_limit_usd" type="number" min="0" step="0.01" value="{esc(cfg.get('apify_monthly_credit_limit_usd','5'))}"></label><label>Máximo de vagas por ciclo Apify<input name="apify_job_count" type="number" min="1" max="100" value="{esc(cfg.get('apify_job_count','25'))}"></label><label style="grid-column:1/-1">Actors Apify (JSON — um ou mais scrapers)<textarea name="apify_actors_json" rows="8" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px">{esc(cfg.get('apify_actors_json',''))}</textarea></label></div><p class="hint">Cada actor: <code>id</code>, <code>label</code>, <code>enabled</code>, <code>input_mode</code> (<code>linkedin_search</code> ou <code>custom</code>), <code>count</code> opcional. Em <code>linkedin_search</code>, cada filtro LinkedIn ativo gera um run Apify independente; a IA cria vários filtros a partir do currículo. Em <code>custom</code>, use <code>input_template</code> com placeholders <code>{{keyword}}</code>, <code>{{location}}</code>, <code>{{count}}</code>, <code>{{keywords}}</code>.</p><label style="margin:16px 0 8px;display:block;grid-column:1/-1">Prompt do filtro LinkedIn (IA)<textarea name="linkedin_filter_prompt" rows="14" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px">{esc(effective_linkedin_filter_prompt(cfg))}</textarea></label><p class="hint">Edite as instruções da IA para o filtro. Placeholders: <code>{{pref_keywords}}</code>, <code>{{facts_pt}}</code>, <code>{{facts_en}}</code>, <code>{{resume_pt}}</code>, <code>{{resume_en}}</code>. Ao salvar com mudanças neste texto, os filtros são <strong>regenerados</strong> na hora (precisa de chave de IA e currículo analisado).</p><div id="linkedin-filter-slot">{linkedin_filter_view}</div><button>Salvar preferências</button></form></section></div>
+<div id="tab-busca" class="tab-panel"><section class="panel"><h2>Busca &amp; coleta</h2><form method="post" action="/settings"><div class="form-grid"><label>Cargos e termos, separados por vírgula<textarea name="keywords" rows="3">{esc(cfg.get('keywords',''))}</textarea></label><label>Países/regiões aceitos<textarea name="locations" rows="3">{esc(cfg.get('locations',''))}</textarea></label><label>Fontes: remotive, remoteok, adzuna, apify<input name="sources" value="{esc(cfg.get('sources',''))}"></label><label>Países Adzuna (ex.: br,us,gb,ca)<input name="adzuna_countries" value="{esc(cfg.get('adzuna_countries','br,us,gb,ca'))}"></label><label>Limite mensal Apify (USD)<input name="apify_monthly_credit_limit_usd" type="number" min="0" step="0.01" value="{esc(cfg.get('apify_monthly_credit_limit_usd','5'))}"></label><label>Máximo de vagas por ciclo Apify<input name="apify_job_count" type="number" min="1" max="100" value="{esc(cfg.get('apify_job_count','25'))}"></label><label style="grid-column:1/-1">Actors Apify (JSON — um ou mais scrapers)<textarea name="apify_actors_json" rows="8" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px">{esc(cfg.get('apify_actors_json',''))}</textarea></label></div><p class="hint">Cada actor: <code>id</code>, <code>label</code>, <code>enabled</code>, <code>input_mode</code> (<code>linkedin_search</code> ou <code>custom</code>), <code>count</code> opcional. Em <code>linkedin_search</code>, cada filtro LinkedIn ativo gera um run Apify independente; a IA cria vários filtros a partir do currículo. Em <code>custom</code>, use <code>input_template</code> com placeholders <code>{{keyword}}</code>, <code>{{location}}</code>, <code>{{count}}</code>, <code>{{keywords}}</code>.</p><label style="margin:16px 0 8px;display:block;grid-column:1/-1">Prompt do filtro LinkedIn (IA)<textarea name="linkedin_filter_prompt" rows="14" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px">{esc(effective_linkedin_filter_prompt(cfg))}</textarea></label><p class="hint">Edite as instruções da IA para o filtro. Placeholders: <code>{{pref_keywords}}</code>, <code>{{facts_pt}}</code>, <code>{{facts_en}}</code>, <code>{{resume_pt}}</code>, <code>{{resume_en}}</code>. Ao salvar com mudanças neste texto, os filtros são <strong>regenerados</strong> na hora (precisa de chave de IA e currículo analisado).</p><div id="linkedin-filter-slot">{linkedin_filter_view}</div><button>Salvar preferências</button></form></section></div>
 
 <div id="tab-curriculos" class="tab-panel"><section class="panel"><h2>Currículos (PDF)</h2>{resume_panel}<p class="hint">O seletor de arquivos do sistema abre ao escolher o PDF. A análise agora gera um dossiê completo (skills, experiências, projetos). Use <em>Reanalisar</em> para regenerar com o prompt enriquecido.</p></section></div>
 
