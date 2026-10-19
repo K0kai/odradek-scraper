@@ -14,6 +14,30 @@ from urllib.request import Request, urlopen
 from resume_pipeline import AiUnavailableError
 
 
+def ai_http_error_detail(exc: HTTPError, *, provider: str, model: str, operation: str, api_key: str) -> str:
+    """Keep the provider's explanation without exposing credentials or request URLs."""
+    body = exc.read(65536).decode("utf-8", errors="replace")
+    try:
+        payload = json.loads(body)
+    except (ValueError, TypeError):
+        payload = None
+    error = payload.get("error") if isinstance(payload, dict) else None
+    parts = []
+    if isinstance(error, dict):
+        for field in ("status", "code", "param", "message"):
+            value = error.get(field)
+            if isinstance(value, (str, int)) and value:
+                parts.append(str(value))
+    elif isinstance(error, str):
+        parts.append(error)
+    # Do not copy arbitrary HTML/proxy responses, which may echo the request.
+    detail = " | ".join(parts) or "O provedor não retornou uma explicação JSON."
+    if api_key:
+        detail = detail.replace(api_key, "[chave omitida]").replace(quote_plus(api_key), "[chave omitida]")
+    detail = " ".join(detail.split())[:700]
+    return f"{operation}: {provider}/{model} (HTTP {exc.code}): {detail}"
+
+
 def call_ai_text(
     *,
     prompt: str,

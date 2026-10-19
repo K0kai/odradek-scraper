@@ -741,12 +741,15 @@ Description: {re.sub(r'<[^>]+>', ' ', job['description'])[:10000]}"""
         with urlopen(request, timeout=60) as response:
             result = json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")[:300]
-        quota = exc.code in {401, 403, 429} or "quota" in body.casefold()
+        from ai_client import ai_http_error_detail
+
+        detail = ai_http_error_detail(exc, provider=provider, model=model, operation="Triagem da vaga", api_key=api_key)
+        quota = exc.code in {401, 403, 429, 502, 503, 504} or "quota" in detail.casefold()
         _record_ai_usage(provider, model, None, ok=False, quota_error=quota)
+        log_event("error", "auto-apply", f"Vaga #{job.get('id', '?')}: {detail}")
         if quota:
-            raise AiUnavailableError(f"IA indisponível (HTTP {exc.code}).") from exc
-        raise
+            raise AiUnavailableError(detail) from exc
+        raise RuntimeError(detail) from exc
     _record_ai_usage(provider, model, result if isinstance(result, dict) else None, ok=True, quota_error=False)
     if provider == "openai":
         raw = "\n".join(part.get("text", "") for item in result.get("output", []) for part in item.get("content", []) if part.get("type") == "output_text")
@@ -2208,7 +2211,7 @@ def run_apify_actor(
     return normalized
 
 
-def fetch_apify() -> list[dict]:
+def iter_apify_jobs():
     """Run enabled actors; LinkedIn actors run once for each enabled filter."""
     token = secret_get("apify_token")
     if not token:
@@ -2265,13 +2268,14 @@ def fetch_apify() -> list[dict]:
             except Exception:
                 pass
             try:
-                results.extend(
-                    run_apify_actor(token, run_actor, cfg, linkedin_filter=linkedin_filter)
-                )
+                batch = run_apify_actor(token, run_actor, cfg, linkedin_filter=linkedin_filter)
+                results.extend(batch)
             except Exception as exc:
                 LOG.exception("Falha no actor Apify %s", run_label)
                 errors.append(f"{run_label}: {exc}")
                 log_event("error", "apify", f"Falha no actor {run_label}: {exc}")
+            else:
+                yield from batch
         if budget_exhausted:
             break
     try:
@@ -2284,10 +2288,13 @@ def fetch_apify() -> list[dict]:
         raise RuntimeError("Todos os actors Apify falharam: " + "; ".join(errors))
     if errors:
         log_event("warning", "apify", "Alguns actors falharam: " + "; ".join(errors))
-    return results
 
 
-PROVIDERS = {"remotive": fetch_remotive, "remoteok": fetch_remoteok, "adzuna": fetch_adzuna, "apify": fetch_apify}
+def fetch_apify() -> list[dict]:
+    return list(iter_apify_jobs())
+
+
+PROVIDERS = {"remotive": fetch_remotive, "remoteok": fetch_remoteok, "adzuna": fetch_adzuna, "apify": iter_apify_jobs}
 
 
 class Collector:
@@ -2382,12 +2389,13 @@ class Collector:
             if not provider:
                 errors.append(f"Fonte desconhecida: {source}")
                 continue
-            self._set_progress(f"Consultando {source}… {found} vaga(s) nova(s) nesta execução.", found)
+            self._set_progress(f"Aguardando vagas de {source}… {found} vaga(s) nova(s) salva(s) nesta execução.", found)
             log_event("info", "collector", f"Consultando fonte {source}…")
             try:
                 jobs = provider()
-                log_event("info", "collector", f"{source}: {len(jobs)} anúncio(s) recebidos antes dos filtros.")
+                received = 0
                 for job in jobs:
+                    received += 1
                     if self.stop_event.is_set():
                         break
                     searchable = " ".join((job["title"], job["company"], job["location"], re.sub("<[^>]+>", " ", job["description"]))).casefold()
@@ -2404,7 +2412,8 @@ class Collector:
                         inserted = max(cursor.rowcount, 0)
                     found += inserted
                     if inserted:
-                        self._set_progress(f"Consultando {source}… {found} vaga(s) nova(s) nesta execução.", found)
+                        self._set_progress(f"Consultando {source}… {found} vaga(s) nova(s) salva(s) nesta execução.", found)
+                log_event("info", "collector", f"{source}: {received} anúncio(s) recebidos antes dos filtros.")
             except Exception as exc:  # keep other sources running if one is unavailable
                 LOG.exception("Falha ao consultar %s", source)
                 errors.append(f"{source}: {exc.__class__.__name__}")
@@ -3731,7 +3740,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
 <main class="content">{notice_html}
 
 <div id="tab-painel" class="tab-panel active">
-<section class="panel runbar"><div class="actions" style="margin:0"><form method="post" action="/start" class="js-process-form"><button>Iniciar bot</button></form><form method="post" action="/stop" class="js-process-form"><button class="stop">Parar bot</button></form><span class="runtime" id="runtime-message">{esc(status['message'])}</span><small class="hint">Uma coleta por clique; o bot para ao concluir.</small>{collector_timer_html}</div></section>
+<section class="panel runbar"><div class="actions" style="margin:0"><form method="post" action="/start" class="js-process-form"><button>Iniciar bot</button></form><form method="post" action="/stop" class="js-process-form"><button class="stop">Parar bot</button></form><span class="runtime" id="runtime-message">{esc(status['message'])}</span>{collector_timer_html}</div></section>
 <div class="stats" id="job-stats">{cards}</div>
 <section class="table-wrap"><table><thead><tr><th>Vaga</th><th>Localidade</th><th>Fonte</th><th>Idioma</th><th>Etapa</th><th>Carta e descrição</th><th>Data</th></tr></thead><tbody id="jobs-body">{rows}</tbody></table></section>
 <section class="panel" style="margin-top:18px"><h2>Execuções recentes</h2><ul class="history" id="run-history">{history}</ul></section>
@@ -4747,7 +4756,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
   setInterval(keepServerAwake, 5 * 60 * 1000);
   panelReady = true;
   if ((document.querySelector(".tab.active")?.getAttribute("data-tab") || "painel") !== "painel") refresh(true);
-  setInterval(refresh, 10000);
+  setInterval(refresh, 2000);
   setInterval(updateAllCountdowns, 1000);
   updateAllCountdowns();
   document.addEventListener("visibilitychange", function () {{
