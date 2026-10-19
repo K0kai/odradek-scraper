@@ -2561,12 +2561,12 @@ def queue_html(limit: int = 100) -> str:
         if row["status"] in {"pending", "retry_wait", "running"}:
             actions.append(
                 f'<form method="post" action="/queue-cancel" class="js-process-form" style="display:inline">'
-                f'<input type="hidden" name="id" value="{jid}"><button class="subtle" type="submit">Cancelar</button></form>'
+                f'<input type="hidden" name="id" value="{jid}"><button class="subtle" type="submit" data-live-key="queue-cancel-{jid}">Cancelar</button></form>'
             )
         if row["kind"] != "linkedin_apply" and row["status"] in {"retry_wait", "failed", "cancelled", "running"}:
             actions.append(
                 f'<form method="post" action="/queue-retry" class="js-process-form" style="display:inline">'
-                f'<input type="hidden" name="id" value="{jid}"><button class="subtle" type="submit">Reenfileirar</button></form>'
+                f'<input type="hidden" name="id" value="{jid}"><button class="subtle" type="submit" data-live-key="queue-retry-{jid}">Reenfileirar</button></form>'
             )
         progress_raw = ""
         try:
@@ -2582,7 +2582,7 @@ def queue_html(limit: int = 100) -> str:
         if len(progress_lines) > 1:
             hist = esc("\n".join(progress_lines[-40:]))
             detail_bits.append(
-                f'<details class="queue-progress"><summary><small>histórico '
+                f'<details class="queue-progress" data-live-key="queue-history-{jid}"><summary><small>histórico '
                 f'({len(progress_lines)})</small></summary>'
                 f'<pre style="white-space:pre-wrap;max-height:220px;overflow:auto;'
                 f'font-size:11px;margin:4px 0 0">{hist}</pre></details>'
@@ -2612,11 +2612,11 @@ def queue_html(limit: int = 100) -> str:
     clear_btn = (
         '<div style="margin-top:10px;display:flex;gap:10px;flex-wrap:wrap">'
         '<form method="post" action="/queue-eval-new" class="js-process-form">'
-        '<button class="subtle" type="submit">Enfileirar vagas novas (ainda não triadas)</button></form>'
+        '<button class="subtle" type="submit" data-live-key="queue-eval-new">Enfileirar vagas novas (ainda não triadas)</button></form>'
         '<form method="post" action="/queue-retry-all" class="js-process-form">'
-        '<button class="subtle" type="submit">Reenfileirar falhos/cancelados/retry</button></form>'
+        '<button class="subtle" type="submit" data-live-key="queue-retry-all">Reenfileirar falhos/cancelados/retry</button></form>'
         '<form method="post" action="/queue-clear" class="js-process-form">'
-        '<button class="subtle" type="submit">Limpar concluídos/falhos/cancelados</button></form>'
+        '<button class="subtle" type="submit" data-live-key="queue-clear">Limpar concluídos/falhos/cancelados</button></form>'
         "</div>"
     )
     return summary + table + clear_btn
@@ -4121,8 +4121,16 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     if (opts.skipIfBusy && panelBusy(el)) return;
     var scrollEl = opts.scrollSelector ? el.querySelector(opts.scrollSelector) : null;
     var scrollTop = scrollEl ? scrollEl.scrollTop : 0;
-    var details = opts.preserveDetails ? el.querySelector("details") : null;
-    var wasOpen = details ? details.open : null;
+    var detailStates = {{}};
+    if (opts.preserveDetails) el.querySelectorAll("details").forEach(function (detail, index) {{
+      var content = detail.querySelector("pre");
+      detailStates[detail.getAttribute("data-live-key") || index] = {{
+        open: detail.open, scrollTop: content ? content.scrollTop : 0
+      }};
+    }});
+    var focused = opts.preserveFocus && el.contains(document.activeElement) ? document.activeElement : null;
+    var focusKey = focused ? focused.getAttribute("data-live-key") : null;
+    if (focused && !focusKey) focusKey = focused.closest("[data-live-key]")?.getAttribute("data-live-key");
     var wrap = opts.wrapScroll ? el.closest(opts.wrapScroll) : null;
     var wrapTop = wrap ? wrap.scrollTop : 0;
     el.innerHTML = html;
@@ -4132,10 +4140,18 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
       var again = el.querySelector(opts.scrollSelector);
       if (again) again.scrollTop = scrollTop;
     }}
-    if (details != null) {{
-      var d2 = el.querySelector("details");
-      if (d2 && wasOpen !== null) d2.open = wasOpen;
-    }}
+    if (opts.preserveDetails) el.querySelectorAll("details").forEach(function (detail, index) {{
+      var saved = detailStates[detail.getAttribute("data-live-key") || index];
+      if (!saved) return;
+      detail.open = saved.open;
+      var content = detail.querySelector("pre");
+      if (content) content.scrollTop = saved.scrollTop;
+    }});
+    if (focusKey) el.querySelectorAll("[data-live-key]").forEach(function (target) {{
+      if (target.getAttribute("data-live-key") !== focusKey) return;
+      var focusTarget = target.matches("details") ? target.querySelector("summary") : target;
+      if (focusTarget) focusTarget.focus({{ preventScroll: true }});
+    }});
     if (wrap) wrap.scrollTop = wrapTop;
   }}
   function requestWorthRefresh() {{
@@ -4318,7 +4334,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
         applyRegion(statsEl, data.stats_html, data.stats_hash, {{ key: "stats" }});
         applyRegion(jobsEl, data.jobs_html, data.jobs_hash, {{ key: "jobs", skipIfBusy: true, wrapScroll: ".table-wrap" }});
         applyRegion(historyEl, data.history_html, data.history_hash, {{ key: "history" }});
-        applyRegion(queueEl, data.queue_html, data.queue_hash, {{ key: "queue", skipIfBusy: true }});
+        applyRegion(queueEl, data.queue_html, data.queue_hash, {{ key: "queue", preserveDetails: true, preserveFocus: true }});
         if (worthFresh) {{
           applyRegion(worthEl, data.worth_html, data.worth_hash, {{ key: "worth", skipIfBusy: !worthForceUpdate }});
           worthForceUpdate = false;
