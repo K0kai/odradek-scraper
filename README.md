@@ -1,5 +1,7 @@
 # Odradek Scraper (estudo / fins educacionais)
 
+**Idioma / Language:** Português (Brasil) | [English](README.en.md)
+
 Projeto **pessoal e educacional** para estudar, em ambiente local:
 
 - painéis HTTP simples em Python (`http.server`)
