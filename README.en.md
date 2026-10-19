@@ -7,14 +7,14 @@ A **personal, educational** project for exploring the following in a local envir
 - simple HTTP dashboards in Python (`http.server`)
 - local storage with SQLite
 - third-party API integrations (using API keys configured by the user)
-- PDF parsing and web form workflows
+- PDF parsing and manual form assistance
 
 **This is not a product, commercial service, or tool intended for mass use.**  
 The code is intended for learning and experimentation **on your own computer**.
 
 ## Important notice
 
-- Respect the **terms of use** of any website or API you access. Automation, scraping, or automated job applications may be **prohibited** by those platforms.
+- Respect the **terms of use** of any website or API you access. Automation and scraping may be **prohibited** by those platforms.
 - The author **does not encourage** violating terms of service, bypassing CAPTCHAs or login requirements, or abusing accounts.
 - Any use beyond local learning is **at your own risk**.
 - Sensitive data (résumés, Brazilian taxpayer IDs/CPF, API keys, browser sessions) should remain **only on your computer** — never in commits.

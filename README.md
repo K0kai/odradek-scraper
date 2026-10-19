@@ -7,14 +7,14 @@ Projeto **pessoal e educacional** para estudar, em ambiente local:
 - painéis HTTP simples em Python (`http.server`)
 - armazenamento local com SQLite
 - integração com APIs de terceiros (quando o usuário configura as próprias chaves)
-- parsing de PDF e fluxos de formulário web
+- parsing de PDF e suporte ao preenchimento manual de formulários
 
 **Não é um produto, serviço comercial nem ferramenta oferecida para uso em massa.**  
 O código existe para aprendizado e experimentação **na sua máquina**.
 
 ## Aviso importante
 
-- Respeite os **termos de uso** de qualquer site ou API que você consultar. Automação, scraping ou candidaturas automatizadas podem ser **proibidos** por essas plataformas.
+- Respeite os **termos de uso** de qualquer site ou API que você consultar. Automação e scraping podem ser **proibidos** por essas plataformas.
 - O autor **não incentiva** violar termos de serviço, contornar CAPTCHA/login nem abusar de contas.
 - Qualquer uso além do estudo local é **por sua conta e risco**.
 - Dados sensíveis (currículo, CPF, chaves de API, sessão de navegador) devem permanecer **apenas no seu computador** — nunca em commits.
