@@ -2484,6 +2484,8 @@ def job_rows_html(jobs, collecting: bool) -> str:
         lang_label = {"pt": "Português", "en": "English", "unknown": "Incerto"}.get(job["language"], job["language"])
         confidence = f" · {job['language_confidence']:.0%}" if job["language_confidence"] else ""
         letter_ui = f'<details><summary>{"Carta criada" if job["cover_letter"] else "Carta não criada"}</summary><div class="description">{esc(job["cover_letter"] or "A carta será gerada automaticamente na candidatura.")}</div></details>'
+        if job["cover_letter"]:
+            letter_ui += f'<a href="/cover-letter.pdf?job_id={int(job["id"])}" download>Baixar PDF</a>'
         if "COPILOT_UNAUTOMATED:" in (job["notes"] or ""):
             notes = (
                 '<span style="background:#3a2f00;border:1px solid #e8c33f;color:#ffd54a;'
@@ -2961,7 +2963,8 @@ def worth_html(
             f"{_notes_html(notes) if notes else ''}"
             f'<p class="hint"><strong>Descrição</strong></p><div class="description">{esc(desc or "—")}</div>'
             f'<p class="hint"><strong>Carta</strong></p><div class="description">{esc(letter or "—")}</div>'
-            "</details>"
+            + (f'<a href="/cover-letter.pdf?job_id={int(job["id"])}" download>Baixar PDF</a>' if letter else "")
+            + "</details>"
         )
         body_rows.append(
             "<tr>"
@@ -4932,6 +4935,34 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
+        if path == "/cover-letter.pdf":
+            try:
+                job_id = int(parse_qs(parsed.query).get("job_id", [""])[0])
+                if job_id <= 0:
+                    raise ValueError
+            except ValueError:
+                self.send_error(400, "Invalid job ID")
+                return
+            with connect() as db:
+                letter = db.execute("SELECT body FROM cover_letters WHERE job_id=?", (job_id,)).fetchone()
+            if not letter or not (letter["body"] or "").strip():
+                self.send_error(404, "Cover letter not found")
+                return
+            try:
+                from cover_letter_pdf import render_cover_letter_pdf
+                data = render_cover_letter_pdf(letter["body"])
+            except Exception:
+                LOG.exception("Failed to render cover letter PDF for job %s", job_id)
+                self.send_error(500, "Unable to create cover letter PDF")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Disposition", f'attachment; filename="cover-letter-{job_id}.pdf"')
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if path in ("/favicon.ico", "/odradek-icon.png"):
             self.send_favicon()
             return
