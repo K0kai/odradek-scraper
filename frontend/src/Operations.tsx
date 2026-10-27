@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, type LogItem, type QueueData, type QueueItem, type ResumeRecord, type ResumesData, type UsageData } from './api'
+import { formatDate } from './format'
 
 const kinds: Record<string, string> = {
   resume_analysis: 'Análise de currículo',
@@ -10,15 +11,6 @@ const kinds: Record<string, string> = {
 const statuses: Record<string, string> = {
   pending: 'Pendente', running: 'Executando', retry_wait: 'Aguardando nova tentativa',
   succeeded: 'Concluído', failed: 'Falhou', cancelled: 'Cancelado',
-}
-
-function date(value: string | null) {
-  if (!value) return 'Sem data'
-  const parsed = new Date(value)
-  return Number.isNaN(parsed.valueOf()) ? value : new Intl.DateTimeFormat('pt-BR', {
-    timeZone: 'America/Sao_Paulo', day: '2-digit', month: 'short', year: 'numeric',
-    hour: '2-digit', minute: '2-digit',
-  }).format(parsed)
 }
 
 function usePolling<T>(loader: () => Promise<T>, setData: (value: T) => void, setError: (error: string) => void, delay: number) {
@@ -38,8 +30,8 @@ function usePolling<T>(loader: () => Promise<T>, setData: (value: T) => void, se
 function QueueCard({ item, action }: { item: QueueItem; action: (id: number, name: 'cancel' | 'retry') => Promise<void> }) {
   const [busy, setBusy] = useState(false)
   async function run(name: 'cancel' | 'retry') { setBusy(true); try { await action(item.id, name) } finally { setBusy(false) } }
-  return <article className="operation-card"><div className="operation-head"><div><strong>#{item.id} · {kinds[item.kind] || item.kind}</strong><small>Criado {date(item.created_at)}</small></div><span className={`queue-status ${item.status}`}>{statuses[item.status] || item.status}</span></div>
-    <div className="operation-meta"><span>Tentativas: {item.attempts}/{item.max_attempts}</span>{item.next_run_at && <span>Próxima: {date(item.next_run_at)}</span>}</div>
+  return <article className="operation-card"><div className="operation-head"><div><strong>#{item.id} · {kinds[item.kind] || item.kind}</strong><small>Criado {formatDate(item.created_at, true)}</small></div><span className={`queue-status ${item.status}`}>{statuses[item.status] || item.status}</span></div>
+    <div className="operation-meta"><span>Tentativas: {item.attempts}/{item.max_attempts}</span>{item.next_run_at && <span>Próxima: {formatDate(item.next_run_at, true)}</span>}</div>
     {item.last_step && <p>{item.last_step}</p>}{item.outcome && <p className="operation-outcome">{item.outcome}</p>}
     {item.progress && <details><summary>Histórico do processamento</summary><pre>{item.progress}</pre></details>}
     <div className="job-actions">{['pending', 'running', 'retry_wait'].includes(item.status) && <button className="secondary" disabled={busy} onClick={() => run('cancel')}>Cancelar</button>}{item.kind !== 'linkedin_apply' && ['running', 'retry_wait', 'failed', 'cancelled'].includes(item.status) && <button className="secondary" disabled={busy} onClick={() => run('retry')}>Reenfileirar</button>}</div>
@@ -85,7 +77,7 @@ export function LogsView({ notify }: { notify: (message: string, error?: boolean
   }
   return <section className="section"><div className="section-head"><div><p className="eyebrow">ATIVIDADE DO SISTEMA</p><h2>Logs recentes</h2></div><div className="job-actions"><button className="secondary" onClick={refresh}>Atualizar</button><button className="secondary" disabled={busy} onClick={clear}>{confirmClear ? 'Confirmar limpeza' : 'Limpar logs'}</button>{confirmClear && <button className="secondary" onClick={() => setConfirmClear(false)}>Cancelar</button>}</div></div>
     {error && <p className="banner error" role="alert">{error}</p>}
-    {!data ? <p className="empty">Carregando logs…</p> : data.length ? <div className="log-list">{data.map(item => <div className="log-item" key={item.id}><time>{date(item.created_at)}</time><span className={`log-level ${item.level}`}>{item.level}</span><strong>{item.source}</strong><span>{item.message}</span></div>)}</div> : <p className="empty">Nenhum evento registrado.</p>}
+    {!data ? <p className="empty">Carregando logs…</p> : data.length ? <div className="log-list">{data.map(item => <div className="log-item" key={item.id}><time>{formatDate(item.created_at, true)}</time><span className={`log-level ${item.level}`}>{item.level}</span><strong>{item.source}</strong><span>{item.message}</span></div>)}</div> : <p className="empty">Nenhum evento registrado.</p>}
   </section>
 }
 
@@ -106,7 +98,7 @@ export function UsageView({ notify }: { notify: (message: string, error?: boolea
   const percent = limit > 0 ? Math.min(100, Math.max(0, used / limit * 100)) : 0
   return <><section className="section"><div className="section-head"><div><p className="eyebrow">CUSTOS E LIMITES</p><h2>Uso e cotas</h2></div><button className="secondary" disabled={busy} onClick={update}>{busy ? 'Consultando…' : 'Atualizar cotas Apify'}</button></div>
     {error && <p className="banner error" role="alert">{error} <button onClick={refresh}>Tentar novamente</button></p>}
-    {!data ? <p className="empty">Carregando uso…</p> : <div className="usage-grid-new"><article className="usage-card-new"><p className="eyebrow">APIFY</p><h3>Consumo do ciclo</h3>{apify?.error && <p className="inline-message">{apify.error}</p>}<div className="usage-big">US$ {used.toFixed(2)} <small>de US$ {limit.toFixed(2)}</small></div><div className="progress-track"><div style={{ width: `${percent}%` }} /></div><p className="usage-caption">{percent.toFixed(0)}% do limite · {apify?.cycle_label || 'Ciclo não informado'}</p><p className="usage-caption">Última consulta: {date(apify?.fetched_at || null)}</p></article>
+    {!data ? <p className="empty">Carregando uso…</p> : <div className="usage-grid-new"><article className="usage-card-new"><p className="eyebrow">APIFY</p><h3>Consumo do ciclo</h3>{apify?.error && <p className="inline-message">{apify.error}</p>}<div className="usage-big">US$ {used.toFixed(2)} <small>de US$ {limit.toFixed(2)}</small></div><div className="progress-track"><div style={{ width: `${percent}%` }} /></div><p className="usage-caption">{percent.toFixed(0)}% do limite · {apify?.cycle_label || 'Ciclo não informado'}</p><p className="usage-caption">Última consulta: {formatDate(apify?.fetched_at || null, true)}</p></article>
       <article className="usage-card-new"><p className="eyebrow">INTELIGÊNCIA ARTIFICIAL</p><h3>{data.provider === 'gemini' ? 'Gemini' : data.provider === 'openai' ? 'OpenAI' : data.provider} <small>{data.model}</small></h3><p className="usage-caption">Estimativa local das chamadas feitas por este aplicativo.</p><div className="usage-metrics-new"><div><span>Chamadas hoje</span><strong>{data.ai.day.calls_ok || 0}</strong></div><div><span>Erros de quota hoje</span><strong>{data.ai.day.calls_quota_error || 0}</strong></div><div><span>Tokens hoje</span><strong>{data.ai.day.tokens_in || 0} / {data.ai.day.tokens_out || 0}</strong></div><div><span>Chamadas no mês</span><strong>{data.ai.month.calls_ok || 0}</strong></div><div><span>Tokens no mês</span><strong>{data.ai.month.tokens_in || 0} / {data.ai.month.tokens_out || 0}</strong></div></div></article></div>}
   </section></>
 }
@@ -163,7 +155,7 @@ function ResumeCard({ language, record, refresh, notify }: {
     finally { setBusy(false) }
   }
   return <article className="resume-card"><div className="resume-head"><div><p className="eyebrow">{language === 'pt' ? 'PORTUGUÊS' : 'ENGLISH'}</p><h3>Currículo {language.toUpperCase()}</h3></div><span className="status-pill">{record?.status || 'Não enviado'}</span></div>
-    {record ? <div className="resume-info"><strong>{record.filename || 'currículo.pdf'}</strong><span>{record.message || 'Sem mensagem de análise.'}</span><span>Última análise: {date(record.analyzed_at)}</span><span>{record.provider && `${record.provider} · ${record.model}`}</span>{record.error && <p className="inline-message">{record.error}</p>}</div> : <p className="section-description">Envie um PDF para analisar e usar o currículo na triagem.</p>}
+    {record ? <div className="resume-info"><strong>{record.filename || 'currículo.pdf'}</strong><span>{record.message || 'Sem mensagem de análise.'}</span><span>Última análise: {formatDate(record.analyzed_at, true)}</span><span>{record.provider && `${record.provider} · ${record.model}`}</span>{record.error && <p className="inline-message">{record.error}</p>}</div> : <p className="section-description">Envie um PDF para analisar e usar o currículo na triagem.</p>}
     {record?.summary && <details className="resume-details"><summary>Resumo da análise</summary><pre>{record.summary}</pre></details>}
     {record?.analysis_json && <details className="resume-details"><summary>Dossiê completo</summary><pre>{record.analysis_json}</pre></details>}
     <label htmlFor={`resume-file-${language}`}>Selecionar PDF</label><input ref={fileInput} id={`resume-file-${language}`} type="file" accept="application/pdf,.pdf" onChange={event => setFile(event.target.files?.[0] || null)} />

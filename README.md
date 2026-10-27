@@ -9,6 +9,8 @@ Projeto **pessoal e educacional** para estudar, em ambiente local:
 - integração com APIs de terceiros (quando o usuário configura as próprias chaves)
 - parsing de PDF e suporte ao preenchimento manual de formulários
 
+O código da interface fica em `frontend/`. A API, a coleta e os módulos de negócio ficam em `backend/`. O banco SQLite e os arquivos persistentes continuam na raiz do projeto para preservar os dados locais anteriores.
+
 **Não é um produto, serviço comercial nem ferramenta oferecida para uso em massa.**  
 O código existe para aprendizado e experimentação **na sua máquina**.
 
@@ -32,14 +34,14 @@ Este repositório é fornecido **“como está”**, sem garantias. Não constit
 ```bash
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+pip install -r backend/requirements.txt
 cd frontend
 npm ci
 npm run build
 cd ..
 # dependências de browser, se for estudar esses módulos:
 # playwright install
-python -m uvicorn api_asgi:api --host 127.0.0.1 --port 8765
+python -m uvicorn api_asgi:api --app-dir backend --host 127.0.0.1 --port 8765
 ```
 
 Abra `http://127.0.0.1:8765`. O painel local não exige senha por padrão. Configure `PANEL_PASSWORD` se expuser a porta além da sua máquina.
@@ -58,7 +60,7 @@ Cada clique em **Iniciar bot** executa um único ciclo de coleta e encerra autom
 
 - A aplicação usa SQLite local quando `DATABASE_URL` não está definida e PostgreSQL quando ela aponta para Neon.
 - Execute no Neon SQL Editor o schema PostgreSQL completo (tabelas, índices e valores padrão) antes de iniciar a aplicação.
-- Para copiar os dados locais para Neon, pare o serviço hospedado e rode `python migrate_sqlite_to_neon.py` no computador que contém `jobs.db`, com `DATABASE_URL` definido para a conexão Neon. O script importa tabelas e dados, preserva as configurações locais e substitui as regras iniciais/logs de primeiro boot pelas versões locais.
+- Para copiar os dados locais para Neon, pare o serviço hospedado e rode `python backend/migrate_sqlite_to_neon.py` no computador que contém `jobs.db`, com `DATABASE_URL` definido para a conexão Neon. O script importa tabelas e dados, preserva as configurações locais e substitui as regras iniciais/logs de primeiro boot pelas versões locais.
 - Configure a mesma `DATABASE_URL` como variável secreta no Render. Nunca a salve no repositório.
 - O Render não oferece o cofre de credenciais do sistema operacional usado pelo `keyring` local. Para salvar e alterar chaves pelo painel, configure **uma única vez** `SECRET_ENCRYPTION_KEY` em **Environment**. Gere uma chave Fernet localmente com `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`, copie o resultado para o Render e mantenha uma cópia segura: sem essa mesma chave, os segredos salvos não podem ser descriptografados. As chaves de API são criptografadas com Fernet antes de serem gravadas como valores internos na tabela `settings` do Postgres. Variáveis como `GEMINI_API_KEY`, `OPENAI_API_KEY`, `ADZUNA_APP_ID`, `ADZUNA_APP_KEY`, `APIFY_TOKEN` e `SMTP_PASSWORD` continuam aceitas como fallback, mas segredos cadastrados pelo painel no banco têm prioridade.
 - Currículos e arquivos enviados ficam no sistema de arquivos, não no banco; configure um disco persistente no Render e defina `RESUMES_DIR` e `COPILOT_UPLOADS_DIR` para diretórios nesse disco. Copie os arquivos locais para lá antes de usar os registros migrados.

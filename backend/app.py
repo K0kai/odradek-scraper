@@ -36,16 +36,16 @@ from resume_pipeline import (
     run_resume_analysis,
 )
 from panel_log import attach_to_logger, ensure_log_table, list_logs, log_event
+from paths import PROJECT_ROOT, DB_PATH as DEFAULT_DB_PATH, FRONTEND_DIST as DEFAULT_FRONTEND_DIST, ICON_PATH
 
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(ROOT, "jobs.db")
-RESUMES_DIR = os.environ.get("RESUMES_DIR", os.path.join(ROOT, "resumes"))
+DB_PATH = str(DEFAULT_DB_PATH)
+RESUMES_DIR = os.environ.get("RESUMES_DIR", str(PROJECT_ROOT / "resumes"))
 COPILOT_UPLOADS_DIR = os.environ.get(
-    "COPILOT_UPLOADS_DIR", os.path.join(ROOT, "copilot_uploads")
+    "COPILOT_UPLOADS_DIR", str(PROJECT_ROOT / "copilot_uploads")
 )
-FAVICON_PATH = os.path.join(ROOT, "assets", "public", "odradek-icon.png")
-FRONTEND_DIST = os.path.join(ROOT, "frontend", "dist")
+FAVICON_PATH = str(ICON_PATH)
+FRONTEND_DIST = str(DEFAULT_FRONTEND_DIST)
 HOST = os.environ.get("HOST", "0.0.0.0" if os.environ.get("RENDER", "").casefold() == "true" else "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8765"))
 LOG = logging.getLogger("odradek-scraper")
@@ -2706,9 +2706,6 @@ def _worth_match_expr() -> str:
                         WHERE ai_decisions.job_id = jobs.id
                         ORDER BY id DESC LIMIT 1
                       )"""
-
-
-# Labels padrão do timer do coletor (runbar). Outros timers passam o próprio dict.
 
 
 if __name__ == "__main__":

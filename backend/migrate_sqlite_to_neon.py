@@ -9,9 +9,9 @@ from pathlib import Path
 
 import psycopg
 from psycopg.rows import dict_row
+from paths import DB_PATH
 
 
-ROOT = Path(__file__).resolve().parent
 TABLE_ORDER = (
     "settings",
     "jobs",
@@ -35,7 +35,7 @@ def main() -> int:
     parser.add_argument(
         "--sqlite",
         type=Path,
-        default=ROOT / "jobs.db",
+        default=DB_PATH,
         help="SQLite database to copy (default: jobs.db beside this script)",
     )
     args = parser.parse_args()

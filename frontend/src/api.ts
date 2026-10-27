@@ -136,6 +136,21 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>
 }
 
+function postForm<T>(path: string, fields: Record<string, string>): Promise<T> {
+  return request<T>(path, {
+    method: 'POST',
+    headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams(fields).toString(),
+  })
+}
+
+function postUpload<T>(path: string, fields: Record<string, string>, file: File | null): Promise<T> {
+  const form = new FormData()
+  Object.entries(fields).forEach(([key, value]) => form.set(key, value))
+  if (file) form.set('file', file)
+  return request<T>(path, { method: 'POST', headers: { Accept: 'application/json' }, body: form })
+}
+
 export const api = {
   session: () => request<{ auth_required: boolean; expires_at: number | null }>('/api/session'),
   dashboard: () => request<Dashboard>('/api/dashboard'),
@@ -150,36 +165,23 @@ export const api = {
   clearLogs: () => request<{ notice: string }>('/api/logs/clear', { method: 'POST' }),
   usage: () => request<UsageData>('/api/usage'),
   refreshUsage: () => request<{ notice: string; usage: UsageData }>('/api/usage/refresh', { method: 'POST' }),
-  assistant: (message: string, history: { role: string; content: string }[]) => request<{ answer: string }>('/api/assistant', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
-    body: new URLSearchParams({ message, history: JSON.stringify(history) }).toString(),
-  }),
+  assistant: (message: string, history: { role: string; content: string }[]) => postForm<{ answer: string }>(
+    '/api/assistant', { message, history: JSON.stringify(history) },
+  ),
   resumes: () => request<ResumesData>('/api/resumes'),
-  uploadResume: (language: 'pt' | 'en', file: File) => {
-    const form = new FormData()
-    form.set('language', language)
-    form.set('file', file)
-    return request<{ ok: boolean; notice: string }>('/api/resumes/upload', { method: 'POST', headers: { Accept: 'application/json' }, body: form })
-  },
-  reanalyzeResume: (language: 'pt' | 'en') => request<{ ok: boolean; notice: string }>('/api/resumes/reanalyze', {
-    method: 'POST',
-    headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ language }).toString(),
-  }),
+  uploadResume: (language: 'pt' | 'en', file: File) => postUpload<{ ok: boolean; notice: string }>(
+    '/api/resumes/upload', { language }, file,
+  ),
+  reanalyzeResume: (language: 'pt' | 'en') => postForm<{ ok: boolean; notice: string }>(
+    '/api/resumes/reanalyze', { language },
+  ),
   pendingAsk: () => request<{ ask: CopilotAsk | null }>('/api/copilot-asks/pending'),
-  answerAsk: (id: number, answer: string, file: File | null) => {
-    const form = new FormData()
-    form.set('id', String(id))
-    form.set('answer', answer)
-    if (file) form.set('file', file)
-    return request<{ ok: boolean; notice: string }>('/api/copilot-asks/answer', { method: 'POST', headers: { Accept: 'application/json' }, body: form })
-  },
-  askAction: (id: number, action: 'cancel' | 'manual') => request<{ ok: boolean; notice: string }>(`/api/copilot-asks/${action}`, {
-    method: 'POST',
-    headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ id: String(id) }).toString(),
-  }),
+  answerAsk: (id: number, answer: string, file: File | null) => postUpload<{ ok: boolean; notice: string }>(
+    '/api/copilot-asks/answer', { id: String(id), answer }, file,
+  ),
+  askAction: (id: number, action: 'cancel' | 'manual') => postForm<{ ok: boolean; notice: string }>(
+    `/api/copilot-asks/${action}`, { id: String(id) },
+  ),
   settings: (group: SettingsGroup) => request<{ group: SettingsGroup; values: Record<string, string> }>(`/api/settings/${group}`),
   saveSettings: (group: SettingsGroup, values: Record<string, string>) => request<{ notice: string; values: Record<string, string> }>(`/api/settings/${group}`, {
     method: 'POST', body: JSON.stringify(values),

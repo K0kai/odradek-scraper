@@ -9,6 +9,8 @@ A **personal, educational** project for exploring the following in a local envir
 - third-party API integrations (using API keys configured by the user)
 - PDF parsing and manual form assistance
 
+The interface code lives in `frontend/`. The API, collection, and business modules live in `backend/`. The SQLite database and persistent files remain in the project root to preserve existing local data.
+
 **This is not a product, commercial service, or tool intended for mass use.**  
 The code is intended for learning and experimentation **on your own computer**.
 
@@ -32,7 +34,7 @@ This repository is provided **“as is”**, without warranties. It does not con
 ```bash
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+pip install -r backend/requirements.txt
 # Build the React frontend:
 cd frontend
 npm ci
@@ -40,7 +42,7 @@ npm run build
 cd ..
 # Browser dependencies, if you plan to explore those modules:
 # playwright install
-python app.py
+python backend/app.py
 ```
 
 Open `http://127.0.0.1:8765`. Local access is open by default. Set `PANEL_PASSWORD` to enable the password screen locally. On Render, this variable is required; the signed browser session lasts seven days.
@@ -51,7 +53,7 @@ Each click on **Iniciar bot** (Start bot) runs a single collection cycle and sto
 
 - The application uses local SQLite when `DATABASE_URL` is not set, and PostgreSQL when it points to Neon.
 - Run the complete PostgreSQL schema (tables, indexes, and default values) in the Neon SQL Editor before starting the application.
-- To copy local data to Neon, stop the hosted service and run `python migrate_sqlite_to_neon.py` on the computer containing `jobs.db`, with `DATABASE_URL` set to the Neon connection string. The script imports tables and data, preserves local settings, and replaces the initial rules and first-boot logs with the local versions.
+- To copy local data to Neon, stop the hosted service and run `python backend/migrate_sqlite_to_neon.py` on the computer containing `jobs.db`, with `DATABASE_URL` set to the Neon connection string. The script imports tables and data, preserves local settings, and replaces the initial rules and first-boot logs with the local versions.
 - Configure the same `DATABASE_URL` as a secret environment variable in Render. Never save it in the repository.
 - Render does not provide the operating system credential store used by local `keyring`. To save and update keys through the dashboard, configure `SECRET_ENCRYPTION_KEY` **once** under **Environment**. Generate a Fernet key locally with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`, copy the result to Render, and keep a secure backup: saved secrets cannot be decrypted without that same key. API keys are encrypted with Fernet before being stored as internal values in the Postgres `settings` table. Environment variables such as `GEMINI_API_KEY`, `OPENAI_API_KEY`, `ADZUNA_APP_ID`, `ADZUNA_APP_KEY`, `APIFY_TOKEN`, and `SMTP_PASSWORD` are still accepted as fallbacks, but secrets saved to the database through the dashboard take priority.
 - Résumés and uploaded files are stored in the filesystem, not in the database. Configure a persistent disk in Render and set `RESUMES_DIR` and `COPILOT_UPLOADS_DIR` to directories on that disk. Copy the local files there before using the migrated records.

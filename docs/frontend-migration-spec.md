@@ -11,6 +11,7 @@ Escopo: interface web, camada HTTP e deploy. A lógica de coleta, triagem e cand
 - A leitura das configurações de busca mostra o prompt efetivo do LinkedIn mesmo quando o banco usa o texto padrão e apresenta o filtro salvo no formato antigo quando a lista nova ainda não foi gravada. Essa compatibilidade não altera os dados armazenados ao abrir a página.
 - Leituras, ações, uploads, downloads e rotas usadas pela interface são atendidos diretamente por FastAPI. O handler `http.server`, o encaminhamento interno e a página HTML antiga foram removidos.
 - O build React/TypeScript é produzido em `frontend/dist` e servido pelo mesmo Web Service Python. O Dockerfile inicia FastAPI, mas não foi validado no Render.
+- O código Python está em `backend/`; o banco e os arquivos persistentes mantêm os caminhos anteriores na raiz do projeto.
 - O painel hospedado exige `PANEL_PASSWORD` e protege a interface, a API e os downloads com uma sessão por cookie assinado de 7 dias. A compatibilidade da extensão com acesso hospedado permanece pendente.
 - Verificação local: build do frontend, leitura HTTP, ações migradas, larguras de 360, 390, 768 e 1280 px, e preservação de foco e texto durante atualização automática.
 - Pendências externas: adaptação da extensão ao acesso hospedado, build Docker e deploy de teste no Render, além de medições de desempenho no ambiente hospedado.

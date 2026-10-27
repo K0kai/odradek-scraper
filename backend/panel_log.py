@@ -2,13 +2,12 @@
 from __future__ import annotations
 
 import logging
-import os
 import sqlite3
 import threading
 from datetime import datetime, timezone
+from paths import DB_PATH as DEFAULT_DB_PATH
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(ROOT, "jobs.db")
+DB_PATH = str(DEFAULT_DB_PATH)
 MAX_ROWS = 800
 _lock = threading.Lock()
 
