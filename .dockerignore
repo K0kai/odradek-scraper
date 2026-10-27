@@ -1,0 +1,16 @@
+.git
+.venv
+__pycache__
+*.pyc
+*.db
+*.db-*
+.env
+.env.*
+resumes/
+copilot_uploads/
+linkedin_browser_profile/
+tmp/
+tests/
+frontend/node_modules/
+frontend/dist/
+docs/superpowers/

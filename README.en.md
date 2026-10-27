@@ -4,7 +4,7 @@
 
 A **personal, educational** project for exploring the following in a local environment:
 
-- simple HTTP dashboards in Python (`http.server`)
+- a responsive React/TypeScript dashboard served by FastAPI
 - local storage with SQLite
 - third-party API integrations (using API keys configured by the user)
 - PDF parsing and manual form assistance
@@ -33,12 +33,17 @@ This repository is provided **“as is”**, without warranties. It does not con
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+# Build the React frontend:
+cd frontend
+npm ci
+npm run build
+cd ..
 # Browser dependencies, if you plan to explore those modules:
 # playwright install
 python app.py
 ```
 
-Open `http://127.0.0.1:8765`. Do not expose the port to the internet: the dashboard **has no authentication**.
+Open `http://127.0.0.1:8765`. Local access is open by default. Set `PANEL_PASSWORD` to enable the password screen locally. On Render, this variable is required; the signed browser session lasts seven days.
 
 Each click on **Iniciar bot** (Start bot) runs a single collection cycle and stops automatically. To search again, click **Iniciar bot** once more. There is no recurring schedule or automatic interval; **Parar bot** (Stop bot) interrupts the current cycle.
 

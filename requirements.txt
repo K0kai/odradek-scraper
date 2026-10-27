@@ -6,3 +6,5 @@ reportlab>=4.4,<5
 playwright>=1.40,<2
 pydoll-python>=3,<4
 psycopg[binary]>=3.2,<4
+fastapi>=0.160,<0.163
+uvicorn>=0.52,<0.55

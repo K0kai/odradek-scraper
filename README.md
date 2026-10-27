@@ -4,7 +4,7 @@
 
 Projeto **pessoal e educacional** para estudar, em ambiente local:
 
-- painéis HTTP simples em Python (`http.server`)
+- painel responsivo em React/TypeScript servido pela API FastAPI
 - armazenamento local com SQLite
 - integração com APIs de terceiros (quando o usuário configura as próprias chaves)
 - parsing de PDF e suporte ao preenchimento manual de formulários
@@ -33,12 +33,24 @@ Este repositório é fornecido **“como está”**, sem garantias. Não constit
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+cd frontend
+npm ci
+npm run build
+cd ..
 # dependências de browser, se for estudar esses módulos:
 # playwright install
-python app.py
+python -m uvicorn api_asgi:api --host 127.0.0.1 --port 8765
 ```
 
-Abra `http://127.0.0.1:8765`. Não exponha a porta na internet: o painel **não tem autenticação**.
+Abra `http://127.0.0.1:8765`. O painel local não exige senha por padrão. Configure `PANEL_PASSWORD` se expuser a porta além da sua máquina.
+
+### Painel web
+
+A interface responsiva está em `http://127.0.0.1:8765/` após compilar o frontend.
+
+Ela cobre Visão geral, Vagas para revisar, Filas de IA, Logs, Uso e cotas, Assistente, Currículos, perguntas pendentes do copiloto, configurações, regras de formulário, teste SMTP, edição visual e geração com IA dos filtros LinkedIn. Para desenvolver o frontend, execute `npm run dev` em `frontend/` com o backend Python na porta 8765. A spec e o estado da migração estão em `docs/frontend-migration-spec.md`.
+
+O `Dockerfile` compila o frontend e inicia FastAPI em um único Web Service. No Render, selecione o runtime Docker para o serviço existente e mantenha as variáveis e os diretórios persistentes já usados. Configure uma senha longa e exclusiva em `PANEL_PASSWORD` antes do deploy; sem ela, o painel responde com erro 503. O acesso usa uma página de senha e um cookie assinado, válido por 7 dias, com `HttpOnly`, `SameSite=Lax` e `Secure` no Render. O botão **Sair** remove o cookie do navegador. Alterar `PANEL_PASSWORD` invalida as sessões existentes. Opcionalmente, configure `PANEL_SESSION_SECRET` com um valor aleatório estável entre deploys para fortalecer a assinatura. A mesma proteção cobre a interface, a API e os downloads. Os endpoints de perfil e regras para a extensão exigem a sessão e não liberam acesso de qualquer origem. A extensão precisa de adaptação para acessar o serviço hospedado.
 
 Cada clique em **Iniciar bot** executa um único ciclo de coleta e encerra automaticamente. Para buscar de novo, clique em **Iniciar bot** outra vez. Não existe agendamento recorrente nem intervalo automático; **Parar bot** interrompe o ciclo em andamento.
 
@@ -50,7 +62,7 @@ Cada clique em **Iniciar bot** executa um único ciclo de coleta e encerra autom
 - Configure a mesma `DATABASE_URL` como variável secreta no Render. Nunca a salve no repositório.
 - O Render não oferece o cofre de credenciais do sistema operacional usado pelo `keyring` local. Para salvar e alterar chaves pelo painel, configure **uma única vez** `SECRET_ENCRYPTION_KEY` em **Environment**. Gere uma chave Fernet localmente com `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`, copie o resultado para o Render e mantenha uma cópia segura: sem essa mesma chave, os segredos salvos não podem ser descriptografados. As chaves de API são criptografadas com Fernet antes de serem gravadas como valores internos na tabela `settings` do Postgres. Variáveis como `GEMINI_API_KEY`, `OPENAI_API_KEY`, `ADZUNA_APP_ID`, `ADZUNA_APP_KEY`, `APIFY_TOKEN` e `SMTP_PASSWORD` continuam aceitas como fallback, mas segredos cadastrados pelo painel no banco têm prioridade.
 - Currículos e arquivos enviados ficam no sistema de arquivos, não no banco; configure um disco persistente no Render e defina `RESUMES_DIR` e `COPILOT_UPLOADS_DIR` para diretórios nesse disco. Copie os arquivos locais para lá antes de usar os registros migrados.
-- O painel não tem autenticação. Não o exponha publicamente até adicionar proteção de acesso.
+- No Render, `PANEL_PASSWORD` é obrigatória e protege o painel e a API com sessão por cookie de 7 dias. Mantenha HTTPS, fornecido pelo Render, e adapte a extensão caso ela precise acessar o serviço hospedado.
 - O servidor não executa candidaturas por navegador. Em vagas com formulário, use **Abrir vaga + extensão** e importe manualmente seu perfil pelo botão da extensão; revise os campos e envie a candidatura no Chrome. A automação do servidor permanece limitada ao envio por e-mail SMTP. O endpoint `/api/autofill-rules` compartilha somente nomes e aliases de campos com a extensão.
 
 ## Privacidade e o que não versionar

@@ -15,3 +15,5 @@ linkedin_browser_profile/
 # Notas internas e suíte local — fora do repositório público
 docs/superpowers/
 tests/
+frontend/node_modules/
+frontend/dist/

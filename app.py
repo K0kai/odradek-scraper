@@ -1,28 +1,26 @@
-# Odradek Scraper: interface local, armazenamento, busca e preparação de candidaturas.
+# Odradek Scraper: dados, coleta, busca e preparação de candidaturas.
 # O host e a porta podem ser sobrescritos pelo ambiente de deploy (ex.: Render).
 from __future__ import annotations
 
-import gzip
 import hashlib
-import html
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, quote_plus, urlparse
+from urllib.parse import quote_plus, urlparse
 from urllib.request import Request, urlopen
 
 from dbutil import open_connection, using_postgres
 from apply_channels import apply_via_email, record_blocked, send_smtp_email
-from dates_br import BRASILIA, format_brasilia, format_brasilia_date, format_cycle_label_display, format_cycle_range, parse_utc
+from dates_br import BRASILIA, format_cycle_range, parse_utc
 
-from form_rules import ensure_default_rules, list_rules, save_rules_from_form
+from form_rules import ensure_default_rules
 from job_queue import (
     KIND_APPLY,
     KIND_RESUME,
@@ -33,12 +31,11 @@ from resume_pipeline import (
     AiUnavailableError,
     get_resume,
     mark_resume_analysis_error,
-    persist_resume_upload,
     resume_match_snippets,
     resume_summaries,
     run_resume_analysis,
 )
-from panel_log import attach_to_logger, clear_logs, ensure_log_table, list_logs, log_event
+from panel_log import attach_to_logger, ensure_log_table, list_logs, log_event
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -48,7 +45,8 @@ COPILOT_UPLOADS_DIR = os.environ.get(
     "COPILOT_UPLOADS_DIR", os.path.join(ROOT, "copilot_uploads")
 )
 FAVICON_PATH = os.path.join(ROOT, "assets", "public", "odradek-icon.png")
-HOST = os.environ.get("HOST", "0.0.0.0")
+FRONTEND_DIST = os.path.join(ROOT, "frontend", "dist")
+HOST = os.environ.get("HOST", "0.0.0.0" if os.environ.get("RENDER", "").casefold() == "true" else "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8765"))
 LOG = logging.getLogger("odradek-scraper")
 
@@ -793,7 +791,6 @@ Description: {re.sub(r'<[^>]+>', ' ', job['description'])[:10000]}"""
     }
 
 
-
 def is_linkedin_job(job: dict) -> bool:
     blob = " ".join(
         str(job.get(key) or "")
@@ -1177,7 +1174,7 @@ def load_apify_quota_snapshot() -> dict:
 
 
 def refresh_apify_quota_snapshot() -> dict:
-    """Busca limites oficiais da Apify e grava cache em settings (não usado no /live)."""
+    """Busca limites oficiais da Apify e grava cache em settings."""
     from usage_tracker import APIFY_SNAPSHOT_KEY, parse_apify_limits
 
     token = secret_get("apify_token")
@@ -1218,84 +1215,6 @@ def refresh_apify_quota_snapshot() -> dict:
         }
     set_setting(APIFY_SNAPSHOT_KEY, json.dumps(snap, ensure_ascii=False))
     return snap
-
-
-def usage_dashboard_html() -> str:
-    """Painel Uso & cotas: Apify (cache API) + estimativa local da IA ativa."""
-    from usage_tracker import STORE_KEY, load_store, summarize_ai_usage
-
-    cfg = settings()
-    provider = (cfg.get("ai_provider") or "gemini").casefold()
-    model = (cfg.get("ai_model") or "").strip()
-    snap = load_apify_quota_snapshot()
-    store = load_store(cfg.get(STORE_KEY) or "")
-    ai = summarize_ai_usage(store, provider=provider)
-
-    def bar(pct: float, *, warn: float = 80.0) -> str:
-        pct = max(0.0, min(100.0, float(pct or 0)))
-        cls = "usage-bar-fill warn" if pct >= warn else "usage-bar-fill"
-        return (
-            f'<div class="usage-bar"><div class="{cls}" style="width:{pct:.1f}%"></div></div>'
-            f'<p class="hint" style="margin:6px 0 0">{pct:.0f}% do limite</p>'
-        )
-
-    if snap.get("error") and not snap.get("fetched_at"):
-        apify_body = f'<p class="hint">{esc(snap.get("error"))}</p>'
-    elif not snap:
-        apify_body = '<p class="hint">Ainda sem dados. Clique em <strong>Atualizar cotas</strong> para consultar a API Apify.</p>'
-    else:
-        used = float(snap.get("used_usd") or 0)
-        api_lim = float(snap.get("api_limit_usd") or 0)
-        local_lim = float(snap.get("local_limit_usd") or 0)
-        effective = local_lim if local_lim > 0 else api_lim
-        pct = float(snap.get("pct_of_local") if local_lim > 0 else snap.get("pct_of_api") or 0)
-        err = snap.get("error") or ""
-        apify_body = (
-            f'<div class="usage-metrics">'
-            f'<div><span>Usado (ciclo)</span><strong>${used:.2f}</strong></div>'
-            f'<div><span>Limite da conta (API)</span><strong>${api_lim:.2f}</strong></div>'
-            f'<div><span>Limite local (painel)</span><strong>${local_lim:.2f}</strong></div>'
-            f'<div><span>Ciclo</span><strong>{esc(format_cycle_label_display(snap.get("cycle_label") or "—"))}</strong></div>'
-            f'</div>'
-            f'{bar(pct if effective > 0 else 0)}'
-            f'<p class="hint">Última consulta: {esc(format_brasilia(snap.get("fetched_at") or "")) or "—"}'
-            + (f' · {esc(err)}' if err else "")
-            + "</p>"
-        )
-
-    day = ai["day"]
-    month = ai["month"]
-    provider_label = {"gemini": "Gemini", "openai": "OpenAI"}.get(provider, provider)
-    ai_body = (
-        f'<p class="hint"><strong>Estimativa local deste app</strong> — não é a cota oficial do provedor. '
-        f'Conta só chamadas feitas por aqui (tokens quando a API devolver).</p>'
-        f'<p class="hint">Provedor ativo: <strong>{esc(provider_label)}</strong>'
-        + (f' · modelo <code>{esc(model)}</code>' if model else "")
-        + f' · dia {esc(ai["day_label"])} / mês {esc(ai["month_label"])} (Brasília)</p>'
-        f'<div class="usage-metrics">'
-        f'<div><span>Chamadas OK (hoje)</span><strong>{int(day.get("calls_ok") or 0)}</strong></div>'
-        f'<div><span>Erros de quota (hoje)</span><strong>{int(day.get("calls_quota_error") or 0)}</strong></div>'
-        f'<div><span>Tokens in / out (hoje)</span><strong>{int(day.get("tokens_in") or 0)} / {int(day.get("tokens_out") or 0)}</strong></div>'
-        f'<div><span>Chamadas OK (mês)</span><strong>{int(month.get("calls_ok") or 0)}</strong></div>'
-        f'<div><span>Tokens in / out (mês)</span><strong>{int(month.get("tokens_in") or 0)} / {int(month.get("tokens_out") or 0)}</strong></div>'
-        f'<div><span>Erros de quota (mês)</span><strong>{int(month.get("calls_quota_error") or 0)}</strong></div>'
-        f'</div>'
-        f'<p class="hint">Painel oficial: '
-        f'<a href="https://aistudio.google.com/usage" target="_blank" rel="noreferrer">Google AI Studio</a> · '
-        f'<a href="https://platform.openai.com/usage" target="_blank" rel="noreferrer">OpenAI Usage</a></p>'
-    )
-
-    return (
-        '<section class="panel">'
-        '<div class="actions" style="justify-content:space-between;margin-top:0">'
-        "<h2 style=\"margin:0\">Uso &amp; cotas</h2>"
-        '<form method="post" action="/usage-refresh" class="js-process-form">'
-        '<button type="submit" class="subtle">Atualizar cotas Apify</button></form></div>'
-        '<div class="usage-grid">'
-        f'<article class="usage-card"><h3>Apify</h3>{apify_body}</article>'
-        f'<article class="usage-card"><h3>IA ({esc(provider_label)})</h3>{ai_body}</article>'
-        "</div></section>"
-    )
 
 
 def normalize_apify_actor_id(actor_id: str) -> str:
@@ -1777,75 +1696,6 @@ def get_linkedin_search_filter(cfg: dict[str, str], *, force_refresh: bool = Fal
     """Compatibilidade dos placeholders customizados: usa o primeiro filtro ativo."""
     filters = get_linkedin_search_filters(cfg, force_refresh=force_refresh)
     return next((item for item in filters if item.get("enabled")), filters[0] if filters else _fallback_linkedin_filter(cfg))
-
-
-def linkedin_filter_panel_html(cfg: dict[str, str] | None = None) -> str:
-    """Editor dos filtros independentes usados nos runs de busca LinkedIn."""
-    cfg = cfg or settings()
-    try:
-        raw_filters = json.loads((cfg.get("apify_linkedin_filters_json") or "").strip() or "null")
-    except json.JSONDecodeError:
-        raw_filters = None
-    if raw_filters is None:
-        try:
-            legacy = json.loads((cfg.get("apify_linkedin_filter_json") or "").strip() or "null")
-            raw_filters = [legacy] if isinstance(legacy, dict) else None
-        except json.JSONDecodeError:
-            raw_filters = None
-    filters = _normalize_linkedin_filters(raw_filters, cfg, fallback_if_empty=False)
-    exp_labels = {1: "Estágio", 2: "Júnior", 3: "Associado", 4: "Pleno / sênior", 5: "Diretor", 6: "Executivo"}
-    workplace_labels = {1: "Presencial", 2: "Remoto", 3: "Híbrido"}
-    cards = []
-    for item in filters:
-        checked = " checked" if item.get("enabled", True) else ""
-        selected_exp = {int(x) for x in item.get("experience_levels", []) if str(x).isdigit()}
-        selected_workplace = {int(x) for x in item.get("workplace_types", []) if str(x).isdigit()}
-        experience_options = "".join(
-            f'<label class="linkedin-filter-option"><input type="checkbox" data-filter-experience value="{code}"'
-            f'{" checked" if code in selected_exp else ""}>{label}</label>'
-            for code, label in exp_labels.items()
-        )
-        workplace_options = "".join(
-            f'<label class="linkedin-filter-option"><input type="checkbox" data-filter-workplace value="{code}"'
-            f'{" checked" if code in selected_workplace else ""}>{label}</label>'
-            for code, label in workplace_labels.items()
-        )
-        cards.append(
-            f'<article class="linkedin-filter-card" data-filter-id="{esc(item["id"])}" '
-            f'data-filter-source="{esc(item.get("source", "manual"))}" '
-            f'data-filter-reason="{esc(item.get("reason", ""))}">'
-            '<div class="linkedin-filter-head"><label class="linkedin-filter-enable">'
-            f'<input type="checkbox" data-filter-enabled{checked}> Usar nesta busca</label>'
-            '<button type="button" class="subtle linkedin-filter-delete">Excluir</button></div>'
-            '<label>Nome do filtro<input data-filter-name maxlength="80" value="'
-            f'{esc(item.get("name", ""))}"></label>'
-            '<label>Keywords (separadas por vírgula)<input data-filter-keywords value="'
-            f'{esc(", ".join(item.get("keywords", [])))}"></label>'
-            '<label>Locais (separados por vírgula)<input data-filter-locations value="'
-            f'{esc(", ".join(item.get("locations", [])))}"></label>'
-            '<div class="linkedin-filter-options"><strong>Experiência</strong>'
-            f'{experience_options}</div>'
-            '<div class="linkedin-filter-options"><strong>Modelo de trabalho</strong>'
-            f'{workplace_options}</div><small class="hint">'
-            f'{esc(item.get("reason", ""))}</small></article>'
-        )
-    filters_json = esc(json.dumps(filters, ensure_ascii=False))
-    return (
-        '<div id="linkedin-filter-panel" class="resume-card" style="margin-top:12px">'
-        '<h3 style="margin:0 0 8px;font-size:14px">Filtros LinkedIn</h3>'
-        '<p class="hint">Cada filtro ativo executa uma busca Apify independente e consome um run do actor. '
-        'Desative filtros para '
-        'pausá-los sem perder a configuração; use Excluir para removê-los.</p>'
-        f'<input type="hidden" id="linkedin-filters-json" name="apify_linkedin_filters_json" value="{filters_json}">'
-        f'<div id="linkedin-filter-list">{"".join(cards) if cards else "<p class=\"hint\">Nenhum filtro criado ainda. Adicione um manualmente ou peça à IA para gerar vários.</p>"}</div>'
-        '<div class="linkedin-filter-add"><input id="new-linkedin-filter-name" placeholder="Nome do novo filtro">'
-        '<input id="new-linkedin-filter-keywords" placeholder="Keywords separadas por vírgula">'
-        '<button type="button" class="subtle" id="linkedin-filter-add">Adicionar filtro</button>'
-        '<button type="submit" class="subtle" formaction="/linkedin-filters-generate">Gerar filtros com IA</button></div>'
-        f'<p class="hint">As URLs são limitadas a {LINKEDIN_MAX_AGE_DAYS} dias; priorizam as últimas 24h. '
-        'A IA separa títulos e competências em filtros menores. Edite os filtros, marque quais usar e salve as preferências.</p>'
-        '</div>'
-    )
 
 
 def build_linkedin_search_urls(filter_data: dict, *, max_urls: int = 4) -> list[str]:
@@ -2452,10 +2302,6 @@ def _boot_queue() -> None:
     queue.start()
 
 
-def esc(value: object) -> str:
-    return html.escape(str(value or ""), quote=True)
-
-
 def load_dashboard() -> tuple[dict, list, list]:
     with connect() as db:
         counts = {row["status"]: row["n"] for row in db.execute("SELECT status,COUNT(*) n FROM jobs GROUP BY status")}
@@ -2464,168 +2310,287 @@ def load_dashboard() -> tuple[dict, list, list]:
     return counts, jobs, runs
 
 
-def stats_html(counts: dict) -> str:
-    return "".join(
-        f'<div class="stat"><span>{esc(label)}</span><strong>{counts.get(key, 0)}</strong></div>'
-        for key, label in [
-            ("new", "Novas"),
-            ("worth", "Vale olhar"),
-            ("prepared", "Preparadas"),
-            ("applied", "Aplicadas"),
-            ("ignored", "Ignoradas"),
-        ]
-    )
+def _job_api_record(row) -> dict:
+    """Keep the browser contract independent from database row implementations."""
+    data = dict(row)
+    data["description"] = re.sub(r"<[^>]+>", " ", data.get("description") or "")[:1800]
+    data["match_score"] = int(data["match_score"]) if data.get("match_score") is not None else None
+    data["has_cover_letter"] = bool(data.pop("cover_letter", None))
+    if urlparse(data.get("url") or "").scheme not in {"http", "https"}:
+        data["url"] = ""
+    data.pop("fingerprint", None)
+    return data
 
 
-def job_rows_html(jobs, collecting: bool) -> str:
-    rows = []
-    for job in jobs:
-        description = re.sub(r"<[^>]+>", " ", job["description"])
-        lang_label = {"pt": "Português", "en": "English", "unknown": "Incerto"}.get(job["language"], job["language"])
-        confidence = f" · {job['language_confidence']:.0%}" if job["language_confidence"] else ""
-        letter_ui = f'<details><summary>{"Carta criada" if job["cover_letter"] else "Carta não criada"}</summary><div class="description">{esc(job["cover_letter"] or "A carta será gerada automaticamente na candidatura.")}</div></details>'
-        if job["cover_letter"]:
-            letter_ui += f'<a href="/cover-letter.pdf?job_id={int(job["id"])}" download>Baixar PDF</a>'
-        if "COPILOT_UNAUTOMATED:" in (job["notes"] or ""):
-            notes = (
-                '<span style="background:#3a2f00;border:1px solid #e8c33f;color:#ffd54a;'
-                'font-weight:700;padding:3px 8px;border-radius:6px">⚠ fluxo não automatizado pela IA'
-                "</span>"
-                f'<details><summary>Detalhes</summary><div class="description">{esc(job["notes"])}</div></details>'
-            )
-        else:
-            notes = f'<details><summary>Notas</summary><div class="description">{esc(job["notes"] or "—")}</div></details>' if job["notes"] else ""
-        rows.append(f'''<tr><td><a class="job-title" href="{esc(job['url'])}" target="_blank" rel="noreferrer">{esc(job['title'])}</a><small>{esc(job['company'])}</small></td><td>{esc(job['location'])}</td><td><span class="source" title="{esc(job['source'])}">{esc(job['source'])}</span></td><td><span title="Confiança do detector: {confidence}">{esc(lang_label + confidence)}</span></td><td>{esc(STATUSES.get(job['status'], job['status']))}</td><td>{letter_ui}{notes}<details><summary>Descrição</summary><div class="description">{esc(description[:1800])}</div></details></td><td><small>{esc(format_brasilia_date(job['posted_at'] or job['first_seen_at']))}</small></td></tr>''')
-    if rows:
-        return "".join(rows)
-    if collecting:
-        return '<tr><td colspan="7">Buscando vagas… as novas aparecem aqui assim que forem encontradas.</td></tr>'
-    return '<tr><td colspan="7">Nenhuma vaga ainda. Configure as fontes e inicie o bot.</td></tr>'
+def dashboard_api_payload() -> dict:
+    with connect() as db:
+        counts = {row["status"]: row["n"] for row in db.execute("SELECT status, COUNT(*) n FROM jobs GROUP BY status")}
+        rows = db.execute(
+            "SELECT jobs.id, jobs.title, jobs.company, jobs.location, jobs.source, jobs.url, "
+            "jobs.posted_at, jobs.first_seen_at, jobs.status, jobs.description, jobs.notes, "
+            "cover_letters.body AS cover_letter, " + _worth_match_expr() + " AS match_score "
+            "FROM jobs LEFT JOIN cover_letters ON cover_letters.job_id=jobs.id "
+            "ORDER BY jobs.first_seen_at DESC LIMIT 20"
+        ).fetchall()
+        runs = [dict(row) for row in db.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 8")]
+    return {"counts": counts, "jobs": [{**_job_api_record(row), "description": "", "notes": ""} for row in rows], "runs": runs,
+            "collector": collector.snapshot(), "status_labels": STATUSES}
 
 
-def history_html(runs) -> str:
-    return "".join(
-        f'<li><span>{esc(format_brasilia(run["started_at"]))}</span> {esc(run["message"] or run["state"])}</li>'
-        for run in runs
-    ) or "<li>Nenhuma execução ainda.</li>"
+def jobs_api_payload(*, page: int = 1, page_size: int = 15, status: str = "worth",
+                     min_match: int = 0, sort: str = "", date_from: str = "", date_to: str = "") -> dict:
+    page = max(1, page)
+    page_size = max(5, min(50, page_size))
+    min_match = max(0, min(100, min_match))
+    status = status if status in STATUSES else "worth"
+    sort = normalize_worth_sort(sort)
+    if date_from and date_to and date_from > date_to:
+        date_from, date_to = date_to, date_from
+    lo, hi = worth_date_bounds_utc(date_from, date_to)
+    where = "jobs.status = ?"
+    params: list[object] = [status]
+    if min_match:
+        where += f" AND COALESCE({_worth_match_expr()}, 0) >= ?"
+        params.append(min_match)
+    if lo:
+        where += " AND jobs.first_seen_at >= ?"
+        params.append(lo)
+    if hi:
+        where += " AND jobs.first_seen_at < ?"
+        params.append(hi)
+    with connect() as db:
+        total = int(db.execute(f"SELECT COUNT(*) n FROM jobs WHERE {where}", params).fetchone()["n"])
+        pages = max(1, (total + page_size - 1) // page_size)
+        page = min(page, pages)
+        rows = db.execute(
+            "SELECT jobs.id, jobs.title, jobs.company, jobs.location, jobs.source, jobs.url, "
+            "jobs.posted_at, jobs.first_seen_at, jobs.status, jobs.description, jobs.notes, "
+            "cover_letters.body AS cover_letter, " + _worth_match_expr() + " AS match_score "
+            "FROM jobs LEFT JOIN cover_letters ON cover_letters.job_id=jobs.id "
+            f"WHERE {where} ORDER BY {worth_order_sql(sort)} LIMIT ? OFFSET ?",
+            [*params, page_size, (page - 1) * page_size],
+        ).fetchall()
+    return {"items": [_job_api_record(row) for row in rows], "total": total, "page": page,
+            "pages": pages, "page_size": page_size, "filters": {"status": status,
+            "min_match": min_match, "sort": sort, "date_from": date_from, "date_to": date_to}}
 
 
-def logs_html(limit: int = 200) -> str:
-    rows = list_logs(limit)
-    if not rows:
-        return '<div class="log-empty">Nenhum evento ainda. Inicie o bot, envie um currículo ou rode um teste SMTP para ver o fluxo aqui.</div>'
-    parts = []
-    for row in rows:
-        level = esc(row["level"])
-        when = esc(format_brasilia(row["created_at"]))
-        source = esc(row["source"])
-        message = esc(row["message"])
-        parts.append(
-            f'<div class="log-line log-{level}">'
-            f'<span class="log-time">{when}</span>'
-            f'<span class="log-level">{level}</span>'
-            f'<span class="log-source">{source}</span>'
-            f'<span class="log-msg">{message}</span></div>'
+def queue_api_payload() -> dict:
+    items = []
+    for row in queue.list_jobs(limit=100):
+        record = dict(row)
+        progress = (record.get("progress_log") or "").splitlines()
+        items.append({key: record.get(key) for key in (
+            "id", "kind", "status", "attempts", "max_attempts", "next_run_at",
+            "created_at", "updated_at",
+        )} | {"last_step": (progress[-1] if progress else "")[:280],
+             "progress": "\n".join(progress[-40:])[-4000:],
+             "outcome": (record.get("last_error") or record.get("result") or "")[:500]})
+    return {"counts": queue.counts(), "items": items}
+
+
+def logs_api_payload(limit: int = 200) -> dict:
+    return {"items": [dict(row) for row in list_logs(max(1, min(500, limit)))]}
+
+
+def usage_api_payload() -> dict:
+    from usage_tracker import STORE_KEY, load_store, summarize_ai_usage
+
+    cfg = settings()
+    provider = (cfg.get("ai_provider") or "gemini").casefold()
+    store = load_store(cfg.get(STORE_KEY) or "")
+    return {"provider": provider, "model": cfg.get("ai_model") or "",
+            "apify": load_apify_quota_snapshot(),
+            "ai": summarize_ai_usage(store, provider=provider)}
+
+
+def resumes_api_payload() -> dict:
+    with connect() as db:
+        rows = {lang: get_resume(db, lang) for lang in ("pt", "en")}
+    result = {}
+    for lang, row in rows.items():
+        result[lang] = None if row is None else {
+            "language": lang,
+            "filename": row["original_filename"],
+            "status": row["analysis_status"],
+            "message": row["analysis_message"],
+            "error": row["analysis_error"],
+            "summary": row["analysis_summary"],
+            "analysis_json": row["analysis_json"],
+            "analyzed_at": row["analyzed_at"],
+            "provider": row["provider"],
+            "model": row["model"],
+        }
+    return result
+
+
+def send_smtp_test() -> tuple[bool, str]:
+    cfg = settings()
+    to_addr = (cfg.get("candidate_email") or cfg.get("smtp_from") or "").strip()
+    if not to_addr:
+        return False, "Configure o e-mail do candidato ou remetente para testar."
+    try:
+        send_smtp_email(
+            cfg=cfg,
+            password=secret_get("smtp_password"),
+            to_addrs=[to_addr],
+            subject="Odradek Scraper — teste SMTP",
+            body="Este é um e-mail de teste do Odradek Scraper.",
+            attachment_path=None,
         )
-    return "".join(parts)
+        log_event("success", "smtp", f"E-mail de teste enviado para {to_addr}.")
+        return True, f"E-mail de teste enviado para {to_addr}."
+    except Exception as exc:
+        log_event("error", "smtp", f"Falha no teste SMTP: {exc}")
+        return False, f"Falha no teste SMTP: {exc}"
 
 
-def queue_html(limit: int = 100) -> str:
-    rows = queue.list_jobs(limit=limit)
-    counts = queue.counts()
-    summary = (
-        f'<p class="hint">Ativos: pending={counts.get("pending",0)} · running={counts.get("running",0)} · '
-        f'retry_wait={counts.get("retry_wait",0)} · succeeded={counts.get("succeeded",0)} · '
-        f'failed={counts.get("failed",0)} · cancelled={counts.get("cancelled",0)}. '
-        f'Vagas novas não entram sozinhas — use o botão abaixo ou ligue a triagem automática. '
-        f'Paralelismo: {esc(settings().get("queue_max_workers","3"))} worker(s).</p>'
-    )
-    if not rows:
-        return summary + '<p class="hint">Nenhum job na fila ainda.</p>'
-    kind_label = {
-        KIND_RESUME: "Análise de currículo",
-        KIND_APPLY: "Candidatura",
-        KIND_WORTH_REVERIFY: "Verificação diária de vagas",
-        "linkedin_apply": "Candidatura por navegador (retirada)",
-    }
-    status_label = {
-        "pending": "Pendente",
-        "running": "Executando",
-        "retry_wait": "Aguardando retry",
-        "succeeded": "Sucesso",
-        "failed": "Falhou",
-        "cancelled": "Cancelado",
-    }
-    body = []
-    for row in rows:
-        jid = int(row["id"])
-        actions = []
-        if row["status"] in {"pending", "retry_wait", "running"}:
-            actions.append(
-                f'<form method="post" action="/queue-cancel" class="js-process-form" style="display:inline">'
-                f'<input type="hidden" name="id" value="{jid}"><button class="subtle" type="submit" data-live-key="queue-cancel-{jid}">Cancelar</button></form>'
+SETTINGS_API_GROUPS = {
+    "search": ("keywords", "locations", "sources", "adzuna_countries", "apify_monthly_credit_limit_usd",
+               "apify_job_count", "apify_actors_json", "linkedin_filter_prompt", "apify_linkedin_filters_json"),
+    "profile": ("candidate_name", "candidate_email", "candidate_phone", "candidate_linkedin",
+                "candidate_city", "candidate_street", "candidate_postal_code", "candidate_state",
+                "candidate_country", "candidate_current_company", "candidate_cpf", "salary_expectation_brl",
+                "salary_expectation_usd", "salary_currency_preference", "salary_pj_multiplier",
+                "candidate_contract_type", "candidate_gender", "candidate_race", "candidate_lgbtq",
+                "candidate_pcd", "candidate_diversity_note"),
+    "ai": ("ai_provider", "ai_model", "candidate_facts_pt", "candidate_facts_en",
+           "job_selection_optimism", "job_selection_prompt"),
+    "automation": ("auto_apply", "minimum_match_score", "queue_max_workers", "queue_max_attempts",
+                   "queue_ttl_hours", "copilot_ask_sound", "copilot_ask_sound_volume"),
+    "smtp": ("smtp_host", "smtp_port", "smtp_user", "smtp_from", "smtp_use_tls"),
+}
+
+
+def settings_api_payload(group: str) -> dict:
+    cfg = settings()
+    values = {key: cfg.get(key, "") for key in SETTINGS_API_GROUPS[group]}
+    if group == "search":
+        values["linkedin_filter_prompt"] = effective_linkedin_filter_prompt(cfg)
+        if not values["apify_linkedin_filters_json"].strip():
+            try:
+                legacy = json.loads((cfg.get("apify_linkedin_filter_json") or "").strip() or "null")
+            except json.JSONDecodeError:
+                legacy = None
+            if isinstance(legacy, dict):
+                filters = _normalize_linkedin_filters([legacy], cfg, fallback_if_empty=False)
+                values["apify_linkedin_filters_json"] = json.dumps(filters, ensure_ascii=False)
+    return {"group": group, "values": values}
+
+
+def save_settings_api_group(group: str, incoming: dict) -> str:
+    if not isinstance(incoming, dict):
+        raise ValueError("Configuração inválida")
+    keys = SETTINGS_API_GROUPS[group]
+    form = {}
+    for key in keys:
+        if key in incoming:
+            value = incoming[key]
+            if not isinstance(value, str) or len(value) > 30000:
+                raise ValueError(f"Valor inválido para {key}")
+            form[key] = value
+    for key in ("api_key", "adzuna_app_id", "adzuna_app_key", "apify_token", "smtp_password"):
+        if key in incoming and (not isinstance(incoming[key], str) or len(incoming[key]) > 8192):
+            raise ValueError(f"Valor inválido para {key}")
+    if group == "search":
+        if "apify_job_count" in form and not (form["apify_job_count"].isdigit() and 1 <= int(form["apify_job_count"]) <= 100):
+            raise ValueError("Máximo de vagas Apify deve ficar entre 1 e 100")
+        if "apify_monthly_credit_limit_usd" in form:
+            try:
+                amount = float(form["apify_monthly_credit_limit_usd"])
+                if not math.isfinite(amount) or amount < 0:
+                    raise ValueError
+            except ValueError as exc:
+                raise ValueError("Limite Apify inválido") from exc
+        if form.get("apify_actors_json", "").strip():
+            load_apify_actors({**settings(), **form})
+        if "apify_linkedin_filters_json" in form:
+            form["apify_linkedin_filters_json"] = _validate_linkedin_filter_form(
+                form["apify_linkedin_filters_json"], {**settings(), **form}
             )
-        if row["kind"] != "linkedin_apply" and row["status"] in {"retry_wait", "failed", "cancelled", "running"}:
-            actions.append(
-                f'<form method="post" action="/queue-retry" class="js-process-form" style="display:inline">'
-                f'<input type="hidden" name="id" value="{jid}"><button class="subtle" type="submit" data-live-key="queue-retry-{jid}">Reenfileirar</button></form>'
-            )
-        progress_raw = ""
-        try:
-            progress_raw = str(row["progress_log"] or "")
-        except (KeyError, IndexError):
-            progress_raw = ""
-        progress_lines = [ln for ln in progress_raw.splitlines() if ln.strip()]
-        last_step = progress_lines[-1] if progress_lines else ""
-        outcome = (row["last_error"] or row["result"] or "").strip()
-        detail_bits = []
-        if last_step:
-            detail_bits.append(f'<div class="queue-step"><small>{esc(last_step[:280])}</small></div>')
-        if len(progress_lines) > 1:
-            hist = esc("\n".join(progress_lines[-40:]))
-            detail_bits.append(
-                f'<details class="queue-progress" data-live-key="queue-history-{jid}"><summary><small>histórico '
-                f'({len(progress_lines)})</small></summary>'
-                f'<pre style="white-space:pre-wrap;max-height:220px;overflow:auto;'
-                f'font-size:11px;margin:4px 0 0">{hist}</pre></details>'
-            )
-        if outcome:
-            detail_bits.append(
-                f'<div class="queue-outcome"><small>{esc(outcome[:220])}</small></div>'
-            )
-        if not detail_bits:
-            detail_bits.append("<small>—</small>")
-        body.append(
-            "<tr>"
-            f"<td>#{jid}</td>"
-            f"<td>{esc(kind_label.get(row['kind'], row['kind']))}</td>"
-            f"<td><span class=\"queue-status queue-{esc(row['status'])}\">{esc(status_label.get(row['status'], row['status']))}</span></td>"
-            f"<td>{int(row['attempts'])}/{int(row['max_attempts'])}</td>"
-            f"<td><small>{esc(format_brasilia(row['next_run_at']))}</small></td>"
-            f"<td>{''.join(detail_bits)}</td>"
-            f"<td>{' '.join(actions) or '—'}</td>"
-            "</tr>"
+        old_prompt = effective_linkedin_filter_prompt(settings())
+        if "linkedin_filter_prompt" in form and form["linkedin_filter_prompt"].strip() == DEFAULT_LINKEDIN_FILTER_PROMPT.strip():
+            form["linkedin_filter_prompt"] = ""
+        save_settings(form)
+        new_cfg = settings()
+        if effective_linkedin_filter_prompt(new_cfg) != old_prompt:
+            try:
+                generated = get_linkedin_search_filters(new_cfg, force_refresh=True)
+                return f"Preferências salvas e {len(generated)} filtros LinkedIn regenerados."
+            except Exception as exc:
+                log_event("warning", "settings", f"Regeneração do filtro LinkedIn falhou: {exc}")
+                return "Preferências salvas. O filtro LinkedIn será regenerado na próxima coleta."
+        if "apify_linkedin_filters_json" in form:
+            set_setting("apify_linkedin_filter_hash", _resume_filter_fingerprint(new_cfg))
+        return "Preferências de busca salvas."
+    if group == "ai":
+        if "ai_provider" in form and form["ai_provider"] not in {"gemini", "openai"}:
+            raise ValueError("Provedor de IA inválido")
+        if "job_selection_optimism" in form:
+            form["job_selection_optimism"] = str(job_selection_optimism_instruction(form["job_selection_optimism"])[0])
+        if "job_selection_prompt" in form and form["job_selection_prompt"].strip() == DEFAULT_JOB_SELECTION_PROMPT.strip():
+            form["job_selection_prompt"] = ""
+        save_settings(form)
+        provider = form.get("ai_provider") or settings().get("ai_provider") or "gemini"
+        if incoming.get("api_key"):
+            save_ai_key(provider, str(incoming["api_key"]))
+        for key in ("adzuna_app_id", "adzuna_app_key", "apify_token"):
+            if incoming.get(key):
+                secret_set(key, str(incoming[key]))
+        return "IA e integrações salvas."
+    if group == "automation":
+        limits = {"minimum_match_score": (0, 100), "queue_max_workers": (1, 8),
+                  "queue_max_attempts": (1, 200), "queue_ttl_hours": (1, 168)}
+        for key, (lower, upper) in limits.items():
+            if key in form and not (form[key].isdigit() and lower <= int(form[key]) <= upper):
+                raise ValueError(f"Valor inválido para {key}: use {lower} a {upper}")
+        for key in ("auto_apply", "copilot_ask_sound"):
+            if key in form:
+                form[key] = "1" if form[key] == "1" else "0"
+        if "copilot_ask_sound_volume" in form:
+            try:
+                volume = float(form["copilot_ask_sound_volume"])
+            except ValueError as exc:
+                raise ValueError("Volume inválido") from exc
+            form["copilot_ask_sound_volume"] = f"{max(0.0, min(1.0, volume)):.2f}"
+    if group == "smtp":
+        if "smtp_port" in form and not (form["smtp_port"].isdigit() and 1 <= int(form["smtp_port"]) <= 65535):
+            raise ValueError("Porta SMTP inválida")
+        save_settings(form)
+        if incoming.get("smtp_password"):
+            secret_set("smtp_password", str(incoming["smtp_password"]))
+        return "SMTP salvo."
+    save_settings(form)
+    return "Perfil salvo." if group == "profile" else "Automação salva."
+
+
+def generate_linkedin_filters(form: dict[str, str]) -> list[dict]:
+    if form.get("apify_actors_json", "").strip():
+        load_apify_actors({**settings(), "apify_actors_json": form["apify_actors_json"]})
+    raw_prompt = (form.get("linkedin_filter_prompt") or "").strip()
+    form["linkedin_filter_prompt"] = "" if raw_prompt == DEFAULT_LINKEDIN_FILTER_PROMPT.strip() else raw_prompt
+    current_cfg = {**settings(), **form}
+    if "apify_linkedin_filters_json" in form:
+        form["apify_linkedin_filters_json"] = _validate_linkedin_filter_form(
+            form["apify_linkedin_filters_json"], current_cfg
         )
-    table = (
-        '<table style="min-width:100%;font-size:13px"><thead><tr>'
-        "<th>ID</th><th>Tipo</th><th>Status</th><th>Tentativas</th><th>Próxima execução</th><th>Detalhe</th><th>Ações</th>"
-        "</tr></thead><tbody>" + "".join(body) + "</tbody></table>"
+    save_settings(form)
+    cfg = settings()
+    generated = ai_generate_linkedin_search_filters(cfg)
+    previous = _normalize_linkedin_filters(
+        json.loads(cfg.get("apify_linkedin_filters_json") or "[]"), cfg, fallback_if_empty=False,
     )
-    clear_btn = (
-        '<div style="margin-top:10px;display:flex;gap:10px;flex-wrap:wrap">'
-        '<form method="post" action="/queue-eval-new" class="js-process-form">'
-        '<button class="subtle" type="submit" data-live-key="queue-eval-new">Enfileirar vagas novas (ainda não triadas)</button></form>'
-        '<form method="post" action="/queue-retry-all" class="js-process-form">'
-        '<button class="subtle" type="submit" data-live-key="queue-retry-all">Reenfileirar falhos/cancelados/retry</button></form>'
-        '<form method="post" action="/queue-clear" class="js-process-form">'
-        '<button class="subtle" type="submit" data-live-key="queue-clear">Limpar concluídos/falhos/cancelados</button></form>'
-        "</div>"
-    )
-    return summary + table + clear_btn
+    previous_states = {item["name"].casefold(): item["enabled"] for item in previous}
+    for item in generated:
+        if item["name"].casefold() in previous_states:
+            item["enabled"] = previous_states[item["name"].casefold()]
+    set_setting("apify_linkedin_filters_json", json.dumps(generated, ensure_ascii=False))
+    set_setting("apify_linkedin_filter_json", json.dumps(generated[0], ensure_ascii=False))
+    set_setting("apify_linkedin_filter_hash", _resume_filter_fingerprint(cfg))
+    log_event("info", "apify", f"IA gerou {len(generated)} filtros LinkedIn.")
+    return generated
 
 
-WORTH_PAGE_SIZE = 15
-WORTH_SORT_NONE = ""
 WORTH_SORT_MATCH_ASC = "match_asc"
 WORTH_SORT_MATCH_DESC = "match_desc"
 WORTH_SORT_SEEN_ASC = "seen_asc"
@@ -2633,7 +2598,6 @@ WORTH_SORT_SEEN_DESC = "seen_desc"
 WORTH_SORT_POSTED_ASC = "posted_asc"
 WORTH_SORT_POSTED_DESC = "posted_desc"
 # Legado do select antigo.
-WORTH_SORT_MATCH = WORTH_SORT_MATCH_DESC
 WORTH_SORT_TOKEN = {
     WORTH_SORT_MATCH_ASC,
     WORTH_SORT_MATCH_DESC,
@@ -2642,8 +2606,6 @@ WORTH_SORT_TOKEN = {
     WORTH_SORT_POSTED_ASC,
     WORTH_SORT_POSTED_DESC,
 }
-WORTH_SORTS = {WORTH_SORT_NONE, *WORTH_SORT_TOKEN}
-WORTH_SORT_COLS = ("match", "seen", "posted")
 
 
 def parse_worth_sorts(sort: str | None) -> list[str]:
@@ -2681,29 +2643,6 @@ def normalize_worth_sort(sort: str | None) -> str:
     return encode_worth_sorts(parse_worth_sorts(sort))
 
 
-def cycle_worth_sort(column: str, current: str | None) -> str:
-    """Cicla uma coluna (none→asc→desc→none) sem apagar as outras."""
-    col = (column or "").strip().casefold()
-    if col not in WORTH_SORT_COLS:
-        return normalize_worth_sort(current)
-    tokens = parse_worth_sorts(current)
-    cur_dir = ""
-    rest: list[str] = []
-    for token in tokens:
-        if token.startswith(col + "_"):
-            cur_dir = "asc" if token.endswith("_asc") else "desc"
-        else:
-            rest.append(token)
-    if cur_dir == "":
-        next_token = f"{col}_asc"
-    elif cur_dir == "asc":
-        next_token = f"{col}_desc"
-    else:
-        next_token = ""
-    if next_token:
-        # Última coluna clicada vira a prioridade principal do ORDER BY.
-        return encode_worth_sorts([next_token, *rest])
-    return encode_worth_sorts(rest)
 
 
 def _worth_sort_clause(kind: str) -> str:
@@ -2734,15 +2673,6 @@ def worth_order_sql(sort: str | None) -> str:
     if not clauses:
         return "jobs.id DESC"
     return ", ".join(clauses) + ", jobs.id DESC"
-
-
-def _worth_sort_indicator(sort: str, column: str) -> str:
-    for token in parse_worth_sorts(sort):
-        if token == f"{column}_asc":
-            return " ↑"
-        if token == f"{column}_desc":
-            return " ↓"
-    return ""
 
 
 def _parse_worth_day(raw: str | None) -> datetime | None:
@@ -2778,2753 +2708,10 @@ def _worth_match_expr() -> str:
                       )"""
 
 
-def _notes_html(notes: str) -> str:
-    """Nota do card 'Vale a pena olhar'; vermelho p/ handler ausente, AMARELO
-    destacado p/ fluxo nao automatizado pelo copiloto de IA."""
-    text = notes or ""
-    if "COPILOT_UNAUTOMATED:" in text:
-        return (
-            '<p class="hint" style="background:#3a2f00;border:1px solid #e8c33f;'
-            'color:#ffd54a;font-weight:700;padding:10px 12px;border-radius:8px">'
-            "⚠ " + esc(text).replace("COPILOT_UNAUTOMATED: ", "Não foi possível automatizar o fluxo. ")
-            + "</p>"
-        )
-    if "NO_HANDLER:" in text:
-        return (
-            '<p class="hint" style="color:#b3261e;font-weight:600">'
-            f"{esc(text)}</p>"
-        )
-    return f'<p class="hint">{esc(text)}</p>'
-
-
-def worth_html(
-    *,
-    page: int = 1,
-    page_size: int = WORTH_PAGE_SIZE,
-    min_match: int = 0,
-    sort: str = WORTH_SORT_NONE,
-    date_from: str = "",
-    date_to: str = "",
-) -> str:
-    page = max(1, int(page or 1))
-    page_size = max(5, min(50, int(page_size or WORTH_PAGE_SIZE)))
-    min_match = max(0, min(100, int(min_match or 0)))
-    sort = normalize_worth_sort(sort)
-    date_from = (date_from or "").strip()
-    date_to = (date_to or "").strip()
-    if date_from and date_to and date_from > date_to:
-        date_from, date_to = date_to, date_from
-    offset = (page - 1) * page_size
-    match_expr = _worth_match_expr()
-    where = "jobs.status = 'worth'"
-    params: list[object] = []
-    if min_match > 0:
-        where += f" AND COALESCE({match_expr}, 0) >= ?"
-        params.append(min_match)
-    lo, hi = worth_date_bounds_utc(date_from, date_to)
-    if lo:
-        where += " AND jobs.first_seen_at >= ?"
-        params.append(lo)
-    if hi:
-        where += " AND jobs.first_seen_at < ?"
-        params.append(hi)
-    order_sql = worth_order_sql(sort)
-
-    with connect() as db:
-        total = int(
-            db.execute(
-                f"SELECT COUNT(*) AS n FROM jobs WHERE {where}",
-                params,
-            ).fetchone()["n"]
-        )
-        rows = db.execute(
-            f"""SELECT jobs.id, jobs.title, jobs.company, jobs.location, jobs.source,
-                      jobs.url, jobs.posted_at, jobs.first_seen_at, jobs.description, jobs.notes,
-                      cover_letters.body AS cover_letter,
-                      {match_expr} AS match_score
-               FROM jobs
-               LEFT JOIN cover_letters ON cover_letters.job_id = jobs.id
-               WHERE {where}
-               ORDER BY {order_sql}
-               LIMIT ? OFFSET ?""",
-            [*params, page_size, offset],
-        ).fetchall()
-
-    pages = max(1, (total + page_size - 1) // page_size) if total else 1
-    if total and page > pages:
-        page = pages
-        offset = (page - 1) * page_size
-        with connect() as db:
-            rows = db.execute(
-                f"""SELECT jobs.id, jobs.title, jobs.company, jobs.location, jobs.source,
-                          jobs.url, jobs.posted_at, jobs.first_seen_at, jobs.description, jobs.notes,
-                          cover_letters.body AS cover_letter,
-                          {match_expr} AS match_score
-                   FROM jobs
-                   LEFT JOIN cover_letters ON cover_letters.job_id = jobs.id
-                   WHERE {where}
-                   ORDER BY {order_sql}
-                   LIMIT ? OFFSET ?""",
-                [*params, page_size, offset],
-            ).fetchall()
-
-    def _th(col: str, label: str) -> str:
-        ind = _worth_sort_indicator(sort, col)
-        active = " worth-sort-active" if ind else ""
-        return (
-            f'<th><button type="button" class="worth-sort-th{active}" '
-            f'data-worth-sort-col="{esc(col)}">{esc(label)}'
-            f'<span class="worth-sort-ind">{esc(ind)}</span></button></th>'
-        )
-
-    filter_bits: list[str] = [
-        '<div class="worth-filters">',
-        '<label class="worth-filter-item">Match mín. %'
-        f'<input type="number" id="worth-min-match" min="0" max="100" step="1" value="{min_match}"></label>',
-        '<label class="worth-filter-item">De'
-        f'<input type="date" id="worth-date-from" value="{esc(date_from)}"></label>',
-        '<label class="worth-filter-item">Até'
-        f'<input type="date" id="worth-date-to" value="{esc(date_to)}"></label>',
-        '<button type="button" class="subtle" id="worth-apply-filter">Aplicar</button>',
-    ]
-    for n in (0, 70, 80, 90):
-        label = "Todos" if n == 0 else f"{n}+"
-        filter_bits.append(
-            f'<button type="button" class="subtle worth-match-preset" data-worth-min-match="{n}">{label}</button>'
-        )
-    filter_bits.append(
-        '<span class="worth-ignore-all-wrap">'
-        '<button type="button" class="subtle" id="worth-ignore-all">Ignorar todas</button>'
-        "</span>"
-    )
-    note_bits: list[str] = []
-    if min_match > 0:
-        note_bits.append(f"match ≥ {min_match}")
-    if date_from or date_to:
-        note_bits.append(
-            f"encontrada {format_brasilia_date(date_from) if date_from else '…'}"
-            f" → {format_brasilia_date(date_to) if date_to else '…'}"
-        )
-    if total:
-        start = offset + 1
-        end = offset + len(rows)
-        note_bits.insert(0, f"{start}–{end} de {total}")
-    else:
-        note_bits.insert(0, "0 vagas")
-    pager = (
-        f'<div class="worth-pager" data-worth-pages="{pages}" data-worth-current="{page}">'
-        f'<span class="hint">{esc(" · ".join(note_bits))}</span>'
-        '<span class="worth-pager-btns">'
-    )
-    if page > 1:
-        pager += f'<button type="button" class="subtle" data-worth-page="{page - 1}">‹</button>'
-    else:
-        pager += '<button type="button" class="subtle" disabled>‹</button>'
-    pager += f'<span class="hint" style="margin:0">{page}/{pages}</span>'
-    if page < pages and total:
-        pager += f'<button type="button" class="subtle" data-worth-page="{page + 1}">›</button>'
-    else:
-        pager += '<button type="button" class="subtle" disabled>›</button>'
-    pager += "</span></div>"
-    filter_bits.append(pager)
-    filter_bits.append("</div>")
-    toolbar = "".join(filter_bits)
-
-    if total == 0:
-        empty = (
-            '<div data-worth-current="1" class="table-wrap">'
-            '<p class="hint" style="padding:16px">Nenhuma vaga neste filtro. '
-            + (
-                "Ajuste match, datas ou limpe o filtro."
-                if min_match > 0 or date_from or date_to
-                else "Quando houver bom match mas LinkedIn, falha de formulário/e-mail, a vaga aparece aqui."
-            )
-            + "</p></div>"
-        )
-        return toolbar + empty
-
-    body_rows: list[str] = []
-    for job in rows:
-        score = job["match_score"]
-        score_label = f"{int(score)}" if score is not None else "—"
-        desc = re.sub(r"<[^>]+>", " ", job["description"] or "")[:1200]
-        letter = job["cover_letter"] or ""
-        notes = job["notes"] or ""
-        open_job = (
-            f'<a class="worth-open-button" href="{esc(job["url"])}" target="_blank" rel="noreferrer" '
-            'title="Abrir vaga em uma nova aba">Abrir Vaga</a>'
-            if job.get("url") else ""
-        )
-        posted_raw = (job["posted_at"] or "").strip()
-        posted_label = format_brasilia_date(posted_raw) if posted_raw else "—"
-        seen_label = format_brasilia(job["first_seen_at"])
-        details = (
-            "<details class=\"worth-details\"><summary>Abrir</summary>"
-            f"{_notes_html(notes) if notes else ''}"
-            f'<p class="hint"><strong>Descrição</strong></p><div class="description">{esc(desc or "—")}</div>'
-            f'<p class="hint"><strong>Carta</strong></p><div class="description">{esc(letter or "—")}</div>'
-            + (f'<a href="/cover-letter.pdf?job_id={int(job["id"])}" download>Baixar PDF</a>' if letter else "")
-            + "</details>"
-        )
-        body_rows.append(
-            "<tr>"
-            f'<td class="worth-match">{esc(score_label)}</td>'
-            f'<td><a class="job-title" href="{esc(job["url"])}" target="_blank" rel="noreferrer">{esc(job["title"])}</a>'
-            f'<div class="hint">{esc(job["company"])} · {esc(job["location"])}</div></td>'
-            f"<td>{esc(job['source'])}</td>"
-            f"<td>{esc(seen_label)}</td>"
-            f"<td>{esc(posted_label)}</td>"
-            f"<td>{details}</td>"
-            f'<td class="worth-actions">{open_job}'
-            f'<form method="post" action="/job-status" class="js-process-form" style="display:inline">'
-            f'<input type="hidden" name="id" value="{int(job["id"])}">'
-            f'<button class="subtle" name="status" value="applied" type="submit">Aplicada</button>'
-            f'<button class="subtle" name="status" value="ignored" type="submit">Ignorar</button>'
-            f'<button class="subtle" name="status" value="saved" type="submit">Salvar</button>'
-            f"</form></td></tr>"
-        )
-
-    table = (
-        '<div class="table-wrap worth-table-wrap">'
-        "<table class=\"worth-table\"><thead><tr>"
-        + _th("match", "Match")
-        + "<th>Vaga</th><th>Fonte</th>"
-        + _th("seen", "Encontrada")
-        + _th("posted", "Publicada")
-        + "<th>Detalhes</th><th>Ações</th>"
-        + "</tr></thead><tbody>"
-        + "".join(body_rows)
-        + "</tbody></table></div>"
-    )
-    return toolbar + table
-
-
-def state_label_for(state: str) -> str:
-    return {"running": "Em execução", "stopping": "Parando", "stopped": "Parada"}.get(state, state)
-
-
-def next_run_countdown_seconds(next_run_at: str | None) -> int | None:
-    if not next_run_at:
-        return None
-    target = parse_utc(next_run_at)
-    if not target:
-        return None
-    return max(0, int((target - datetime.now(timezone.utc)).total_seconds()))
-
-
-def format_countdown(seconds: int | None) -> str:
-    if seconds is None:
-        return ""
-    seconds = max(0, int(seconds))
-    hours, rem = divmod(seconds, 3600)
-    mins, secs = divmod(rem, 60)
-    if hours:
-        return f"{hours:d}:{mins:02d}:{secs:02d}"
-    return f"{mins:02d}:{secs:02d}"
-
-
 # Labels padrão do timer do coletor (runbar). Outros timers passam o próprio dict.
-COLLECTOR_COUNTDOWN_LABELS: dict[str, str] = {
-    "stopped": "Próxima busca: —",
-    "busy": "Próxima busca: em andamento…",
-    "running": "Próxima busca em",
-}
-
-
-def countdown_entry(*, at: str | None = None, state: str = "busy") -> dict[str, str]:
-    """Estado de um timer: state=stopped|busy|running; at=ISO UTC quando running."""
-    state = (state or "busy").strip().casefold()
-    if state not in {"stopped", "busy", "running"}:
-        state = "busy"
-    return {"at": (at or "").strip(), "state": state}
-
-
-def collector_countdown(status: dict) -> dict[str, str]:
-    if (status.get("state") or "") == "stopped":
-        return countdown_entry(state="stopped")
-    at = status.get("next_run_at")
-    if at:
-        return countdown_entry(at=str(at), state="running")
-    return countdown_entry(state="busy")
-
-
-def format_countdown_label(entry: dict[str, str], *, labels: dict[str, str]) -> str:
-    state = (entry.get("state") or "busy").casefold()
-    if state == "stopped":
-        return labels.get("stopped") or "—"
-    at = (entry.get("at") or "").strip()
-    if not at or state == "busy":
-        return labels.get("busy") or "em andamento…"
-    secs = next_run_countdown_seconds(at)
-    prefix = (labels.get("running") or "").rstrip()
-    clock = format_countdown(secs if secs is not None else 0)
-    return f"{prefix} {clock}".strip() if prefix else clock
-
-
-def countdown_span_html(
-    key: str,
-    entry: dict[str, str],
-    *,
-    labels: dict[str, str],
-    extra_class: str = "runtime",
-    style: str = "",
-) -> str:
-    """Span com data-* para o JS atualizar N timers com um único setInterval."""
-    text = format_countdown_label(entry, labels=labels)
-    style_attr = f' style="{esc(style)}"' if style else ""
-    cls = f"countdown {extra_class}".strip()
-    return (
-        f'<span class="{esc(cls)}"'
-        f' data-countdown-key="{esc(key)}"'
-        f' data-at="{esc(entry.get("at") or "")}"'
-        f' data-state="{esc(entry.get("state") or "")}"'
-        f' data-label-stopped="{esc(labels.get("stopped") or "")}"'
-        f' data-label-busy="{esc(labels.get("busy") or "")}"'
-        f' data-label-running="{esc(labels.get("running") or "")}"'
-        f"{style_attr}>{esc(text)}</span>"
-    )
-
-
-def live_countdowns(status: dict | None = None) -> dict[str, dict[str, str]]:
-    """Mapa key → {{at, state}} exposto em /live. Inclua novas chaves aqui + span no HTML."""
-    status = status or collector.snapshot()
-    return {
-        "collector": collector_countdown(status),
-    }
-
-
-def live_payload(
-    *,
-    view: str = "all",
-    worth_page: int = 1,
-    worth_min_match: int = 0,
-    worth_sort: str = WORTH_SORT_NONE,
-    worth_date_from: str = "",
-    worth_date_to: str = "",
-) -> dict:
-    allowed_views = {"all", "painel", "vale", "filas", "logs", "uso", "curriculos", "busca", "ia", "assistente"}
-    view = view if view in allowed_views else "all"
-    status = collector.snapshot()
-    from copilot_asks import get_pending_ask
-
-    cfg_live = settings()
-    payload = {
-        "state": status["state"],
-        "state_label": state_label_for(status["state"]),
-        "message": status["message"],
-        "countdowns": live_countdowns(status),
-        "copilot_ask": get_pending_ask(connect),
-        "copilot_ask_sound": (cfg_live.get("copilot_ask_sound") or "1") == "1",
-        "copilot_ask_sound_volume": _copilot_ask_volume(cfg_live),
-    }
-    dashboard_views = {"all", "painel"}
-    if view in dashboard_views:
-        counts, jobs, runs = load_dashboard()
-        collecting = status["state"] in {"running", "stopping"}
-        stats = stats_html(counts)
-        jobs_body = job_rows_html(jobs, collecting)
-        history = history_html(runs)
-        payload.update({
-            "stats_html": stats,
-            "stats_hash": _live_hash(stats),
-            "jobs_html": jobs_body,
-            "jobs_hash": _live_hash(jobs_body),
-            "history_html": history,
-            "history_hash": _live_hash(history),
-        })
-
-    worth_min_match = max(0, min(100, int(worth_min_match or 0)))
-    worth_page = max(1, int(worth_page or 1))
-    worth_sort = normalize_worth_sort(worth_sort)
-    worth_date_from = (worth_date_from or "").strip()
-    worth_date_to = (worth_date_to or "").strip()
-    if view in {"all", "vale"}:
-        # Clamp page so "ignorar" na última página não pede um OFFSET vazio.
-        worth = worth_html(
-            page=worth_page,
-            min_match=worth_min_match,
-            sort=worth_sort,
-            date_from=worth_date_from,
-            date_to=worth_date_to,
-        )
-        try:
-            m = re.search(r'data-worth-current="(\d+)"', worth or "")
-            if m:
-                worth_page = max(1, int(m.group(1)))
-        except Exception:
-            pass
-        payload.update({
-            "worth_html": worth,
-            "worth_hash": _live_hash(worth),
-            "worth_page": worth_page,
-            "worth_min_match": worth_min_match,
-            "worth_sort": worth_sort,
-            "worth_date_from": worth_date_from,
-            "worth_date_to": worth_date_to,
-        })
-
-    if view in {"all", "logs"}:
-        logs = logs_html()
-        payload.update({"logs_html": logs, "logs_hash": _live_hash(logs)})
-    if view in {"all", "filas"}:
-        queue_view = queue_html()
-        payload.update({"queue_html": queue_view, "queue_hash": _live_hash(queue_view)})
-    if view in {"all", "busca", "ia"}:
-        linkedin_filter = linkedin_filter_panel_html()
-        payload.update({"linkedin_filter_html": linkedin_filter, "linkedin_filter_hash": _live_hash(linkedin_filter)})
-    if view in {"all", "uso"}:
-        usage = usage_dashboard_html()
-        payload.update({"usage_html": usage, "usage_hash": _live_hash(usage)})
-    if view in {"all", "curriculos"}:
-        payload["resume_status"] = resume_status_payload()
-
-    countdowns = payload["countdowns"]
-    collector_cd = countdowns.get("collector") or countdown_entry(state="stopped")
-    next_in = next_run_countdown_seconds(collector_cd.get("at") or None)
-    payload.update({
-        # aliases legados do timer do coletor
-        "next_run_at": collector_cd.get("at") or None,
-        "next_run_in_seconds": next_in,
-        "next_run_label": format_countdown_label(collector_cd, labels=COLLECTOR_COUNTDOWN_LABELS),
-    })
-    return payload
-
-
-def _live_hash(text: str) -> str:
-    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
-
-
-def _copilot_ask_volume(cfg: dict[str, str] | None) -> float:
-    raw = (cfg or {}).get("copilot_ask_sound_volume") or "0.55"
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        return 0.55
-    if value > 1.0:
-        value = value / 100.0
-    return max(0.0, min(1.0, value))
-
-
-def resume_status_parts(lang: str) -> dict[str, str]:
-    """Partes do status do currículo: meta (leve) e dossiê (só muda com a análise)."""
-    with connect() as db:
-        row = get_resume(db, lang)
-    if not row:
-        meta = (
-            '<div class="analysis-badge analysis-none">Sem PDF</div>'
-            '<p class="hint">Nenhum currículo enviado. Escolha um PDF e clique em enviar para a IA analisar.</p>'
-        )
-        dossier = ""
-        return {
-            "meta_html": meta,
-            "dossier_html": dossier,
-            "meta_hash": _live_hash(meta),
-            "dossier_hash": _live_hash(dossier),
-        }
-    raw_status = (row["analysis_status"] if "analysis_status" in row.keys() else "") or (
-        "ok" if (row["analysis_summary"] or "").strip() else "none"
-    )
-    badge_map = {
-        "ok": ("analysis-ok", "Análise OK"),
-        "reused": ("analysis-info", "Análise reutilizada"),
-        "pending": ("analysis-info", "Na fila de análise"),
-        "error": ("analysis-error", "Erro na análise"),
-        "none": ("analysis-none", "Aguardando análise"),
-    }
-    badge_class, badge_label = badge_map.get(raw_status, ("analysis-none", raw_status or "Desconhecido"))
-    filename = esc(row["original_filename"] or "currículo.pdf")
-    when = esc(format_brasilia(row["analyzed_at"])) if row["analyzed_at"] else "—"
-    provider = esc(row["provider"] or "—")
-    model = esc(row["model"] or "—")
-    message = esc(
-        (row["analysis_message"] if "analysis_message" in row.keys() else "")
-        or ("Análise concluída." if raw_status in {"ok", "reused"} else "Sem mensagem.")
-    )
-    error = esc((row["analysis_error"] if "analysis_error" in row.keys() else "") or "")
-    reanalyze = (
-        f'<form method="post" action="/reanalyze-resume" class="js-process-form" style="margin-top:10px">'
-        f'<input type="hidden" name="language" value="{lang}">'
-        f'<button type="submit" style="width:100%">Reanalisar currículo com IA</button></form>'
-        f'<p class="hint">Gera uma nova análise mesmo com o mesmo PDF (útil após melhorar o prompt).</p>'
-    )
-    error_block = (
-        f'<p class="analysis-error-text"><strong>Detalhe do erro:</strong> {error}</p>'
-        if error and raw_status == "error"
-        else ""
-    )
-    meta = (
-        f'<div class="analysis-badge {badge_class}">{badge_label}</div>'
-        f'<p class="hint"><strong>Arquivo:</strong> {filename}<br>'
-        f'<strong>Última análise:</strong> {when}<br>'
-        f'<strong>Modelo:</strong> {provider} / {model}</p>'
-        f'<p class="hint">{message}</p>'
-        f"{reanalyze}{error_block}"
-    )
-    summary = esc((row["analysis_summary"] or "")[:6000])
-    structured = ""
-    try:
-        data = json.loads(row["analysis_json"] or "{}")
-    except json.JSONDecodeError:
-        data = {}
-    if isinstance(data, dict) and data:
-        headline = esc(str(data.get("headline") or "")[:300])
-        skills = data.get("technical_skills") or data.get("skills") or []
-        tools = data.get("tools") or []
-        experience = data.get("experience") or []
-        if headline:
-            structured += f'<p><strong>Headline:</strong> {headline}</p>'
-        if isinstance(skills, list) and skills:
-            structured += "<p><strong>Skills:</strong> " + esc(", ".join(str(s) for s in skills[:40])) + "</p>"
-        if isinstance(tools, list) and tools:
-            structured += "<p><strong>Ferramentas:</strong> " + esc(", ".join(str(s) for s in tools[:30])) + "</p>"
-        if isinstance(experience, list) and experience:
-            structured += "<p><strong>Experiências capturadas:</strong> " + esc(str(len(experience))) + "</p><ul>" + "".join(
-                f"<li>{esc(str(item)[:280])}</li>" for item in experience[:12]
-            ) + "</ul>"
-    if summary:
-        dossier = (
-            f"{structured}"
-            f'<details class="resume-dossier" open>'
-            f"<summary>Dossiê completo da análise</summary>"
-            f'<div class="description resume-dossier-scroll" style="max-width:100%;max-height:420px;white-space:pre-wrap">{summary}</div>'
-            f"</details>"
-        )
-    else:
-        dossier = '<p class="hint">Ainda não há dossiê salvo (análise incompleta ou falhou).</p>'
-    # Hash do dossiê ignora mensagens transitórias da fila — só conteúdo da análise.
-    dossier_key = "|".join(
-        (
-            raw_status,
-            row["analyzed_at"] or "",
-            row["analysis_json"] or "",
-            row["analysis_summary"] or "",
-            row["analysis_error"] or "",
-        )
-    )
-    return {
-        "meta_html": meta,
-        "dossier_html": dossier,
-        "meta_hash": _live_hash(meta),
-        "dossier_hash": _live_hash(dossier_key),
-    }
-
-
-def resume_status_html_for(lang: str) -> str:
-    """HTML combinado da zona de status (meta + dossiê). Sem input de arquivo."""
-    parts = resume_status_parts(lang)
-    return (
-        f'<div id="resume-meta-{lang}" data-hash="{parts["meta_hash"]}">{parts["meta_html"]}</div>'
-        f'<div id="resume-dossier-{lang}" data-hash="{parts["dossier_hash"]}">{parts["dossier_html"]}</div>'
-    )
-
-
-def resume_status_payload() -> dict[str, dict[str, str]]:
-    return {"pt": resume_status_parts("pt"), "en": resume_status_parts("en")}
-
-
-def resume_panels_html(*, include_status: bool = True) -> str:
-    blocks = []
-    for lang, label in (("pt", "Português"), ("en", "English")):
-        blocks.append(
-            f'<div class="resume-card"><h3 style="margin:0 0 8px;font-size:15px">Currículo {label}</h3>'
-            f'<form method="post" action="/upload-resume" enctype="multipart/form-data" class="js-process-form">'
-            f'<input type="hidden" name="language" value="{lang}">'
-            f'<label>Selecionar PDF<input type="file" name="file" accept="application/pdf" required></label>'
-            f'<label style="margin-top:8px;font-weight:500">'
-            f'<input type="checkbox" name="force_reanalyze" value="1" style="width:auto;margin-right:6px">'
-            f'Forçar nova análise mesmo se o arquivo for idêntico</label>'
-            f'<button style="margin-top:8px">Enviar e analisar</button></form>'
-            f'<div id="resume-status-{lang}">'
-            + (resume_status_html_for(lang) if include_status else (
-                f'<div id="resume-meta-{lang}"></div><div id="resume-dossier-{lang}"></div>'
-            ))
-            + "</div></div>"
-        )
-    return '<div class="form-grid">' + "".join(blocks) + "</div>"
-
-
-def request_wants_json(headers) -> bool:
-    accept = (headers.get("Accept") or "").casefold()
-    if "application/json" in accept:
-        return True
-    return (headers.get("X-Requested-With") or "").casefold() == "fetch"
-
-
-def form_rules_html() -> str:
-    with connect() as db:
-        rules = list_rules(db)
-    rows = []
-    for idx, rule in enumerate(rules, start=1):
-        mode_opts = "".join(
-            f'<option value="{m}" {"selected" if rule["mode"] == m else ""}>{m}</option>'
-            for m in ("text", "select", "salary", "file", "cover_letter", "skip")
-        )
-        rows.append(
-            f'<tr><td><input name="rule_key_{idx}" value="{esc(rule["key"])}"></td>'
-            f'<td><input name="rule_aliases_{idx}" value="{esc(rule["aliases"])}"></td>'
-            f'<td><select name="rule_mode_{idx}">{mode_opts}</select></td>'
-            f'<td><input name="rule_value_from_{idx}" value="{esc(rule["value_from"])}" placeholder="ex.: candidate_phone"></td>'
-            f'<td><input name="rule_value_{idx}" value="{esc(rule["value"])}"></td></tr>'
-        )
-    idx = len(rules) + 1
-    mode_opts = "".join(f'<option value="{m}">{m}</option>' for m in ("text", "select", "salary", "file", "cover_letter", "skip"))
-    rows.append(
-        f'<tr><td><input name="rule_key_{idx}" placeholder="nova chave"></td>'
-        f'<td><input name="rule_aliases_{idx}" placeholder="aliases"></td>'
-        f'<td><select name="rule_mode_{idx}">{mode_opts}</select></td>'
-        f'<td><input name="rule_value_from_{idx}"></td>'
-        f'<td><input name="rule_value_{idx}"></td></tr>'
-    )
-    return (
-        '<table style="min-width:100%;font-size:13px"><thead><tr>'
-        "<th>Chave</th><th>Aliases</th><th>Modo</th><th>Valor de settings</th><th>Valor fixo / select</th>"
-        "</tr></thead><tbody>" + "".join(rows) + "</tbody></table>"
-    )
-
-
-PAGE_CSS = """*{box-sizing:border-box}
-:root{--bg:#0a0a0b;--panel:#121214;--panel2:#17171a;--line:#26262b;--line2:#33333a;
---ink:#ededf0;--muted:#8a8a93;--muted2:#5c5c66;--accent:#e5484d;--accent2:#ff6369;
---ok:#4ea36b;--info:#3f6f9e;--warn:#b98a3a;--err:#c2544d;--white:#fff}
-html,body{height:100%}
-
-/* Scrollbar customização — preto não muito escuro e setas pretas nos extremos */
-/* Preto não tão escuro para a thumb */
-:root {
-  --scrollbar-thumb: #242428; /* preto suave */
-}
-
-* {
-  scrollbar-width: thin;
-  scrollbar-color: var(--scrollbar-thumb) var(--bg); /* preto suave + bg */
-}
-/* Webkit scrollbar (Chrome, Edge, Safari) */
-*::-webkit-scrollbar {
-  width: 9px;
-  height: 9px;
-  background: var(--bg);
-}
-*::-webkit-scrollbar-thumb {
-  background: var(--scrollbar-thumb); /* preto suave */
-  border-radius: 8px;
-  border: 2px solid var(--bg);
-  min-height: 30px;
-}
-*::-webkit-scrollbar-thumb:hover {
-  background: var(--accent); /* tom mais forte do vermelho no hover, mantido para consistência */
-}
-*::-webkit-scrollbar-corner {
-  background: var(--scrollbar-thumb); /* preto suave */
-}
-*::-webkit-scrollbar-track {
-  background: var(--bg);
-  border-radius: 8px;
-}
-*::-webkit-scrollbar-button{display:none}
-
-body{margin:0;background:var(--bg);color:var(--ink);
-font:14.5px/1.55 ui-sans-serif,Inter,Segoe UI,Arial,sans-serif;-webkit-font-smoothing:antialiased}
-.shell{display:grid;grid-template-columns:248px 1fr;min-height:100vh}
-.sidebar{background:#0c0c0e;border-right:1px solid var(--line);display:flex;flex-direction:column;overflow-y:auto;
-position:sticky;top:0;height:100vh;padding:20px 14px;gap:18px}
-.brand strong{display:block;font-size:15px;letter-spacing:.02em;color:var(--white)}
-.brand small{display:block;color:var(--muted2);font-size:11.5px;margin-top:4px;font-weight:500}
-.brand{border-bottom:1px solid var(--line);padding-bottom:14px}
-.nav-label{display:block;color:var(--muted2);font-size:10.5px;font-weight:700;letter-spacing:.14em;
-text-transform:uppercase;margin:6px 8px 4px}
-.tabs{display:flex;flex-direction:column;gap:2px}
-.tab{background:transparent;border:0;color:var(--muted);text-align:left;padding:9px 11px;border-radius:8px;
-font:inherit;font-weight:600;font-size:13.5px;cursor:pointer;display:flex;align-items:center;gap:9px;
-border-left:2px solid transparent;transition:background .12s,color .12s}
-.tab:hover{background:var(--panel2);color:var(--ink)}
-.tab.active{background:var(--panel2);color:var(--white);border-left:2px solid var(--accent)}
-.sidebar-foot{margin-top:auto;border-top:1px solid var(--line);padding-top:14px}
-#collector-state{font-size:12px;font-weight:700;color:var(--muted);display:inline-flex;align-items:center;gap:7px}
-#collector-state::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--muted2)}
-#collector-countdown{font-size:12px;font-weight:500;color:var(--muted);display:inline-flex;align-items:center;gap:7px}
-.content{padding:28px clamp(20px,3vw,40px) 40px;overflow-x:auto}
-h1{font-size:20px;margin:0}
-h2{font-size:16px;margin:0 0 16px;font-weight:700;letter-spacing:-.01em;color:var(--white)}
-h3{font-size:13px}
-main{width:100%;max-width:1760px;margin:0 auto;padding:0}
-.top{display:grid;grid-template-columns:1.3fr .7fr;gap:16px}
-.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:18px}
-.runbar{display:flex;flex-wrap:wrap;gap:12px;align-items:center;padding:14px 18px}
-.runbar .actions{margin-top:0}
-.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}
-@media(min-width:1400px){.form-grid{grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}}
-@media(min-width:1800px){main{max-width:1920px}.content{padding:32px clamp(28px,4vw,56px) 48px}}
-label{display:block;color:var(--muted);font-size:12.5px;font-weight:600}
-input,textarea,select{font:inherit;color:var(--ink);width:100%;margin-top:6px;padding:9px 11px;
-border:1px solid var(--line2);border-radius:9px;background:#0e0e10;transition:border-color .12s,background .12s}
-input:focus,textarea:focus,select:focus{outline:none;border-color:var(--accent);background:#101012}
-input[type=checkbox]{width:auto;margin:0;accent-color:var(--accent)}
-.linkedin-filter-card{border:1px solid var(--line2);border-radius:10px;padding:12px;margin:10px 0;background:#101012}
-.linkedin-filter-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
-.linkedin-filter-enable,.linkedin-filter-option{display:flex;align-items:center;gap:7px}
-.linkedin-filter-options{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;margin-top:10px}
-.linkedin-filter-options strong{width:100%;font-size:11px;color:var(--muted2)}
-.linkedin-filter-option{font-size:11.5px;font-weight:500}
-.linkedin-filter-add{display:grid;grid-template-columns:minmax(160px,1fr) minmax(220px,2fr) auto auto;gap:8px;margin-top:12px;align-items:end}
-.linkedin-filter-add input{margin:0}
-@media(max-width:760px){.linkedin-filter-add{grid-template-columns:1fr 1fr}.linkedin-filter-add button{width:100%}}
-option{background:#0e0e10;color:var(--ink)}
-.hint{color:var(--muted2);font-size:11.5px;margin:12px 0 0;line-height:1.5}
-.hint code{background:#000;border:1px solid var(--line);border-radius:5px;padding:1px 5px;color:var(--muted);font-size:11px}
-button{border:1px solid transparent;border-radius:9px;padding:9px 15px;background:var(--white);color:#0a0a0a;
-font-weight:700;font-size:13px;cursor:pointer;transition:filter .12s,background .12s}
-button:hover{filter:brightness(.92)}
-button.stop{background:var(--accent);color:var(--white)}
-button.subtle{padding:6px 10px;background:transparent;color:var(--muted);border:1px solid var(--line2);font-weight:600}
-button.subtle:hover{color:var(--ink);border-color:var(--muted2);background:var(--panel2)}
-.actions{display:flex;gap:9px;margin-top:14px;align-items:center;flex-wrap:wrap}
-.runtime{color:var(--muted);font-size:12.5px;font-variant-numeric:tabular-nums}
-.stats{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:4px 0 18px}
-.stat{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:13px 15px}
-.stat span{display:block;font-size:11px;color:var(--muted2)}
-.stat strong{font-size:22px;color:var(--white);font-variant-numeric:tabular-nums}
-.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:12px}
-table{border-collapse:collapse;width:100%;min-width:900px;font-size:13px}
-th,td{padding:11px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
-th{font-size:10.5px;color:var(--muted2);background:#0f0f11;text-transform:uppercase;letter-spacing:.08em}
-tr:last-child td{border-bottom:0}
-td small{display:block;color:var(--muted2);margin-top:3px}
-.job-title{font-weight:700;color:var(--white);text-decoration:none}
-.job-title:hover{color:var(--accent2)}
-.source{background:var(--panel2);border:1px solid var(--line);color:var(--muted);padding:2px 10px;
-border-radius:99px;font-size:11px;display:inline-block;max-width:140px;overflow:hidden;
-text-overflow:ellipsis;white-space:nowrap;vertical-align:middle;line-height:1.6}
-select{min-width:150px;margin:0;padding:7px}
-summary{cursor:pointer;color:var(--muted);font-size:13px}
-.description{max-width:360px;max-height:220px;overflow:auto;padding:8px 0;font-size:12.5px;color:var(--muted)}
-details textarea{min-width:230px}
-.history{color:var(--muted);font-size:12.5px;padding-left:18px}
-.notice{padding:11px 14px;border-radius:10px;margin-bottom:16px;font-size:13px;font-weight:600;
-border:1px solid var(--line2);background:var(--panel2)}
-.notice-ok{border-color:var(--ok);color:#8fd6a6;background:rgba(78,163,107,.1)}
-.notice-info{border-color:var(--info);color:#9ec9ff;background:rgba(63,111,158,.12)}
-.notice-error{border-color:var(--err);color:#f0a0a0;background:rgba(194,84,77,.12)}
-.notice-warn{border-color:var(--warn);color:#f0c674;background:rgba(185,138,58,.1)}
-.analysis-badge{display:inline-block;padding:3px 10px;border-radius:999px;font-size:11.5px;font-weight:700;margin:6px 0}
-.analysis-ok{background:rgba(78,163,107,.16);color:#8fd6a6}
-.analysis-info{background:rgba(63,111,158,.2);color:#9ec9ff}
-.analysis-error{background:rgba(194,84,77,.2);color:#f0a0a0}
-.analysis-none{background:var(--panel2);color:var(--muted)}
-.analysis-error-text{color:#f0a0a0;font-size:12.5px;margin:8px 0}
-.red-accent-button{background:var(--accent);color:var(--white);border:1px solid var(--accent);border-radius:9px;padding:9px 15px;font-weight:700;font-size:13px;cursor:pointer;transition:filter .12s,background .12s}
-.red-accent-button:hover{filter:brightness(.92);background:var(--accent2);border-color:var(--accent2)}
-.resume-card{border:1px solid var(--line);border-radius:12px;padding:16px;background:var(--panel2)}
-.resume-dossier summary{color:var(--muted)}
-.resume-dossier-scroll{background:#0e0e10}
-/* WARNING PILL FIX: ensure pills don't get clipped/cut on wrap */
-.warning-pill {
-  background: #3a2f00;
-  border: 1px solid #e8c33f;
-  color: #ffd54a;
-  font-weight: 700;
-  padding: 3px 8px;
-  border-radius: 6px;
-  display: inline-block;
-  box-sizing: border-box;
-  max-width: 100vw;
-  width: max-content;
-  white-space: normal !important;
-  overflow-wrap: break-word;
-  word-break: break-word;
-  font-size: 13px;
-  vertical-align: middle;
-}
-.log-console{font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#08080a;
-color:#c9c9d1;border:1px solid var(--line);border-radius:10px;padding:12px;max-height:600px;overflow:auto}
-.log-line{display:grid;grid-template-columns:128px 66px 104px 1fr;gap:10px;padding:5px 0;border-bottom:1px solid #141417}
-.log-time{color:var(--muted2)}
-.log-level{font-weight:700;text-transform:uppercase}
-.log-source{color:var(--muted)}
-.log-msg{color:#d6d6de;white-space:pre-wrap;word-break:break-word}
-.log-info .log-level{color:#9ec9ff}
-.log-success .log-level{color:#8fd6a6}
-.log-warning .log-level{color:#f0c674}
-.log-error .log-level{color:#f0a0a0}
-.log-debug .log-level{color:var(--muted2)}
-.log-empty{color:var(--muted2);padding:18px 8px}
-.queue-status{display:inline-block;padding:3px 8px;border-radius:999px;font-size:11px;font-weight:700}
-.queue-pending,.queue-retry_wait{background:rgba(63,111,158,.2);color:#9ec9ff}
-.queue-running{background:rgba(78,163,107,.16);color:#8fd6a6}
-.queue-succeeded{background:rgba(78,163,107,.16);color:#8fd6a6}
-.queue-failed{background:rgba(194,84,77,.2);color:#f0a0a0}
-.queue-cancelled{background:var(--panel2);color:var(--muted)}
-.usage-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px;margin-top:14px}
-.usage-card{border:1px solid var(--line);border-radius:12px;padding:16px;background:var(--panel2)}
-.usage-card h3{margin:0 0 12px;font-size:14px;color:var(--white)}
-.usage-metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px;margin:10px 0}
-.usage-metrics span{display:block;font-size:11px;color:var(--muted2);margin-bottom:4px}
-.usage-metrics strong{font-size:16px;color:var(--white)}
-.usage-bar{height:8px;border-radius:999px;background:#1a1a1e;overflow:hidden;margin-top:8px}
-.usage-bar-fill{height:100%;background:var(--ok);border-radius:999px}
-.usage-bar-fill.warn{background:var(--warn)}
-.worth-filters{display:flex;flex-wrap:nowrap;align-items:flex-end;gap:10px;margin:0 0 14px;overflow-x:auto;padding-bottom:2px}
-.worth-filter-item{margin:0;display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted2);white-space:nowrap}
-.worth-filter-item input{margin:0;min-width:0;width:118px}
-.worth-ignore-all-wrap{margin-left:auto;display:inline-flex;align-items:center;gap:8px;flex-shrink:0}
-.modal{position:fixed;inset:0;z-index:80;display:flex;align-items:center;justify-content:center;padding:20px}
-.modal[hidden]{display:none!important}
-.modal-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.55)}
-.modal-dialog{position:relative;z-index:1;width:min(420px,100%);background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px 22px 18px;box-shadow:0 16px 48px rgba(0,0,0,.45)}
-.modal-dialog.modal-dialog-ask{width:min(520px,100%)}
-.modal-dialog h3{margin:0 0 10px;font-size:16px;color:var(--white)}
-.modal-dialog .hint{margin:0 0 18px}
-.modal-dialog textarea{width:100%;min-height:96px;margin:0 0 14px;resize:vertical}
-.modal-dialog .actions{display:flex;justify-content:flex-end;gap:10px;margin:0}
-.copilot-ask-waiting{display:flex;flex-direction:column;align-items:center;gap:12px;margin:0 0 14px;padding:16px 8px;border:1px dashed var(--line);border-radius:10px;background:rgba(0,0,0,.18)}
-.copilot-ask-waiting[hidden]{display:none!important}
-.copilot-ask-waiting .hint{margin:0;text-align:center}
-.copilot-ask-spinner{width:28px;height:28px;border:3px solid var(--line);border-top-color:var(--accent,#9ec9ff);border-radius:50%;animation:copilot-spin .8s linear infinite}
-@keyframes copilot-spin{to{transform:rotate(360deg)}}
-.modal-dialog-ask.is-busy textarea{opacity:.65}
-.copilot-ask-file-wrap{margin:0 0 14px}
-.copilot-ask-file-wrap[hidden]{display:none!important}
-.copilot-ask-file-wrap input[type=file]{width:100%;font-size:13px}
-.worth-pager{display:inline-flex;align-items:center;gap:8px;flex-shrink:0;margin-left:4px}
-.worth-pager-btns{display:inline-flex;align-items:center;gap:6px}
-.worth-table th button.worth-sort-th{background:none;border:0;color:inherit;font:inherit;font-weight:700;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;padding:0;display:inline-flex;align-items:center;gap:4px}
-.worth-table th button.worth-sort-th:hover{color:var(--white)}
-.worth-sort-active{color:var(--white)!important}
-.worth-sort-ind{font-size:12px;opacity:.9}
-.worth-match{font-weight:700;white-space:nowrap}
-.worth-actions{white-space:nowrap}
-.worth-actions form{display:inline}
-.worth-open-button{display:inline-block;margin-right:4px;padding:6px 10px;border:1px solid var(--accent);border-radius:9px;background:var(--accent);color:var(--white);font-size:13px;font-weight:600;line-height:1.5;text-decoration:none;vertical-align:middle;transition:filter .12s,background .12s}
-.worth-open-button:hover{filter:brightness(.92);background:var(--accent2);border-color:var(--accent2);color:var(--white)}
-.worth-details{font-size:12.5px}
-.worth-table-wrap{margin-top:0}
-.worth-list{display:grid;gap:14px}
-.worth-card{border:1px solid var(--line);border-radius:12px;padding:15px;background:var(--panel)}
-.worth-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}
-@media(max-width:900px){.worth-filters{flex-wrap:wrap}}
-.tab-panel{display:none}
-.tab-panel.active{display:block}
-.subtle{color:var(--muted)}
-.assistant-chat{display:flex;flex-direction:column;gap:14px;min-height:min(62vh,560px)}
-.assistant-messages{flex:1;min-height:280px;max-height:min(52vh,480px);overflow-y:auto;border:1px solid var(--line);border-radius:12px;padding:14px;background:var(--panel2);display:flex;flex-direction:column;gap:12px}
-.assistant-empty{color:var(--muted2);font-size:13px;margin:auto;text-align:center;padding:24px 12px;line-height:1.5}
-.assistant-msg{max-width:92%;padding:10px 12px;border-radius:12px;font-size:13.5px;line-height:1.45;white-space:pre-wrap;word-break:break-word}
-.assistant-msg.user{align-self:flex-end;background:rgba(63,111,158,.28);color:var(--white);border:1px solid rgba(158,201,255,.25)}
-.assistant-msg.bot{align-self:flex-start;background:rgba(0,0,0,.22);color:#d6d6de;border:1px solid var(--line)}
-.assistant-msg.bot.error{border-color:rgba(194,84,77,.45);color:#f0a0a0}
-.assistant-msg-actions{display:flex;justify-content:flex-end;margin-top:8px}
-.assistant-msg-actions button{font-size:11px;padding:4px 10px}
-.assistant-compose{display:flex;flex-direction:column;gap:10px}
-.assistant-compose textarea{width:100%;min-height:88px;resize:vertical}
-.assistant-compose .actions{margin:0;justify-content:flex-end}
-@media(max-width:900px){.log-line{grid-template-columns:1fr;gap:2px}}
-@media(max-width:820px){.shell{grid-template-columns:1fr}.sidebar{position:static;height:auto}
-.top{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}
-.form-grid{grid-template-columns:1fr}}
-
-/* Product visual system: warm graphite, quiet chrome, red reserved for action. */
-:root{--bg:#101112;--panel:#151718;--panel2:#1b1e1f;--line:#292d2e;--line2:#3a3f40;
---ink:#ece9e5;--muted:#a5a19c;--muted2:#77746f;--accent:#d84b45;--accent2:#eb5b54}
-body{font-size:14px;line-height:1.55;letter-spacing:.008em;background:var(--bg)}
-.shell{grid-template-columns:232px minmax(0,1fr)}
-.sidebar{background:#131516;border-right-color:#242829;padding:24px 13px 16px;gap:22px}
-.brand{padding:0 9px 17px;border-bottom-color:#292d2e}
-.brand strong{font-size:14px;letter-spacing:-.01em;text-transform:none}
-.brand small{font-size:10.5px;letter-spacing:.045em;color:#85817b}
-.nav-label{font-size:9.5px;letter-spacing:.17em;margin:7px 10px 7px}
-.tabs{gap:3px}
-.tab{padding:8px 10px;border-radius:6px;font-size:13px;font-weight:600;border:0;gap:10px}
-.tab::before{content:"";width:4px;height:4px;border-radius:50%;background:transparent;flex:none}
-.tab.active{background:#202324;color:#f4f1ec}
-.tab.active::before{background:var(--accent)}
-.tab:hover{background:#1b1e1f}
-.content{padding:30px clamp(20px,3.2vw,48px) 48px}
-h1{font-size:21px;letter-spacing:-.025em}h2{font-size:16px;letter-spacing:-.015em;margin-bottom:18px}
-.panel{background:var(--panel);border-color:#292d2e;border-radius:9px;padding:22px;margin-bottom:16px;box-shadow:none}
-.panel > h2{display:flex;align-items:center;gap:11px;padding-bottom:14px;border-bottom:1px solid #292d2e}
-.panel > h2::before{content:"";display:block;width:14px;height:2px;background:var(--accent);flex:none}
-.stat,.usage-card,.worth-card{background:var(--panel);border-color:#292d2e;border-radius:8px}
-.form-grid{gap:18px}
-label{color:#c1bfba;font-size:12px;font-weight:650}
-input,textarea,select{background:#111314;border-color:#34393a;border-radius:6px;padding:10px 11px}
-input:focus,textarea:focus,select:focus{border-color:#a9443f;box-shadow:0 0 0 2px rgba(216,75,69,.13)}
-button{border-radius:6px;font-weight:650;background:var(--accent);color:#fff}
-button:hover{filter:brightness(1.08)}
-button.subtle{border-radius:6px;background:transparent;color:#b4b0aa;border-color:#383d3e}
-button.subtle:hover{background:#222627;color:#f0ede8;border-color:#555b5c;filter:none}
-.hint{font-size:12px;color:#898680;line-height:1.6}
-.help-disclosure{margin:10px 0 14px}
-.help-disclosure summary{list-style:none;display:inline-flex;align-items:center;gap:7px;color:#8c8987;font-size:11.5px;user-select:none}
-.help-disclosure summary::-webkit-details-marker{display:none}
-.help-disclosure summary::before{content:"?";display:inline-grid;place-items:center;width:17px;height:17px;border:1px solid #4a4847;border-radius:50%;color:#c2bfbd;font-size:10px;font-weight:700;transition:all .15s}
-.help-disclosure[open] summary{color:#d3cfcc}
-.help-disclosure[open] summary::before{border-color:var(--accent);background:var(--accent);color:#fff}
-.help-disclosure .hint{max-width:850px;margin:8px 0 0;padding:10px 12px;border-left:2px solid #493032;background:rgba(255,255,255,.025);border-radius:0 6px 6px 0}
-.help-disclosure:focus-within summary{outline:2px solid rgba(217,67,72,.6);outline-offset:3px;border-radius:3px}
-.optimism-control{display:grid;grid-template-columns:1fr auto;gap:6px 12px;align-items:center;max-width:560px;margin:14px 0}
-.optimism-control input[type=range]{grid-column:1/-1;width:100%;margin:2px 0;accent-color:var(--accent);padding:0;border:0;background:transparent}
-.optimism-control small{grid-column:1/-1;color:var(--muted2);font-size:11.5px;font-weight:500}
-.optimism-value{font-variant-numeric:tabular-nums;color:var(--ink);font-size:12px}
-.job-selection-prompt{margin:15px 0 4px}
-.job-selection-prompt summary{font-size:12px}
-.job-selection-prompt label{margin-top:12px}
-.job-selection-prompt textarea{font:12px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}
-.table-wrap{border-radius:8px;border-color:#292d2e}th{background:#191c1d;color:#898680}
-.source{border-radius:4px;background:#1d2021}
-.sidebar-foot{border-top-color:#29292b}
-@media(max-width:820px){.shell{grid-template-columns:1fr}.sidebar{padding:14px;gap:12px}.brand{padding-bottom:12px}.tabs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.nav-label{grid-column:1/-1}}
-"""
-
-def render_page(notice: str = "", notice_kind: str = "success") -> str:
-    """Monta o painel local: preferências, controles, histórico e vagas capturadas."""
-    cfg = settings()
-    status = collector.snapshot()
-    counts, jobs, runs = load_dashboard()
-    collecting = status["state"] in {"running", "stopping"}
-    cards = stats_html(counts)
-    rows = job_rows_html(jobs, collecting)
-    history = history_html(runs)
-    state_label = state_label_for(status["state"])
-    countdowns = live_countdowns(status)
-    collector_timer_html = countdown_span_html(
-        "collector",
-        countdowns["collector"],
-        labels=COLLECTOR_COUNTDOWN_LABELS,
-        style="margin-left:14px",
-    )
-    resume_panel = resume_panels_html(include_status=False)
-    rules_panel = form_rules_html()
-    # Large/slow panels load on demand via /live when their tab is opened.
-    logs_view = '<div class="log-empty">Abra esta aba para carregar os logs.</div>'
-    queue_view = '<p class="hint">Abra esta aba para carregar a fila.</p>'
-    worth_view = '<p class="hint">Abra esta aba para carregar as vagas.</p>'
-    usage_view = '<p class="hint">Abra esta aba para carregar uso e cotas.</p>'
-    linkedin_filter_view = '<p class="hint">Carregando filtro ao abrir a aba.</p>'
-    notice_class = {
-        "success": "notice notice-ok",
-        "info": "notice notice-info",
-        "error": "notice notice-error",
-        "warning": "notice notice-warn",
-    }.get(notice_kind, "notice") if notice else "notice"
-    notice_html = (
-        f'<div id="panel-notice" class="{notice_class}"'
-        f'{" hidden" if not notice else ""}>'
-        f"{esc(notice) if notice else ''}</div>"
-    )
-    optimism_value, _ = job_selection_optimism_instruction(cfg.get("job_selection_optimism"))
-    selection_controls_html = f'''<h3 style="margin:22px 0 10px;color:var(--muted)">Seleção de vagas</h3>
-<label class="optimism-control">Otimismo da triagem <span class="optimism-value" id="job-selection-optimism-value">{optimism_value}/100</span>
-<input type="range" name="job_selection_optimism" id="job-selection-optimism" min="0" max="100" step="1" value="{optimism_value}">
-<small>Mais baixo = seleção criteriosa. Mais alto = considera mais vagas com potencial.</small></label>
-<details class="job-selection-prompt"><summary>Editar instruções da seleção</summary>
-<label>Prompt de seleção<textarea name="job_selection_prompt" rows="9">{esc(effective_job_selection_prompt(cfg))}</textarea></label>
-<p class="hint">O sistema acrescenta o nível de otimismo, currículo e dados da vaga automaticamente. Não remova as instruções de formato JSON.</p></details>'''
-    page_html = f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Odradek</title>
-<link rel="icon" href="/odradek-icon.png" type="image/png">
-<style>{PAGE_CSS}</style></head><body>
-<div class="shell">
-<aside class="sidebar">
-<div class="brand"><strong>Odradek</strong><small>coleta &middot; triagem &middot; candidaturas</small></div>
-<nav class="tabs" aria-label="Seções do painel">
-<span class="nav-label">Operação</span>
-<button type="button" class="tab active" data-tab="painel">Visão geral</button>
-<button type="button" class="tab" data-tab="vale">Vale a pena olhar</button>
-<button type="button" class="tab" data-tab="filas">Filas de IA</button>
-<button type="button" class="tab" data-tab="assistente">Assistente</button>
-<button type="button" class="tab" data-tab="uso">Uso &amp; cotas</button>
-<button type="button" class="tab" data-tab="logs">Logs</button>
-<span class="nav-label">Configuração</span>
-<button type="button" class="tab" data-tab="busca">Busca &amp; coleta</button>
-<button type="button" class="tab" data-tab="curriculos">Currículos</button>
-<button type="button" class="tab" data-tab="perfil">Perfil &amp; diversidade</button>
-<button type="button" class="tab" data-tab="ia">IA &amp; integrações</button>
-<button type="button" class="tab" data-tab="automacao">Automação</button>
-<button type="button" class="tab" data-tab="smtp">SMTP</button>
-</nav>
-<div class="sidebar-foot"><span id="collector-state">{esc(state_label)}</span><br><span id="collector-countdown">{collector_timer_html}</span></div>
-</aside>
-<main class="content">{notice_html}
-
-<div id="tab-painel" class="tab-panel active">
-<section class="panel runbar"><div class="actions" style="margin:0"><form method="post" action="/start" class="js-process-form"><button>Iniciar bot</button></form><form method="post" action="/stop" class="js-process-form"><button class="stop">Parar bot</button></form><span class="runtime" id="runtime-message">{esc(status['message'])}</span>{collector_timer_html}</div></section>
-<div class="stats" id="job-stats">{cards}</div>
-<section class="table-wrap"><table><thead><tr><th>Vaga</th><th>Localidade</th><th>Fonte</th><th>Idioma</th><th>Etapa</th><th>Carta e descrição</th><th>Data</th></tr></thead><tbody id="jobs-body">{rows}</tbody></table></section>
-<section class="panel" style="margin-top:18px"><h2>Execuções recentes</h2><ul class="history" id="run-history">{history}</ul></section>
-</div>
-
-<div id="tab-busca" class="tab-panel"><section class="panel"><h2>Busca &amp; coleta</h2><form method="post" action="/settings"><div class="form-grid"><label>Cargos e termos, separados por vírgula<textarea name="keywords" rows="3">{esc(cfg.get('keywords',''))}</textarea></label><label>Países/regiões aceitos<textarea name="locations" rows="3">{esc(cfg.get('locations',''))}</textarea></label><label>Fontes: remotive, remoteok, adzuna, apify<input name="sources" value="{esc(cfg.get('sources',''))}"></label><label>Países Adzuna (ex.: br,us,gb,ca)<input name="adzuna_countries" value="{esc(cfg.get('adzuna_countries','br,us,gb,ca'))}"></label><label>Limite mensal Apify (USD)<input name="apify_monthly_credit_limit_usd" type="number" min="0" step="0.01" value="{esc(cfg.get('apify_monthly_credit_limit_usd','5'))}"></label><label>Máximo de vagas por ciclo Apify<input name="apify_job_count" type="number" min="1" max="100" value="{esc(cfg.get('apify_job_count','25'))}"></label><label style="grid-column:1/-1">Actors Apify (JSON — um ou mais scrapers)<textarea name="apify_actors_json" rows="8" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px">{esc(cfg.get('apify_actors_json',''))}</textarea></label></div><p class="hint">Cada actor: <code>id</code>, <code>label</code>, <code>enabled</code>, <code>input_mode</code> (<code>linkedin_search</code> ou <code>custom</code>), <code>count</code> opcional. Em <code>linkedin_search</code>, cada filtro LinkedIn ativo gera um run Apify independente; a IA cria vários filtros a partir do currículo. Em <code>custom</code>, use <code>input_template</code> com placeholders <code>{{keyword}}</code>, <code>{{location}}</code>, <code>{{count}}</code>, <code>{{keywords}}</code>.</p><label style="margin:16px 0 8px;display:block;grid-column:1/-1">Prompt do filtro LinkedIn (IA)<textarea name="linkedin_filter_prompt" rows="14" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px">{esc(effective_linkedin_filter_prompt(cfg))}</textarea></label><p class="hint">Edite as instruções da IA para o filtro. Placeholders: <code>{{pref_keywords}}</code>, <code>{{facts_pt}}</code>, <code>{{facts_en}}</code>, <code>{{resume_pt}}</code>, <code>{{resume_en}}</code>. Ao salvar com mudanças neste texto, os filtros são <strong>regenerados</strong> na hora (precisa de chave de IA e currículo analisado).</p><div id="linkedin-filter-slot">{linkedin_filter_view}</div><button>Salvar preferências</button></form></section></div>
-
-<div id="tab-curriculos" class="tab-panel"><section class="panel"><h2>Currículos (PDF)</h2>{resume_panel}<p class="hint">O seletor de arquivos do sistema abre ao escolher o PDF. A análise agora gera um dossiê completo (skills, experiências, projetos). Use <em>Reanalisar</em> para regenerar com o prompt enriquecido.</p></section></div>
-
-<div id="tab-perfil" class="tab-panel"><section class="panel"><h2>Perfil &amp; diversidade</h2><form method="post" action="/candidate-settings"><h3 style="margin:0 0 12px;color:var(--muted)">Dados pessoais</h3><div class="form-grid"><label>Seu nome<input name="candidate_name" value="{esc(cfg.get('candidate_name',''))}"></label><label>E-mail<input name="candidate_email" value="{esc(cfg.get('candidate_email',''))}"></label><label>Telefone<input name="candidate_phone" value="{esc(cfg.get('candidate_phone',''))}"></label><label>LinkedIn<input name="candidate_linkedin" value="{esc(cfg.get('candidate_linkedin',''))}"></label><label>Cidade<input name="candidate_city" value="{esc(cfg.get('candidate_city',''))}"></label><label>Estado / UF<input name="candidate_state" value="{esc(cfg.get('candidate_state',''))}" placeholder="MG"></label><label>País<input name="candidate_country" value="{esc(cfg.get('candidate_country',''))}" placeholder="Brazil"></label><label>Endereço (rua, nº)<input name="candidate_street" value="{esc(cfg.get('candidate_street',''))}" placeholder="Rua real — não use placeholder"></label><label>CEP / código postal<input name="candidate_postal_code" value="{esc(cfg.get('candidate_postal_code',''))}" placeholder="00000-000"></label><label>Empresa atual<input name="candidate_current_company" value="{esc(cfg.get('candidate_current_company',''))}"></label><label>CPF<input name="candidate_cpf" value="{esc(cfg.get('candidate_cpf',''))}" placeholder="000.000.000-00"></label></div><h3 style="margin:20px 0 12px;color:var(--muted)">Pretensão salarial &amp; contratação</h3><div class="form-grid"><label>Pretensão base — CLT (BRL)<input name="salary_expectation_brl" value="{esc(cfg.get('salary_expectation_brl',''))}" placeholder="ex.: 6000"></label><label>Pretensão (USD)<input name="salary_expectation_usd" value="{esc(cfg.get('salary_expectation_usd',''))}" placeholder="ex.: 80000"></label><label>Moeda da pretensão<select name="salary_currency_preference"><option value="auto" {'selected' if cfg.get('salary_currency_preference','auto')=='auto' else ''}>Detectar na página (padrão)</option><option value="BRL" {'selected' if cfg.get('salary_currency_preference')=='BRL' else ''}>Sempre BRL (R$)</option><option value="USD" {'selected' if cfg.get('salary_currency_preference')=='USD' else ''}>Sempre USD ($)</option></select></label><label>Multiplicador PJ (só BRL)<input name="salary_pj_multiplier" value="{esc(cfg.get('salary_pj_multiplier','1.3'))}" placeholder="ex.: 1.3" step="0.05" min="1"></label><label>Tipo de contratação preferido<select name="candidate_contract_type"><option value="employee" {'selected' if cfg.get('candidate_contract_type','employee')=='employee' else ''}>Employee (CLT / efetivo)</option><option value="contractor" {'selected' if cfg.get('candidate_contract_type')=='contractor' else ''}>Contractor (PJ / autônomo)</option><option value="ask" {'selected' if cfg.get('candidate_contract_type')=='ask' else ''}>Perguntar — deixar comigo no Chrome</option></select></label></div><p class="hint">A pretensão usa o valor BRL ou USD conforme a moeda do campo na vaga (placeholder <code>R$</code> vs <code>$</code>). O valor <strong>BRL é a base CLT</strong>: se a contratação preferida for <strong>PJ/Contractor</strong>, ele é multiplicado pelo <strong>multiplicador PJ</strong> (aceita decimal; só em reais — USD nunca é multiplicado). O radio Contractor/Employee segue a preferência (com "Perguntar" o robô deixa você decidir).</p><h3 style="margin:22px 0 12px;color:var(--muted)">Perfil de diversidade (a IA nunca decide identidade)</h3><div class="form-grid"><label>Gênero<select name="candidate_gender"><option value="not_informed" {'selected' if cfg.get('candidate_gender','not_informed') == 'not_informed' else ''}>Prefiro não informar</option><option value="female" {'selected' if cfg.get('candidate_gender') == 'female' else ''}>Mulher</option><option value="male" {'selected' if cfg.get('candidate_gender') == 'male' else ''}>Homem</option><option value="other" {'selected' if cfg.get('candidate_gender') == 'other' else ''}>Outro / não binário</option></select></label><label>Raça/etnia (autodeclarada)<select name="candidate_race"><option value="not_informed" {'selected' if cfg.get('candidate_race','not_informed') == 'not_informed' else ''}>Prefiro não informar</option><option value="white" {'selected' if cfg.get('candidate_race') == 'white' else ''}>Branca</option><option value="black" {'selected' if cfg.get('candidate_race') == 'black' else ''}>Preta</option><option value="pardo" {'selected' if cfg.get('candidate_race') == 'pardo' else ''}>Parda</option><option value="asian" {'selected' if cfg.get('candidate_race') == 'asian' else ''}>Amarela/asiática</option><option value="indigenous" {'selected' if cfg.get('candidate_race') == 'indigenous' else ''}>Indígena</option></select></label><label>PCD (deficiência)<select name="candidate_pcd"><option value="no" {'selected' if cfg.get('candidate_pcd','no') in ('no','0') else ''}>Não sou PCD</option><option value="yes" {'selected' if cfg.get('candidate_pcd') in ('yes','1') else ''}>Sou PCD</option><option value="not_informed" {'selected' if cfg.get('candidate_pcd') == 'not_informed' else ''}>Prefiro não informar</option></select></label><label>LGBTQ+ (orientação/identidade)<select name="candidate_lgbtq"><option value="not_informed" {'selected' if cfg.get('candidate_lgbtq','not_informed') == 'not_informed' else ''}>Prefiro não informar</option><option value="no" {'selected' if cfg.get('candidate_lgbtq') == 'no' else ''}>Hétero / cis (não)</option><option value="gay" {'selected' if cfg.get('candidate_lgbtq') == 'gay' else ''}>Homossexual / gay</option><option value="lesbian" {'selected' if cfg.get('candidate_lgbtq') == 'lesbian' else ''}>Lésbica</option><option value="bisexual" {'selected' if cfg.get('candidate_lgbtq') == 'bisexual' else ''}>Bissexual</option><option value="pansexual" {'selected' if cfg.get('candidate_lgbtq') == 'pansexual' else ''}>Pansexual</option><option value="asexual" {'selected' if cfg.get('candidate_lgbtq') == 'asexual' else ''}>Assexual</option><option value="other" {'selected' if cfg.get('candidate_lgbtq') == 'other' else ''}>Outra (use a nota)</option><option value="yes" {'selected' if cfg.get('candidate_lgbtq') == 'yes' else ''}>Sou LGBTI+ (genérico)</option></select></label></div><label style="margin-top:14px">Nota livre p/ perguntas de diversidade fora das opções<textarea name="candidate_diversity_note" rows="2">{esc(cfg.get('candidate_diversity_note',''))}</textarea></label><p class="hint">Esses valores respondem perguntas de diversidade (radio/select/checkbox). "Prefiro não informar" deixa a pergunta em branco para você no Chrome — o robô não chuta. Perguntas da empresa <em>sem</em> relação com identidade são respondidas pela IA com a análise do currículo.</p><button style="margin-top:16px">Salvar perfil</button></form></section></div>
-
-<div id="tab-ia" class="tab-panel"><section class="panel"><h2>IA &amp; integrações</h2><form method="post" action="/ai-settings"><div class="form-grid"><label>Provedor de IA<select name="ai_provider"><option value="gemini" {'selected' if cfg.get('ai_provider') == 'gemini' else ''}>Gemini</option><option value="openai" {'selected' if cfg.get('ai_provider') == 'openai' else ''}>OpenAI</option></select></label><label>Modelo<input name="ai_model" value="{esc(cfg.get('ai_model','gemini-2.5-flash'))}"></label><label>Motor de navegador<select name="browser_engine"><option value="pydoll" {'selected' if cfg.get('browser_engine','pydoll') == 'pydoll' else ''}>Pydoll (CDP, stealth — padrão)</option><option value="playwright" {'selected' if cfg.get('browser_engine','pydoll') == 'playwright' else ''}>Playwright (fallback)</option></select></label><label>Chave de IA (vazio mantém a salva)<input type="password" name="api_key" autocomplete="new-password"></label><label>Adzuna App ID (vazio mantém o salvo)<input name="adzuna_app_id" value=""></label><label>Adzuna API key (vazio mantém a salva)<input type="password" name="adzuna_app_key" value=""></label><label>Token Apify (vazio mantém o salvo)<input type="password" name="apify_token" value="" autocomplete="new-password"></label></div><label style="margin-top:14px">Fatos profissionais em português<textarea name="candidate_facts_pt" rows="3">{esc(cfg.get('candidate_facts_pt',''))}</textarea></label><label style="margin-top:12px">Professional facts in English<textarea name="candidate_facts_en" rows="3">{esc(cfg.get('candidate_facts_en',''))}</textarea></label><p class="hint">Chaves vão para o cofre do sistema. Os fatos alimentam a IA nas perguntas abertas e de opções.</p><button style="margin-top:14px">Salvar IA e integrações</button></form></section><section class="panel"><h2>Regras de formulário (navegador)</h2><form method="post" action="/profile-settings">{rules_panel}<p class="hint">Modo <code>salary</code> escolhe automaticamente BRL×USD pela moeda do campo e aplica o multiplicador PJ ao valor BRL quando a contratação preferida é PJ; "Valor fixo" só é usado como desempate. No modo <code>select</code>, coloque em "Valor fixo" o texto da opção preferida. Perguntas abertas sem regra usam a IA.</p><button>Salvar regras</button></form></section></div>
-
-<div id="tab-automacao" class="tab-panel"><section class="panel"><h2>Automação</h2><form method="post" action="/automation-settings"><label style="margin:0 0 12px;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="auto_apply" value="1" {'checked' if cfg.get('auto_apply') == '1' else ''} style="width:auto;margin-top:3px"> <span>Após a coleta, enfileirar e triar vagas novas automaticamente. O envio automático fica limitado a e-mail SMTP; formulários são preenchidos por você no Chrome com a extensão.</span></label><div class="form-grid"><label>Score mínimo (%)<input name="minimum_match_score" type="number" min="0" max="100" value="{esc(cfg.get('minimum_match_score','80'))}"></label><label>Workers da fila (vagas em paralelo)<input name="queue_max_workers" type="number" min="1" max="8" value="{esc(cfg.get('queue_max_workers','3'))}"></label><label>Máx. tentativas por job<input name="queue_max_attempts" type="number" min="1" max="200" value="{esc(cfg.get('queue_max_attempts','40'))}"></label><label>TTL da fila (horas)<input name="queue_ttl_hours" type="number" min="1" max="168" value="{esc(cfg.get('queue_ttl_hours','24'))}"></label><label>Volume do som do copiloto (0–100)<input name="copilot_ask_sound_volume" type="number" min="0" max="100" value="{esc(str(int(round(_copilot_ask_volume(cfg) * 100))))}"></label></div><label style="margin:12px 0 18px;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="copilot_ask_sound" value="1" {'checked' if cfg.get('copilot_ask_sound', '1') == '1' else ''} style="width:auto;margin-top:3px"> <span>Tocar som de notificação no painel quando o copiloto pedir um dado</span></label><p class="hint">A disponibilidade das vagas em “Vale a pena olhar” é verificada automaticamente uma vez por dia por HTTP e endpoints públicos. Verificações inconclusivas mantêm a vaga na lista.</p><p class="hint">Vagas de formulário ficam em <em>Vale a pena olhar</em>. Abra a vaga no Chrome e use Odradek Autofill; revise e envie manualmente.</p><button style="margin-top:14px">Salvar automação</button></form></section></div>
-
-<div id="tab-smtp" class="tab-panel"><section class="panel"><h2>SMTP</h2><form method="post" action="/smtp-settings"><div class="form-grid"><label>Host<input name="smtp_host" value="{esc(cfg.get('smtp_host',''))}"></label><label>Porta<input name="smtp_port" type="number" value="{esc(cfg.get('smtp_port','587'))}"></label><label>Usuário<input name="smtp_user" value="{esc(cfg.get('smtp_user',''))}"></label><label>Remetente (From)<input name="smtp_from" value="{esc(cfg.get('smtp_from',''))}"></label><label>Senha (vazio mantém)<input type="password" name="smtp_password" autocomplete="new-password"></label><label>TLS<select name="smtp_use_tls"><option value="1" {'selected' if cfg.get('smtp_use_tls','1')=='1' else ''}>Sim (STARTTLS)</option><option value="0" {'selected' if cfg.get('smtp_use_tls')=='0' else ''}>Não</option></select></label></div><div class="actions"><button>Salvar SMTP</button></div></form><form method="post" action="/smtp-test" style="margin-top:8px"><button class="subtle" type="submit">Enviar e-mail de teste</button></form></section></div>
-
-<div id="tab-vale" class="tab-panel"><section class="panel"><h2>Vale a pena olhar</h2><p class="hint">Vagas que merecem revisão manual ou cujo envio por e-mail não foi possível. Abra a vaga no Chrome e use a extensão Odradek Autofill para preencher o formulário.</p><div id="worth-body">{worth_view}</div></section></div>
-
-<div id="worth-ignore-modal" class="modal" hidden>
-  <div class="modal-backdrop" data-worth-ignore-dismiss></div>
-  <div class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="worth-ignore-modal-title">
-    <h3 id="worth-ignore-modal-title">Ignorar todas?</h3>
-    <p class="hint">Todas as vagas em <strong>Vale a pena olhar</strong> serão marcadas como ignoradas. Não remove o histórico — só sai desta lista.</p>
-    <div class="actions">
-      <button type="button" class="subtle" id="worth-ignore-all-no">Cancelar</button>
-      <button type="button" class="stop" id="worth-ignore-all-yes">Confirmar</button>
-    </div>
-  </div>
-</div>
-
-<div id="copilot-ask-modal" class="modal" hidden>
-  <div class="modal-backdrop"></div>
-  <div class="modal-dialog modal-dialog-ask" role="dialog" aria-modal="true" aria-labelledby="copilot-ask-title">
-    <h3 id="copilot-ask-title">Copiloto precisa de um dado</h3>
-    <p class="hint" id="copilot-ask-question"></p>
-    <p class="hint" id="copilot-ask-help" style="margin-top:-8px">A resposta será salva em <strong>Fatos do candidato</strong> (PT e EN). O Chrome da candidatura fica aberto. Use <strong>Modo manual</strong> para a IA/bot pararem e você concluir sozinho (Chrome não fecha).</p>
-    <div id="copilot-ask-waiting" class="copilot-ask-waiting" hidden>
-      <div class="copilot-ask-spinner" aria-hidden="true"></div>
-      <p id="copilot-ask-hint" class="hint">Aguardando a IA…</p>
-    </div>
-    <div id="copilot-ask-file-wrap" class="copilot-ask-file-wrap" hidden>
-      <label class="hint" for="copilot-ask-file" style="display:block;margin:0 0 6px">Anexe o arquivo pedido</label>
-      <input type="file" id="copilot-ask-file">
-    </div>
-    <textarea id="copilot-ask-answer" placeholder="Sua resposta…"></textarea>
-    <div class="actions">
-      <button type="button" class="subtle" id="copilot-ask-cancel">Cancelar</button>
-      <button type="button" class="subtle" id="copilot-ask-manual" title="IA e bot param; o Chrome fica aberto com você">Modo manual</button>
-      <button type="button" id="copilot-ask-submit">Enviar</button>
-    </div>
-  </div>
-</div>
-
-<div id="tab-filas" class="tab-panel"><section class="panel"><h2>Filas de IA (async + retry)</h2><p class="hint">Análise de currículo e candidaturas rodam em paralelo (até 3 workers). Em fila/rate-limit da API, o job entra em retry automático até sucesso, expirar (24h) ou cancelar.</p><div id="queue-body">{queue_view}</div></section></div>
-
-<div id="tab-assistente" class="tab-panel"><section class="panel"><h2>Assistente</h2><p class="hint">Cole a pergunta do formulário; a IA responde com o valor pronto para colar, usando perfil, fatos e currículo. O histórico fica só nesta sessão (some ao recarregar) e <strong>não</strong> grava em Fatos.</p><div class="assistant-chat"><div id="assistant-messages" class="assistant-messages" aria-live="polite"><div class="assistant-empty" id="assistant-empty">Cole uma pergunta de formulário abaixo — por exemplo escala 1–10, “anos de experiência com X”, ou um rótulo de campo.</div></div><div class="assistant-compose"><textarea id="assistant-input" placeholder="Cole ou digite a pergunta do formulário…" rows="3"></textarea><div class="actions"><button type="button" class="subtle" id="assistant-clear" hidden>Limpar chat</button><button type="button" id="assistant-send">Gerar resposta</button></div></div></div></section></div>
-
-<div id="tab-uso" class="tab-panel"><div id="usage-body">{usage_view}</div></div>
-
-<div id="tab-logs" class="tab-panel"><section class="panel"><div class="actions" style="justify-content:space-between;margin-top:0"><h2 style="margin:0">Logs do processo</h2><form method="post" action="/clear-logs" class="js-process-form"><button class="subtle" type="submit">Limpar logs</button></form></div><p class="hint">Atualiza automaticamente. Mostra coleta, análise de currículo, triagem da IA, SMTP e navegador.</p><div id="logs-body" class="log-console">{logs_view}</div></section></div>
-
-</main></div>
-<script>
-(function () {{
-  var inFlight = false;
-  var liveController = null;
-  var inFlightView = "";
-  var panelReady = false;
-  function condenseHelpText(root) {{
-    (root || document).querySelectorAll('.tab-panel > section.panel p.hint, .tab-panel > section.panel form > p.hint').forEach(function (hint) {{
-      if (hint.closest('.modal, .assistant-chat, .help-disclosure') || hint.dataset.helpHandled) return;
-      if ((hint.textContent || '').trim().length < 150) return;
-      hint.dataset.helpHandled = '1';
-      var disclosure = document.createElement('details');
-      disclosure.className = 'help-disclosure';
-      var summary = document.createElement('summary');
-      summary.textContent = 'Ajuda';
-      hint.parentNode.insertBefore(disclosure, hint);
-      disclosure.appendChild(summary);
-      disclosure.appendChild(hint);
-    }});
-  }}
-  condenseHelpText(document);
-  var optimismInput = document.getElementById('job-selection-optimism');
-  var optimismValue = document.getElementById('job-selection-optimism-value');
-  if (optimismInput && optimismValue) optimismInput.addEventListener('input', function () {{
-    optimismValue.textContent = optimismInput.value + '/100';
-  }});
-  ['worth-body','queue-body','usage-body','linkedin-filter-slot'].forEach(function (id) {{
-    var host = document.getElementById(id);
-    if (!host || typeof MutationObserver === 'undefined') return;
-    new MutationObserver(function (records) {{
-      records.forEach(function (record) {{ record.addedNodes.forEach(function (node) {{
-        if (node.nodeType === 1) condenseHelpText(node);
-      }}); }});
-    }}).observe(host, {{childList:true,subtree:true}});
-  }});
-  function formatCountdownClient(sec) {{
-    sec = Math.max(0, Math.floor(sec));
-    var h = Math.floor(sec / 3600);
-    var m = Math.floor((sec % 3600) / 60);
-    var s = sec % 60;
-    if (h > 0) return h + ":" + String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
-    return String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
-  }}
-  function applyCountdownMap(map) {{
-    if (!map || typeof map !== "object") return;
-    Object.keys(map).forEach(function (key) {{
-      var entry = map[key] || {{}};
-      document.querySelectorAll('[data-countdown-key="' + key + '"]').forEach(function (el) {{
-        el.setAttribute("data-at", entry.at || "");
-        el.setAttribute("data-state", entry.state || "");
-      }});
-    }});
-  }}
-  function updateAllCountdowns() {{
-    document.querySelectorAll("[data-countdown-key]").forEach(function (el) {{
-      var state = el.getAttribute("data-state") || "";
-      if (state === "stopped") {{
-        el.textContent = el.getAttribute("data-label-stopped") || "—";
-        return;
-      }}
-      var iso = el.getAttribute("data-at") || "";
-      if (!iso || state === "busy") {{
-        el.textContent = el.getAttribute("data-label-busy") || "em andamento…";
-        return;
-      }}
-      var target = Date.parse(iso);
-      if (!target) {{
-        el.textContent = el.getAttribute("data-label-busy") || "—";
-        return;
-      }}
-      var left = Math.max(0, Math.round((target - Date.now()) / 1000));
-      var prefix = (el.getAttribute("data-label-running") || "").replace(/\\s+$/, "");
-      var clock = formatCountdownClient(left);
-      el.textContent = prefix ? (prefix + " " + clock) : clock;
-    }});
-  }}
-  document.querySelectorAll(".tab").forEach(function (btn) {{
-    btn.addEventListener("click", function () {{
-      var name = btn.getAttribute("data-tab");
-      document.querySelectorAll(".tab").forEach(function (el) {{ el.classList.toggle("active", el === btn); }});
-      document.querySelectorAll(".tab-panel").forEach(function (panel) {{
-        panel.classList.toggle("active", panel.id === "tab-" + name);
-      }});
-      try {{ localStorage.setItem("radar-tab", name); }} catch (e) {{}}
-      if (panelReady) refresh(true);
-    }});
-  }});
-  try {{
-    var saved = localStorage.getItem("radar-tab");
-    if (saved) {{
-      var target = document.querySelector('.tab[data-tab="' + saved + '"]');
-      if (target) target.click();
-    }}
-  }} catch (e) {{}}
-  var lastCopilotAskId = null;
-  var copilotAskSoundOn = true;
-  var copilotAskSoundVol = 0.55;
-  function playCopilotAskSound(volume) {{
-    try {{
-      var Ctx = window.AudioContext || window.webkitAudioContext;
-      if (!Ctx) return;
-      var ctx = new Ctx();
-      var now = ctx.currentTime;
-      var gain = ctx.createGain();
-      gain.gain.setValueAtTime(0.0001, now);
-      gain.gain.exponentialRampToValueAtTime(Math.max(0.001, Math.min(1, volume || 0.55)), now + 0.02);
-      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.55);
-      gain.connect(ctx.destination);
-      [880, 1174].forEach(function (freq, i) {{
-        var osc = ctx.createOscillator();
-        osc.type = "sine";
-        osc.frequency.value = freq;
-        osc.connect(gain);
-        osc.start(now + i * 0.12);
-        osc.stop(now + 0.45 + i * 0.12);
-      }});
-      setTimeout(function () {{ try {{ ctx.close(); }} catch (e) {{}} }}, 900);
-    }} catch (e) {{}}
-  }}
-  function setCopilotAskBusy(busy, hint) {{
-    var dialog = document.querySelector("#copilot-ask-modal .modal-dialog-ask");
-    var aEl = document.getElementById("copilot-ask-answer");
-    var fileEl = document.getElementById("copilot-ask-file");
-    var submit = document.getElementById("copilot-ask-submit");
-    var cancel = document.getElementById("copilot-ask-cancel");
-    var manual = document.getElementById("copilot-ask-manual");
-    var wait = document.getElementById("copilot-ask-waiting");
-    var hintEl = document.getElementById("copilot-ask-hint");
-    if (dialog) dialog.classList.toggle("is-busy", !!busy);
-    if (wait) wait.hidden = !busy;
-    if (aEl) aEl.disabled = !!busy;
-    if (fileEl) fileEl.disabled = !!busy;
-    if (submit) {{
-      submit.disabled = !!busy;
-      submit.hidden = !!busy;
-    }}
-    if (cancel) {{
-      cancel.disabled = !!busy;
-      cancel.hidden = !!busy;
-    }}
-    if (manual) {{
-      manual.disabled = !!busy;
-      manual.hidden = !!busy;
-    }}
-    if (hintEl) hintEl.textContent = hint || (busy ? "Aguardando a IA…" : "");
-  }}
-  function syncCopilotAsk(data) {{
-    if (!Object.prototype.hasOwnProperty.call(data, "copilot_ask")) return;
-    if (typeof data.copilot_ask_sound !== "undefined") {{
-      copilotAskSoundOn = !!data.copilot_ask_sound;
-    }}
-    if (typeof data.copilot_ask_sound_volume === "number") {{
-      copilotAskSoundVol = data.copilot_ask_sound_volume;
-    }}
-    var modal = document.getElementById("copilot-ask-modal");
-    var qEl = document.getElementById("copilot-ask-question");
-    var aEl = document.getElementById("copilot-ask-answer");
-    var fileWrap = document.getElementById("copilot-ask-file-wrap");
-    var fileEl = document.getElementById("copilot-ask-file");
-    var helpEl = document.getElementById("copilot-ask-help");
-    if (!modal || !qEl) return;
-    var ask = data.copilot_ask || null;
-    if (ask && ask.id) {{
-      var isNew = lastCopilotAskId !== ask.id;
-      var busy = ask.status === "awaiting_ai";
-      var needsFile = !!ask.needs_file || ask.kind === "file";
-      qEl.textContent = ask.question || "";
-      modal.hidden = false;
-      if (fileWrap) fileWrap.hidden = !needsFile;
-      if (helpEl) {{
-        helpEl.innerHTML = needsFile
-          ? "Anexe o arquivo pedido (e opcionalmente um comentário). O Chrome da candidatura fica aberto."
-          : "A resposta será salva em <strong>Fatos do candidato</strong> (PT e EN). O Chrome da candidatura fica aberto.";
-      }}
-      if (isNew) {{
-        if (aEl && !busy) aEl.value = "";
-        if (fileEl) fileEl.value = "";
-        lastCopilotAskId = ask.id;
-        if (copilotAskSoundOn && !busy) playCopilotAskSound(copilotAskSoundVol);
-        try {{ if (!busy) {{ if (needsFile && fileEl) fileEl.focus(); else aEl && aEl.focus(); }} }} catch (e) {{}}
-      }}
-      if (busy && aEl && ask.answer) aEl.value = ask.answer;
-      setCopilotAskBusy(busy, ask.hint || (busy ? "Aguardando a IA…" : ""));
-    }} else {{
-      setCopilotAskBusy(false, "");
-      modal.hidden = true;
-      lastCopilotAskId = null;
-    }}
-  }}
-  function postCopilotAsk(path, extra) {{
-    var fd = new FormData();
-    if (lastCopilotAskId) fd.append("id", String(lastCopilotAskId));
-    if (extra) {{
-      Object.keys(extra).forEach(function (k) {{
-        if (extra[k] !== undefined && extra[k] !== null) fd.append(k, extra[k]);
-      }});
-    }}
-    return fetch(path, {{
-      method: "POST",
-      body: fd,
-      headers: {{ Accept: "application/json", "X-Requested-With": "fetch" }},
-      credentials: "same-origin"
-    }})
-      .then(function (r) {{ return r.json().then(function (data) {{ return {{ okHttp: r.ok, data: data }}; }}); }})
-      .then(function (res) {{
-        var data = res.data || {{}};
-        showNotice(data.notice || (data.ok ? "OK" : "Falha"), data.kind || (data.ok ? "success" : "error"));
-        if (path === "/copilot-ask-answer") {{
-          if (data.ok === false) {{
-            setCopilotAskBusy(false, "");
-          }} else {{
-            setCopilotAskBusy(false, "");
-            var modalDone = document.getElementById("copilot-ask-modal");
-            if (modalDone) modalDone.hidden = true;
-            lastCopilotAskId = null;
-          }}
-        }}
-        if ((path === "/copilot-ask-cancel" || path === "/copilot-ask-manual") && data.ok !== false) {{
-          setCopilotAskBusy(false, "");
-          var modalClose = document.getElementById("copilot-ask-modal");
-          if (modalClose) modalClose.hidden = true;
-          lastCopilotAskId = null;
-        }}
-        refresh();
-      }})
-      .catch(function () {{
-        if (path === "/copilot-ask-answer") setCopilotAskBusy(false, "");
-        showNotice("Falha de comunicação com o painel.", "error");
-      }});
-  }}
-  var appliedHashes = {{}};
-  var worthPage = 1;
-  var worthMinMatch = 0;
-  var worthSort = "";
-  var worthDateFrom = "";
-  var worthDateTo = "";
-  var worthForceUpdate = false;
-  var liveReqGen = 0;
-  var pendingWorthRefresh = false;
-  var pendingViewRefresh = false;
-  try {{
-    var savedPage = parseInt(localStorage.getItem("radar-worth-page"), 10);
-    if (savedPage > 0) worthPage = savedPage;
-    var savedMin = parseInt(localStorage.getItem("radar-worth-min-match"), 10);
-    if (!isNaN(savedMin)) worthMinMatch = Math.max(0, Math.min(100, savedMin));
-    var savedSort = localStorage.getItem("radar-worth-sort");
-    if (savedSort === null || typeof savedSort === "undefined") worthSort = "";
-    else if (savedSort === "match") worthSort = "match_desc";
-    else worthSort = savedSort;
-    worthDateFrom = localStorage.getItem("radar-worth-date-from") || "";
-    worthDateTo = localStorage.getItem("radar-worth-date-to") || "";
-  }} catch (e) {{}}
-  function persistWorthState() {{
-    try {{
-      localStorage.setItem("radar-worth-page", String(worthPage));
-      localStorage.setItem("radar-worth-min-match", String(worthMinMatch));
-      localStorage.setItem("radar-worth-sort", String(worthSort || ""));
-      localStorage.setItem("radar-worth-date-from", String(worthDateFrom || ""));
-      localStorage.setItem("radar-worth-date-to", String(worthDateTo || ""));
-    }} catch (e) {{}}
-  }}
-  function readWorthFilterInputs() {{
-    var minEl = document.getElementById("worth-min-match");
-    var fromEl = document.getElementById("worth-date-from");
-    var toEl = document.getElementById("worth-date-to");
-    if (minEl) {{
-      var val = parseInt(minEl.value, 10);
-      worthMinMatch = isNaN(val) ? 0 : Math.max(0, Math.min(100, val));
-    }}
-    if (fromEl) worthDateFrom = fromEl.value || "";
-    if (toEl) worthDateTo = toEl.value || "";
-  }}
-  function cycleWorthSort(col) {{
-    var parts = String(worthSort || "")
-      .split(",")
-      .map(function (s) {{ return s.trim(); }})
-      .filter(Boolean);
-    var curDir = "";
-    var rest = [];
-    parts.forEach(function (p) {{
-      if (p === col + "_asc") curDir = "asc";
-      else if (p === col + "_desc") curDir = "desc";
-      else rest.push(p);
-    }});
-    var next = "";
-    if (curDir === "") next = col + "_asc";
-    else if (curDir === "asc") next = col + "_desc";
-    if (next) rest.unshift(next);
-    worthSort = rest.join(",");
-  }}
-  function applyWorthFilters() {{
-    readWorthFilterInputs();
-    worthPage = 1;
-    persistWorthState();
-    requestWorthRefresh();
-  }}
-  function panelBusy(el) {{
-    if (!el) return false;
-    try {{
-      if (el.matches(":hover")) return true;
-      if (el.querySelector(":hover")) return true;
-    }} catch (e) {{}}
-    if (el.contains(document.activeElement)) return true;
-    return false;
-  }}
-  function applyRegion(el, html, hash, opts) {{
-    opts = opts || {{}};
-    if (!el || html == null || hash == null) return;
-    if (appliedHashes[opts.key] === hash || el.getAttribute("data-hash") === hash) {{
-      appliedHashes[opts.key] = hash;
-      return;
-    }}
-    if (opts.skipIfBusy && panelBusy(el)) return;
-    var scrollEl = opts.scrollSelector ? el.querySelector(opts.scrollSelector) : null;
-    var scrollTop = scrollEl ? scrollEl.scrollTop : 0;
-    var detailStates = {{}};
-    if (opts.preserveDetails) el.querySelectorAll("details").forEach(function (detail, index) {{
-      var content = detail.querySelector("pre");
-      detailStates[detail.getAttribute("data-live-key") || index] = {{
-        open: detail.open, scrollTop: content ? content.scrollTop : 0
-      }};
-    }});
-    var focused = opts.preserveFocus && el.contains(document.activeElement) ? document.activeElement : null;
-    var focusKey = focused ? focused.getAttribute("data-live-key") : null;
-    if (focused && !focusKey) focusKey = focused.closest("[data-live-key]")?.getAttribute("data-live-key");
-    var wrap = opts.wrapScroll ? el.closest(opts.wrapScroll) : null;
-    var wrapTop = wrap ? wrap.scrollTop : 0;
-    el.innerHTML = html;
-    el.setAttribute("data-hash", hash);
-    appliedHashes[opts.key] = hash;
-    if (scrollEl) {{
-      var again = el.querySelector(opts.scrollSelector);
-      if (again) again.scrollTop = scrollTop;
-    }}
-    if (opts.preserveDetails) el.querySelectorAll("details").forEach(function (detail, index) {{
-      var saved = detailStates[detail.getAttribute("data-live-key") || index];
-      if (!saved) return;
-      detail.open = saved.open;
-      var content = detail.querySelector("pre");
-      if (content) content.scrollTop = saved.scrollTop;
-    }});
-    if (focusKey) el.querySelectorAll("[data-live-key]").forEach(function (target) {{
-      if (target.getAttribute("data-live-key") !== focusKey) return;
-      var focusTarget = target.matches("details") ? target.querySelector("summary") : target;
-      if (focusTarget) focusTarget.focus({{ preventScroll: true }});
-    }});
-    if (wrap) wrap.scrollTop = wrapTop;
-  }}
-  function requestWorthRefresh() {{
-    appliedHashes.worth = null;
-    worthForceUpdate = true;
-    var worthEl = document.getElementById("worth-body");
-    if (worthEl) worthEl.removeAttribute("data-hash");
-    if (inFlight) {{
-      pendingWorthRefresh = true;
-      // Invalida a resposta em voo p/ não reaplicar HTML/filtros velhos.
-      liveReqGen += 1;
-      return;
-    }}
-    refresh(true);
-  }}
-  function setWorthIgnoreConfirm(open) {{
-    var modal = document.getElementById("worth-ignore-modal");
-    if (!modal) return;
-    if (open) {{
-      modal.hidden = false;
-      var yes = document.getElementById("worth-ignore-all-yes");
-      if (yes) yes.disabled = false;
-    }} else {{
-      modal.hidden = true;
-    }}
-  }}
-  function ignoreAllWorth() {{
-    var worthEl = document.getElementById("worth-body");
-    if (worthEl) worthEl.innerHTML = '<p class="hint" style="padding:16px">Ignorando vagas…</p>';
-    setWorthIgnoreConfirm(false);
-    fetch("/worth-ignore-all", {{
-      method: "POST",
-      body: new FormData(),
-      headers: {{ Accept: "application/json", "X-Requested-With": "fetch" }},
-      credentials: "same-origin"
-    }})
-      .then(function (r) {{ return r.json().then(function (data) {{ return {{ okHttp: r.ok, data: data }}; }}); }})
-      .then(function (res) {{
-        var data = res.data || {{}};
-        showNotice(data.notice || (data.ok ? "OK" : "Falha"), data.kind || (data.ok ? "success" : "error"));
-        setWorthIgnoreConfirm(false);
-        worthPage = 1;
-        persistWorthState();
-        requestWorthRefresh();
-      }})
-      .catch(function () {{
-        showNotice("Falha de comunicação com o painel.", "error");
-        worthPage = 1;
-        requestWorthRefresh();
-      }});
-  }}
-  var worthBody = document.getElementById("worth-body");
-  if (worthBody) {{
-    worthBody.addEventListener("click", function (ev) {{
-      var preset = ev.target.closest(".worth-match-preset");
-      if (preset && worthBody.contains(preset)) {{
-        // Lê datas (e match digitado) antes — preset não pode apagar o intervalo.
-        readWorthFilterInputs();
-        worthMinMatch = parseInt(preset.getAttribute("data-worth-min-match"), 10) || 0;
-        var minInput = document.getElementById("worth-min-match");
-        if (minInput) minInput.value = String(worthMinMatch);
-        worthPage = 1;
-        persistWorthState();
-        requestWorthRefresh();
-        return;
-      }}
-      if (ev.target && ev.target.id === "worth-apply-filter") {{
-        applyWorthFilters();
-        return;
-      }}
-      var sortBtn = ev.target.closest("[data-worth-sort-col]");
-      if (sortBtn && worthBody.contains(sortBtn)) {{
-        cycleWorthSort(sortBtn.getAttribute("data-worth-sort-col") || "");
-        worthPage = 1;
-        persistWorthState();
-        requestWorthRefresh();
-        return;
-      }}
-      if (ev.target && ev.target.id === "worth-ignore-all") {{
-        setWorthIgnoreConfirm(true);
-        return;
-      }}
-      var btn = ev.target.closest("[data-worth-page]");
-      if (!btn || btn.disabled) return;
-      if (!worthBody.contains(btn)) return;
-      var next = parseInt(btn.getAttribute("data-worth-page"), 10);
-      if (!next || next === worthPage) return;
-      worthPage = next;
-      persistWorthState();
-      requestWorthRefresh();
-    }});
-    worthBody.addEventListener("keydown", function (ev) {{
-      if (ev.key !== "Enter") return;
-      if (!ev.target) return;
-      var id = ev.target.id || "";
-      if (id !== "worth-min-match" && id !== "worth-date-from" && id !== "worth-date-to") return;
-      ev.preventDefault();
-      applyWorthFilters();
-    }});
-  }}
-  var ignoreModal = document.getElementById("worth-ignore-modal");
-  if (ignoreModal) {{
-    ignoreModal.addEventListener("click", function (ev) {{
-      if (ev.target && ev.target.id === "worth-ignore-all-no") {{
-        setWorthIgnoreConfirm(false);
-        return;
-      }}
-      if (ev.target && ev.target.id === "worth-ignore-all-yes") {{
-        ev.target.disabled = true;
-        ignoreAllWorth();
-        return;
-      }}
-      if (ev.target && ev.target.hasAttribute("data-worth-ignore-dismiss")) {{
-        setWorthIgnoreConfirm(false);
-      }}
-    }});
-    document.addEventListener("keydown", function (ev) {{
-      if (ev.key !== "Escape") return;
-      if (!ignoreModal.hidden) setWorthIgnoreConfirm(false);
-    }});
-  }}
-  function refresh(force) {{
-    if (document.hidden) return;
-    var activeView = document.querySelector(".tab.active")?.getAttribute("data-tab") || "painel";
-    if (inFlight) {{
-      if (force) {{
-        pendingViewRefresh = true;
-        // Uma resposta lenta da seção anterior não deve bloquear a seção que
-        // o usuário acabou de abrir.
-        if (activeView !== inFlightView && liveController) liveController.abort();
-      }}
-      return;
-    }}
-    inFlight = true;
-    pendingWorthRefresh = false;
-    var reqGen = ++liveReqGen;
-    inFlightView = activeView;
-    liveController = typeof AbortController !== "undefined" ? new AbortController() : null;
-    fetch(
-      "/live?worth_page=" + encodeURIComponent(worthPage)
-        + "&view=" + encodeURIComponent(activeView)
-        + "&worth_min_match=" + encodeURIComponent(worthMinMatch)
-        + "&worth_sort=" + encodeURIComponent(worthSort || "")
-        + "&worth_date_from=" + encodeURIComponent(worthDateFrom || "")
-        + "&worth_date_to=" + encodeURIComponent(worthDateTo || ""),
-      {{ headers: {{ Accept: "application/json" }}, signal: liveController ? liveController.signal : undefined }}
-    )
-      .then(function (response) {{ return response.ok ? response.json() : Promise.reject(); }})
-      .then(function (data) {{
-        var stateEl = document.getElementById("collector-state");
-        var messageEl = document.getElementById("runtime-message");
-        var statsEl = document.getElementById("job-stats");
-        var jobsEl = document.getElementById("jobs-body");
-        var historyEl = document.getElementById("run-history");
-        var logsEl = document.getElementById("logs-body");
-        var queueEl = document.getElementById("queue-body");
-        var worthEl = document.getElementById("worth-body");
-        if (stateEl && stateEl.textContent !== data.state_label) stateEl.textContent = data.state_label;
-        if (messageEl && messageEl.textContent !== data.message) messageEl.textContent = data.message;
-        if (data.countdowns) {{
-          applyCountdownMap(data.countdowns);
-        }} else if (typeof data.next_run_at !== "undefined") {{
-          // fallback legado se o payload ainda não tiver countdowns
-          applyCountdownMap({{
-            collector: {{
-              at: data.next_run_at || "",
-              state: data.state === "stopped" ? "stopped" : (data.next_run_at ? "running" : "busy")
-            }}
-          }});
-        }}
-        updateAllCountdowns();
-        // Cliente é a fonte da verdade p/ match+data+sort. Resposta velha do /live
-        // não pode sobrescrever um filtro que o usuário acabou de mudar.
-        var worthFresh = reqGen === liveReqGen;
-        if (worthFresh) {{
-          if (data.worth_page) worthPage = data.worth_page;
-          if (typeof data.worth_sort !== "undefined") worthSort = data.worth_sort || "";
-          persistWorthState();
-        }}
-        applyRegion(statsEl, data.stats_html, data.stats_hash, {{ key: "stats" }});
-        applyRegion(jobsEl, data.jobs_html, data.jobs_hash, {{ key: "jobs", skipIfBusy: true, wrapScroll: ".table-wrap" }});
-        applyRegion(historyEl, data.history_html, data.history_hash, {{ key: "history" }});
-        applyRegion(queueEl, data.queue_html, data.queue_hash, {{ key: "queue", preserveDetails: true, preserveFocus: true }});
-        if (worthFresh) {{
-          applyRegion(worthEl, data.worth_html, data.worth_hash, {{ key: "worth", skipIfBusy: !worthForceUpdate }});
-          worthForceUpdate = false;
-        }}
-        applyRegion(
-          document.getElementById("usage-body"),
-          data.usage_html,
-          data.usage_hash,
-          {{ key: "usage", skipIfBusy: true }}
-        );
-        applyRegion(
-          document.getElementById("linkedin-filter-slot"),
-          data.linkedin_filter_html,
-          data.linkedin_filter_hash,
-          {{ key: "linkedin_filter" }}
-        );
-        if (data.resume_status) {{
-          ["pt", "en"].forEach(function (lang) {{
-            var part = data.resume_status[lang];
-            if (!part) return;
-            applyRegion(document.getElementById("resume-meta-" + lang), part.meta_html, part.meta_hash, {{
-              key: "resume-meta-" + lang
-            }});
-            applyRegion(document.getElementById("resume-dossier-" + lang), part.dossier_html, part.dossier_hash, {{
-              key: "resume-dossier-" + lang,
-              skipIfBusy: true,
-              scrollSelector: ".resume-dossier-scroll",
-              preserveDetails: true
-            }});
-          }});
-        }}
-        if (logsEl && data.logs_html && data.logs_hash && appliedHashes.logs !== data.logs_hash) {{
-          if (!panelBusy(logsEl)) {{
-            var stickBottom = logsEl.scrollTop + logsEl.clientHeight >= logsEl.scrollHeight - 40;
-            var savedTop = logsEl.scrollTop;
-            logsEl.innerHTML = data.logs_html;
-            appliedHashes.logs = data.logs_hash;
-            logsEl.scrollTop = stickBottom ? 0 : savedTop;
-          }}
-        }}
-        syncCopilotAsk(data);
-      }})
-      .catch(function () {{}})
-      .then(function () {{
-        liveController = null;
-        inFlightView = "";
-        inFlight = false;
-        if (pendingWorthRefresh || pendingViewRefresh) {{
-          if (pendingWorthRefresh) worthForceUpdate = true;
-          pendingWorthRefresh = false;
-          pendingViewRefresh = false;
-          refresh(true);
-        }} else {{
-          worthForceUpdate = false;
-        }}
-      }});
-  }}
-  document.addEventListener("click", function (ev) {{
-    if (ev.target && ev.target.id === "copilot-ask-submit") {{
-      var aEl = document.getElementById("copilot-ask-answer");
-      var fileEl = document.getElementById("copilot-ask-file");
-      var fileWrap = document.getElementById("copilot-ask-file-wrap");
-      var needsFile = fileWrap && !fileWrap.hidden;
-      var answer = aEl ? String(aEl.value || "").trim() : "";
-      var file = fileEl && fileEl.files && fileEl.files[0] ? fileEl.files[0] : null;
-      if (needsFile && !file) {{
-        showNotice("Anexe o arquivo pedido.", "warning");
-        return;
-      }}
-      if (!needsFile && !answer) {{
-        showNotice("Digite a resposta.", "warning");
-        return;
-      }}
-      setCopilotAskBusy(true, "Aguardando a IA…");
-      var extra = {{ answer: answer }};
-      if (file) extra.file = file;
-      postCopilotAsk("/copilot-ask-answer", extra);
-      return;
-    }}
-    if (ev.target && ev.target.id === "copilot-ask-cancel") {{
-      postCopilotAsk("/copilot-ask-cancel", {{}});
-      return;
-    }}
-    if (ev.target && ev.target.id === "copilot-ask-manual") {{
-      postCopilotAsk("/copilot-ask-manual", {{}});
-    }}
-  }});
-  var assistantHistory = [];
-  var assistantBusy = false;
-  function syncAssistantEmpty() {{
-    var empty = document.getElementById("assistant-empty");
-    var clearBtn = document.getElementById("assistant-clear");
-    var hasMsgs = assistantHistory.length > 0;
-    if (empty) empty.hidden = hasMsgs;
-    if (clearBtn) clearBtn.hidden = !hasMsgs;
-  }}
-  function appendAssistantBubble(role, text, opts) {{
-    opts = opts || {{}};
-    var box = document.getElementById("assistant-messages");
-    if (!box) return;
-    var empty = document.getElementById("assistant-empty");
-    if (empty) empty.hidden = true;
-    var div = document.createElement("div");
-    div.className = "assistant-msg " + (role === "user" ? "user" : "bot") + (opts.error ? " error" : "");
-    div.textContent = text;
-    if (role === "assistant" && !opts.error) {{
-      var actions = document.createElement("div");
-      actions.className = "assistant-msg-actions";
-      var btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "subtle";
-      btn.textContent = "Copiar";
-      btn.addEventListener("click", function () {{
-        var payload = text;
-        if (navigator.clipboard && navigator.clipboard.writeText) {{
-          navigator.clipboard.writeText(payload).then(function () {{
-            btn.textContent = "Copiado";
-            setTimeout(function () {{ btn.textContent = "Copiar"; }}, 1400);
-          }}).catch(function () {{
-            showNotice("Não foi possível copiar.", "warning");
-          }});
-        }} else {{
-          showNotice("Clipboard indisponível neste navegador.", "warning");
-        }}
-      }});
-      actions.appendChild(btn);
-      div.appendChild(actions);
-    }}
-    box.appendChild(div);
-    box.scrollTop = box.scrollHeight;
-    syncAssistantEmpty();
-  }}
-  function setAssistantBusy(on) {{
-    assistantBusy = !!on;
-    var send = document.getElementById("assistant-send");
-    var input = document.getElementById("assistant-input");
-    if (send) {{
-      send.disabled = assistantBusy;
-      send.textContent = assistantBusy ? "Gerando…" : "Gerar resposta";
-    }}
-    if (input) input.disabled = assistantBusy;
-  }}
-  function sendAssistantChat() {{
-    if (assistantBusy) return;
-    var input = document.getElementById("assistant-input");
-    var question = input ? String(input.value || "").trim() : "";
-    if (!question) {{
-      showNotice("Cole a pergunta do formulário.", "warning");
-      return;
-    }}
-    appendAssistantBubble("user", question);
-    assistantHistory.push({{ role: "user", content: question }});
-    if (input) input.value = "";
-    setAssistantBusy(true);
-    var body = new URLSearchParams();
-    body.set("message", question);
-    body.set("history", JSON.stringify(assistantHistory.slice(0, -1)));
-    fetch("/assistant-chat", {{
-      method: "POST",
-      headers: {{
-        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-        "Accept": "application/json",
-        "X-Requested-With": "fetch"
-      }},
-      body: body.toString()
-    }})
-      .then(function (res) {{ return res.json().then(function (data) {{ return {{ ok: res.ok, data: data }}; }}); }})
-      .then(function (res) {{
-        var data = res.data || {{}};
-        if (data.ok && data.answer) {{
-          appendAssistantBubble("assistant", data.answer);
-          assistantHistory.push({{ role: "assistant", content: data.answer }});
-        }} else {{
-          var err = data.notice || "Falha ao gerar resposta.";
-          appendAssistantBubble("assistant", err, {{ error: true }});
-          showNotice(err, data.kind || "error");
-        }}
-      }})
-      .catch(function () {{
-        appendAssistantBubble("assistant", "Falha de comunicação com o painel.", {{ error: true }});
-        showNotice("Falha de comunicação com o painel.", "error");
-      }})
-      .then(function () {{
-        setAssistantBusy(false);
-        syncAssistantEmpty();
-      }});
-  }}
-  document.addEventListener("click", function (ev) {{
-    if (ev.target && ev.target.id === "assistant-send") {{
-      sendAssistantChat();
-      return;
-    }}
-    if (ev.target && ev.target.id === "assistant-clear") {{
-      assistantHistory = [];
-      var box = document.getElementById("assistant-messages");
-      if (box) {{
-        box.innerHTML = '<div class="assistant-empty" id="assistant-empty">Cole uma pergunta de formulário abaixo — por exemplo escala 1–10, “anos de experiência com X”, ou um rótulo de campo.</div>';
-      }}
-      syncAssistantEmpty();
-    }}
-  }});
-  var assistantInput = document.getElementById("assistant-input");
-  if (assistantInput) {{
-    assistantInput.addEventListener("keydown", function (ev) {{
-      if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) {{
-        ev.preventDefault();
-        sendAssistantChat();
-      }}
-    }});
-  }}
-  var noticeTimer = null;
-  var PROCESS_PATHS = {{
-    "/upload-resume": 1,
-    "/reanalyze-resume": 1,
-    "/start": 1,
-    "/stop": 1,
-    "/queue-cancel": 1,
-    "/queue-retry": 1,
-    "/queue-retry-all": 1,
-    "/queue-eval-new": 1,
-    "/queue-clear": 1,
-    "/clear-logs": 1,
-    "/usage-refresh": 1,
-    "/job-status": 1,
-    "/worth-ignore-all": 1,
-    "/copilot-ask-answer": 1,
-    "/copilot-ask-cancel": 1,
-    "/copilot-ask-manual": 1
-  }};
-  function noticeClass(kind) {{
-    return {{
-      success: "notice notice-ok",
-      info: "notice notice-info",
-      error: "notice notice-error",
-      warning: "notice notice-warn"
-    }}[kind] || "notice";
-  }}
-  function showNotice(text, kind) {{
-    var el = document.getElementById("panel-notice");
-    if (!el) return;
-    el.className = noticeClass(kind || "info");
-    el.textContent = text || "";
-    el.hidden = !text;
-    if (noticeTimer) clearTimeout(noticeTimer);
-    if (text) {{
-      noticeTimer = setTimeout(function () {{ el.hidden = true; }}, 6000);
-    }}
-  }}
-  document.addEventListener("submit", function (ev) {{
-    var form = ev.target;
-    if (!(form instanceof HTMLFormElement)) return;
-    var action = form.getAttribute("action") || "";
-    var path = action.split("?")[0];
-    if (!PROCESS_PATHS[path]) return;
-    ev.preventDefault();
-    var submitter = ev.submitter || form.querySelector('button[type="submit"], button:not([type])');
-    if (submitter) submitter.disabled = true;
-    var body = new FormData(form);
-    // multiplos botoes name=status (aplicada/ignorar/salvar): incluir o clicado
-    if (submitter && submitter.name) {{
-      body.set(submitter.name, submitter.value);
-    }}
-    // A vaga sai visualmente da lista enquanto o Render confirma a gravação.
-    var optimisticRow = null;
-    if (path === "/job-status" && ["applied", "ignored"].indexOf(body.get("status")) !== -1) {{
-      optimisticRow = form.closest("tr");
-      if (optimisticRow) optimisticRow.hidden = true;
-    }}
-    fetch(path, {{
-      method: "POST",
-      body: body,
-      headers: {{ Accept: "application/json", "X-Requested-With": "fetch" }},
-      credentials: "same-origin"
-    }})
-      .then(function (r) {{ return r.json().then(function (data) {{ return {{ okHttp: r.ok, data: data }}; }}); }})
-      .then(function (res) {{
-        var data = res.data || {{}};
-        if (optimisticRow && data.ok === false) optimisticRow.hidden = false;
-        showNotice(data.notice || (data.ok ? "OK" : "Falha"), data.kind || (data.ok ? "success" : "error"));
-        if (path === "/upload-resume" && data.ok !== false) {{
-          var fileInput = form.querySelector('input[type="file"]');
-          if (fileInput) fileInput.value = "";
-        }}
-        if (path === "/job-status" || path === "/worth-ignore-all") {{
-          requestWorthRefresh();
-        }} else {{
-          refresh();
-        }}
-      }})
-      .catch(function () {{
-        if (optimisticRow) optimisticRow.hidden = false;
-        showNotice("Falha de comunicação com o painel.", "error");
-      }})
-      .then(function () {{
-        if (submitter) submitter.disabled = false;
-      }});
-  }});
-  function initLinkedinFilterPanel() {{
-    var linkedinFilterPanel = document.getElementById("linkedin-filter-panel");
-    if (!linkedinFilterPanel || linkedinFilterPanel.dataset.initialized === "1") return;
-    linkedinFilterPanel.dataset.initialized = "1";
-    var linkedinFilterList = document.getElementById("linkedin-filter-list");
-    var linkedinFiltersInput = document.getElementById("linkedin-filters-json");
-    var experienceOptions = [[1, "Estágio"], [2, "Júnior"], [3, "Associado"], [4, "Pleno / sênior"], [5, "Diretor"], [6, "Executivo"]];
-    var workplaceOptions = [[1, "Presencial"], [2, "Remoto"], [3, "Híbrido"]];
-    function commaValues(value) {{
-      return String(value || "").split(",").map(function (x) {{ return x.trim(); }}).filter(Boolean);
-    }}
-    function addFilterOptions(parent, title, attr, options, selected) {{
-      var group = document.createElement("div");
-      group.className = "linkedin-filter-options";
-      var heading = document.createElement("strong");
-      heading.textContent = title;
-      group.appendChild(heading);
-      options.forEach(function (option) {{
-        var label = document.createElement("label");
-        label.className = "linkedin-filter-option";
-        var input = document.createElement("input");
-        input.type = "checkbox";
-        input.setAttribute(attr, "");
-        input.value = String(option[0]);
-        input.checked = selected.indexOf(option[0]) !== -1;
-        label.appendChild(input);
-        label.appendChild(document.createTextNode(option[1]));
-        group.appendChild(label);
-      }});
-      parent.appendChild(group);
-    }}
-    function addFilterTextField(parent, labelText, attr, value) {{
-      var label = document.createElement("label");
-      label.textContent = labelText;
-      var input = document.createElement("input");
-      input.setAttribute(attr, "");
-      input.value = value || "";
-      label.appendChild(input);
-      parent.appendChild(label);
-    }}
-    function createLinkedinFilterCard(filter) {{
-      var card = document.createElement("article");
-      card.className = "linkedin-filter-card";
-      card.setAttribute("data-filter-id", filter.id || ("manual-" + Date.now()));
-      card.setAttribute("data-filter-source", filter.source || "manual");
-      card.setAttribute("data-filter-reason", filter.reason || "Criado manualmente.");
-      var head = document.createElement("div");
-      head.className = "linkedin-filter-head";
-      var enableLabel = document.createElement("label");
-      enableLabel.className = "linkedin-filter-enable";
-      var enabled = document.createElement("input");
-      enabled.type = "checkbox";
-      enabled.setAttribute("data-filter-enabled", "");
-      enabled.checked = filter.enabled !== false;
-      enableLabel.appendChild(enabled);
-      enableLabel.appendChild(document.createTextNode(" Usar nesta busca"));
-      var remove = document.createElement("button");
-      remove.type = "button";
-      remove.className = "subtle linkedin-filter-delete";
-      remove.textContent = "Excluir";
-      head.appendChild(enableLabel);
-      head.appendChild(remove);
-      card.appendChild(head);
-      addFilterTextField(card, "Nome do filtro", "data-filter-name", filter.name || "");
-      addFilterTextField(card, "Keywords (separadas por vírgula)", "data-filter-keywords", (filter.keywords || []).join(", "));
-      addFilterTextField(card, "Locais (separados por vírgula)", "data-filter-locations", (filter.locations || ["Remote", "Belo Horizonte"]).join(", "));
-      addFilterOptions(card, "Experiência", "data-filter-experience", experienceOptions, filter.experience_levels || [3, 4]);
-      addFilterOptions(card, "Modelo de trabalho", "data-filter-workplace", workplaceOptions, filter.workplace_types || [2, 3]);
-      var reason = document.createElement("small");
-      reason.className = "hint";
-      reason.textContent = filter.reason || "Filtro criado manualmente.";
-      card.appendChild(reason);
-      return card;
-    }}
-    function syncLinkedinFilters() {{
-      if (!linkedinFiltersInput) return;
-      var filters = Array.from(linkedinFilterList.querySelectorAll(".linkedin-filter-card")).map(function (card) {{
-        return {{
-          id: card.getAttribute("data-filter-id") || ("manual-" + Date.now()),
-          name: (card.querySelector("[data-filter-name]") || {{value: ""}}).value.trim(),
-          enabled: !!(card.querySelector("[data-filter-enabled]") || {{checked: false}}).checked,
-          keywords: commaValues((card.querySelector("[data-filter-keywords]") || {{value: ""}}).value),
-          locations: commaValues((card.querySelector("[data-filter-locations]") || {{value: ""}}).value),
-          experience_levels: Array.from(card.querySelectorAll("[data-filter-experience]:checked")).map(function (x) {{ return Number(x.value); }}),
-          workplace_types: Array.from(card.querySelectorAll("[data-filter-workplace]:checked")).map(function (x) {{ return Number(x.value); }}),
-          reason: card.getAttribute("data-filter-reason") || "",
-          source: card.getAttribute("data-filter-source") || "manual"
-        }};
-      }}).filter(function (filter) {{ return filter.name && filter.keywords.length; }});
-      linkedinFiltersInput.value = JSON.stringify(filters);
-    }}
-    linkedinFilterList.addEventListener("input", syncLinkedinFilters);
-    linkedinFilterList.addEventListener("change", syncLinkedinFilters);
-    linkedinFilterList.addEventListener("click", function (ev) {{
-      var remove = ev.target.closest(".linkedin-filter-delete");
-      if (!remove) return;
-      var card = remove.closest(".linkedin-filter-card");
-      if (card) card.remove();
-      syncLinkedinFilters();
-    }});
-    var addFilterButton = document.getElementById("linkedin-filter-add");
-    if (addFilterButton) addFilterButton.addEventListener("click", function () {{
-      var nameInput = document.getElementById("new-linkedin-filter-name");
-      var keywordsInput = document.getElementById("new-linkedin-filter-keywords");
-      var name = nameInput ? nameInput.value.trim() : "";
-      var keywords = commaValues(keywordsInput ? keywordsInput.value : "");
-      if (!name || !keywords.length) {{
-        showNotice("Informe um nome e ao menos uma keyword para criar o filtro.", "warning");
-        return;
-      }}
-      var emptyHint = linkedinFilterList.querySelector(":scope > .hint");
-      if (emptyHint) emptyHint.remove();
-      linkedinFilterList.appendChild(createLinkedinFilterCard({{
-        id: "manual-" + Date.now(), name: name, keywords: keywords,
-        locations: ["Remote", "Belo Horizonte"], experience_levels: [3, 4],
-        workplace_types: [2, 3], enabled: true, source: "manual",
-        reason: "Filtro criado manualmente."
-      }}));
-      if (nameInput) nameInput.value = "";
-      if (keywordsInput) keywordsInput.value = "";
-      syncLinkedinFilters();
-    }});
-    var filterSettingsForm = linkedinFilterPanel.closest("form");
-    if (filterSettingsForm) filterSettingsForm.addEventListener("submit", syncLinkedinFilters);
-  }}
-  initLinkedinFilterPanel();
-  var linkedinFilterSlot = document.getElementById("linkedin-filter-slot");
-  if (linkedinFilterSlot && typeof MutationObserver !== "undefined") {{
-    new MutationObserver(initLinkedinFilterPanel).observe(linkedinFilterSlot, {{ childList: true, subtree: true }});
-  }}
-  var healthHeartbeatInFlight = false;
-  function keepServerAwake() {{
-    if (healthHeartbeatInFlight) return;
-    healthHeartbeatInFlight = true;
-    fetch("/health", {{ cache: "no-store", credentials: "same-origin" }})
-      .catch(function () {{}})
-      .then(function () {{ healthHeartbeatInFlight = false; }});
-  }}
-  keepServerAwake();
-  setInterval(keepServerAwake, 5 * 60 * 1000);
-  panelReady = true;
-  if ((document.querySelector(".tab.active")?.getAttribute("data-tab") || "painel") !== "painel") refresh(true);
-  setInterval(refresh, 2000);
-  setInterval(updateAllCountdowns, 1000);
-  updateAllCountdowns();
-  document.addEventListener("visibilitychange", function () {{
-    if (!document.hidden) {{
-      refresh();
-      keepServerAwake();
-    }}
-  }});
-}})();
-</script></body></html>'''
-    return page_html.replace(
-        '<p class="hint">Chaves vão para o cofre do sistema.',
-        selection_controls_html + '<p class="hint">Chaves vão para o cofre do sistema.',
-        1,
-    )
-
-
-def parse_form(handler: BaseHTTPRequestHandler) -> dict[str, str]:
-    """Parse POST fields from urlencoded or multipart (fetch FormData uses multipart)."""
-    content_type = (handler.headers.get("Content-Type") or "").casefold()
-    if "multipart/form-data" in content_type:
-        fields, _files = parse_multipart(handler)
-        return fields
-    length = int(handler.headers.get("Content-Length", "0"))
-    raw = handler.rfile.read(length).decode("utf-8")
-    parsed = parse_qs(raw, keep_blank_values=True)
-    return {key: values[0] for key, values in parsed.items()}
-
-
-def parse_multipart(handler: BaseHTTPRequestHandler) -> tuple[dict[str, str], dict[str, tuple[str, bytes]]]:
-    """Parseia multipart/form-data em campos de texto e arquivos (nome, bytes)."""
-    content_type = handler.headers.get("Content-Type", "")
-    length = int(handler.headers.get("Content-Length", "0"))
-    body = handler.rfile.read(length)
-    if "boundary=" not in content_type:
-        raise ValueError("Upload multipart inválido.")
-    boundary = content_type.split("boundary=", 1)[1].strip().encode("utf-8")
-    if boundary.startswith(b'"') and boundary.endswith(b'"'):
-        boundary = boundary[1:-1]
-    fields: dict[str, str] = {}
-    files: dict[str, tuple[str, bytes]] = {}
-    for part in body.split(b"--" + boundary):
-        if not part or part in (b"--\r\n", b"--", b"\r\n"):
-            continue
-        if part.startswith(b"--"):
-            continue
-        if part.startswith(b"\r\n"):
-            part = part[2:]
-        if part.endswith(b"\r\n"):
-            part = part[:-2]
-        header_blob, sep, content = part.partition(b"\r\n\r\n")
-        if not sep:
-            continue
-        headers = header_blob.decode("utf-8", errors="replace")
-        disposition = ""
-        for line in headers.split("\r\n"):
-            if line.lower().startswith("content-disposition:"):
-                disposition = line
-        name_match = re.search(r'name="([^"]+)"', disposition)
-        if not name_match:
-            continue
-        name = name_match.group(1)
-        filename_match = re.search(r'filename="([^"]*)"', disposition)
-        if filename_match is not None:
-            filename = filename_match.group(1) or "upload.pdf"
-            files[name] = (filename, content)
-        else:
-            fields[name] = content.decode("utf-8", errors="replace")
-    return fields, files
-
-
-class Handler(BaseHTTPRequestHandler):
-    """Trata as ações do painel sem depender de um servidor web externo."""
-    def _compress_response(self, data: bytes) -> tuple[bytes, bool]:
-        accepts_gzip = "gzip" in (self.headers.get("Accept-Encoding") or "").casefold()
-        if len(data) < 1024 or not accepts_gzip:
-            return data, False
-        compressed = gzip.compress(data, compresslevel=5)
-        return (compressed, True) if len(compressed) < len(data) else (data, False)
-
-    def send_page(self, body: str, status: int = 200) -> None:
-        data, compressed = self._compress_response(body.encode("utf-8"))
-        self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        if compressed:
-            self.send_header("Content-Encoding", "gzip")
-            self.send_header("Vary", "Accept-Encoding")
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(data)
-
-    def send_favicon(self) -> None:
-        try:
-            with open(FAVICON_PATH, "rb") as fh:
-                data = fh.read()
-        except OSError:
-            self.send_response(404)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-        self.send_response(200)
-        self.send_header("Content-Type", "image/png")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "public, max-age=86400")
-        self.end_headers()
-        self.wfile.write(data)
-
-    def send_json(self, payload: dict, status: int = 200) -> None:
-        data, compressed = self._compress_response(json.dumps(payload).encode("utf-8"))
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        if compressed:
-            self.send_header("Content-Encoding", "gzip")
-            self.send_header("Vary", "Accept-Encoding")
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(data)
-
-    def send_extension_json(self, payload: dict, status: int = 200) -> None:
-        """Read-only, allow-listed profile data for the local autofill extension."""
-        data, compressed = self._compress_response(json.dumps(payload).encode("utf-8"))
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        if compressed:
-            self.send_header("Content-Encoding", "gzip")
-            self.send_header("Vary", "Accept-Encoding")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(data)
-
-    def redirect(self, notice: str = "", notice_kind: str = "success") -> None:
-        body = render_page(notice, notice_kind=notice_kind)
-        self.send_page(body)
-
-    def wants_json(self) -> bool:
-        return request_wants_json(self.headers)
-
-    def respond_notice(
-        self,
-        notice: str = "",
-        notice_kind: str = "success",
-        *,
-        ok: bool = True,
-        status: int = 200,
-    ) -> None:
-        if self.wants_json():
-            self.send_json({"ok": ok, "notice": notice, "kind": notice_kind}, status=status)
-            return
-        self.redirect(notice, notice_kind=notice_kind)
-
-    def do_GET(self) -> None:
-        parsed = urlparse(self.path)
-        path = parsed.path
-        if path == "/cover-letter.pdf":
-            try:
-                job_id = int(parse_qs(parsed.query).get("job_id", [""])[0])
-                if job_id <= 0:
-                    raise ValueError
-            except ValueError:
-                self.send_error(400, "Invalid job ID")
-                return
-            with connect() as db:
-                letter = db.execute("SELECT body FROM cover_letters WHERE job_id=?", (job_id,)).fetchone()
-            if not letter or not (letter["body"] or "").strip():
-                self.send_error(404, "Cover letter not found")
-                return
-            try:
-                from cover_letter_pdf import render_cover_letter_pdf
-                data = render_cover_letter_pdf(letter["body"])
-            except Exception:
-                LOG.exception("Failed to render cover letter PDF for job %s", job_id)
-                self.send_error(500, "Unable to create cover letter PDF")
-                return
-            self.send_response(200)
-            self.send_header("Content-Type", "application/pdf")
-            self.send_header("Content-Disposition", f'attachment; filename="cover-letter-{job_id}.pdf"')
-            self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(data)
-            return
-        if path in ("/favicon.ico", "/odradek-icon.png"):
-            self.send_favicon()
-            return
-        if path == "/health":
-            try:
-                with connect() as db:
-                    db.execute("SELECT 1")
-                self.send_extension_json({"ok": True, "service": "odradek-scraper", "database": "ok"})
-            except Exception:
-                self.send_extension_json(
-                    {"ok": False, "service": "odradek-scraper", "database": "unavailable"},
-                    status=503,
-                )
-            return
-        if path == "/live":
-            qs = parse_qs(parsed.query)
-            view = (qs.get("view") or ["painel"])[0].strip()
-            if view not in {"painel", "vale", "filas", "logs", "uso", "curriculos", "busca", "ia", "assistente"}:
-                view = "painel"
-            worth_page = 1
-            worth_min_match = 0
-            worth_sort = WORTH_SORT_NONE
-            worth_date_from = ""
-            worth_date_to = ""
-            raw_page = (qs.get("worth_page") or ["1"])[0]
-            raw_min = (qs.get("worth_min_match") or ["0"])[0]
-            raw_sort = (qs.get("worth_sort") or [""])[0]
-            worth_date_from = (qs.get("worth_date_from") or [""])[0].strip()
-            worth_date_to = (qs.get("worth_date_to") or [""])[0].strip()
-            try:
-                worth_page = max(1, int(raw_page))
-            except ValueError:
-                worth_page = 1
-            try:
-                worth_min_match = max(0, min(100, int(raw_min)))
-            except ValueError:
-                worth_min_match = 0
-            worth_sort = normalize_worth_sort(raw_sort)
-            self.send_json(
-                live_payload(
-                    view=view,
-                    worth_page=worth_page,
-                    worth_min_match=worth_min_match,
-                    worth_sort=worth_sort,
-                    worth_date_from=worth_date_from,
-                    worth_date_to=worth_date_to,
-                )
-            )
-            return
-        if path == "/api/autofill-profile":
-            cfg = settings()
-            name_parts = (cfg.get("candidate_name") or "").strip().split()
-            first_name = name_parts[0] if name_parts else ""
-            last_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
-            self.send_extension_json({
-                "profile": {
-                    "firstName": first_name,
-                    "lastName": last_name,
-                    "fullName": (cfg.get("candidate_name") or "").strip(),
-                    "email": (cfg.get("candidate_email") or "").strip(),
-                    "phone": (cfg.get("candidate_phone") or "").strip(),
-                    "city": (cfg.get("candidate_city") or "").strip(),
-                    "state": (cfg.get("candidate_state") or "").strip(),
-                    "country": (cfg.get("candidate_country") or "").strip(),
-                    "zip": (cfg.get("candidate_postal_code") or "").strip(),
-                    "linkedin": (cfg.get("candidate_linkedin") or "").strip(),
-                }
-            })
-            return
-        if path == "/api/autofill-rules":
-            # Share only field labels/aliases with the browser extension. Rule
-            # values, resume paths, facts, and other profile details stay server-side.
-            extension_keys = {
-                "full_name": "fullName",
-                "email": "email",
-                "phone": "phone",
-                "linkedin": "linkedin",
-                "city": "city",
-                "street_address": "streetAddress",
-                "postal_code": "zip",
-                "state": "state",
-                "country": "country",
-                "current_company": "currentCompany",
-                "cpf": "cpf",
-                "salary": "salaryExpectation",
-                "contract_type": "contractType",
-            }
-            with connect() as db:
-                rules = list_rules(db)
-            fields = []
-            for rule in rules:
-                key = extension_keys.get(str(rule["key"]).casefold())
-                if not key or str(rule["mode"]).casefold() == "skip":
-                    continue
-                aliases = [part.strip() for part in re.split(r"[,\n;]", str(rule["aliases"] or "")) if part.strip()]
-                fields.append({"key": key, "aliases": aliases})
-            self.send_extension_json({"fields": fields})
-            return
-        self.send_page(render_page())
-
-    def do_POST(self) -> None:
-        path = urlparse(self.path).path
-        if path == "/upload-resume":
-            try:
-                fields, files = parse_multipart(self)
-                language = (fields.get("language") or "").strip().casefold()
-                if "file" not in files:
-                    raise ValueError("Selecione um arquivo PDF.")
-                filename, raw = files["file"]
-                force = (fields.get("force_reanalyze") or "").strip() == "1"
-                with connect() as db:
-                    message, kind, needs_analysis = persist_resume_upload(
-                        db,
-                        language=language,
-                        original_filename=filename,
-                        raw_bytes=raw,
-                        resumes_dir=RESUMES_DIR,
-                        now_iso=now_iso(),
-                        force_reanalyze=force,
-                    )
-                if needs_analysis:
-                    # Force always creates a fresh queue job (no dedupe reuse).
-                    qid = queue.enqueue(
-                        KIND_RESUME,
-                        {"language": language, "force": True, "requested_at": now_iso()},
-                        dedupe_key=None if force else f"resume:{language}",
-                    )
-                    message = f"{message} Job de fila #{qid}."
-                log_event(kind if kind != "info" else "info", "resume", message)
-                self.respond_notice(message, notice_kind=kind)
-            except Exception as exc:
-                log_event("error", "resume", f"Falha no upload: {exc}")
-                self.respond_notice(f"Falha no upload do currículo: {exc}", notice_kind="error", ok=False)
-            return
-
-        if path == "/copilot-ask-answer":
-            content_type = (self.headers.get("Content-Type") or "").casefold()
-            file_path = ""
-            try:
-                if "multipart/form-data" in content_type:
-                    fields, files = parse_multipart(self)
-                    form_ask = fields
-                    ask_id = int(form_ask["id"]) if str(form_ask.get("id", "")).isdigit() else 0
-                    answer = (form_ask.get("answer") or "").strip()
-                    if "file" in files:
-                        from copilot_asks import save_ask_upload
-
-                        fname, raw = files["file"]
-                        file_path = save_ask_upload(
-                            uploads_dir=COPILOT_UPLOADS_DIR,
-                            ask_id=ask_id or 0,
-                            filename=fname,
-                            raw_bytes=raw,
-                        )
-                else:
-                    form_ask = parse_form(self)
-                    ask_id = int(form_ask["id"]) if form_ask.get("id", "").isdigit() else 0
-                    answer = (form_ask.get("answer") or "").strip()
-            except ValueError as exc:
-                self.respond_notice(str(exc), notice_kind="warning", ok=False)
-                return
-            if not ask_id or (not answer and not file_path):
-                self.respond_notice("Informe a resposta ou anexe o arquivo.", notice_kind="warning", ok=False)
-                return
-            from copilot_asks import answer_ask, get_ask
-
-            pending = get_ask(connect, ask_id)
-            if pending and (pending.get("kind") or "text") == "file" and not file_path:
-                self.respond_notice("Esta pergunta exige um arquivo anexado.", notice_kind="warning", ok=False)
-                return
-            ok = answer_ask(connect, ask_id, answer, now_iso=now_iso(), file_path=file_path)
-            if ok:
-                log_event(
-                    "info",
-                    "copilot",
-                    f"Ask #{ask_id} respondida no painel"
-                    + (" (com arquivo)" if file_path else "")
-                    + ".",
-                )
-                self.respond_notice("Resposta enviada — o copiloto continua no Chrome.")
-            else:
-                self.respond_notice("Pergunta já respondida ou expirada.", notice_kind="warning", ok=False)
-            return
-
-        if path == "/assistant-chat":
-            form_ask = parse_form(self)
-            message = (form_ask.get("message") or "").strip()
-            history_raw = form_ask.get("history") or "[]"
-            cfg = settings()
-            provider = (cfg.get("ai_provider") or "gemini").strip()
-            model = (cfg.get("ai_model") or "gemini-2.5-flash").strip()
-            api_key = get_ai_key(provider)
-            try:
-                from assistant_chat import answer_form_question
-                from resume_pipeline import AiUnavailableError
-
-                with connect() as db:
-                    answer = answer_form_question(
-                        question=message,
-                        cfg=cfg,
-                        db=db,
-                        provider=provider,
-                        model=model,
-                        api_key=api_key,
-                        history=history_raw,
-                    )
-                log_event("info", "assistant", "Resposta gerada no Assistente.")
-                self.send_json({"ok": True, "answer": answer})
-            except AiUnavailableError as exc:
-                self.send_json(
-                    {"ok": False, "notice": str(exc), "kind": "warning"},
-                    status=503,
-                )
-            except ValueError as exc:
-                self.send_json(
-                    {"ok": False, "notice": str(exc), "kind": "warning"},
-                    status=400,
-                )
-            except Exception as exc:
-                log_event("error", "assistant", f"Falha no Assistente: {exc}")
-                self.send_json(
-                    {"ok": False, "notice": f"Falha ao gerar resposta: {exc}", "kind": "error"},
-                    status=500,
-                )
-            return
-
-        form = parse_form(self)
-        if path == "/linkedin-filters-generate":
-            try:
-                if "apify_actors_json" in form and form.get("apify_actors_json", "").strip():
-                    load_apify_actors({**settings(), "apify_actors_json": form["apify_actors_json"]})
-                raw_prompt = (form.get("linkedin_filter_prompt") or "").strip()
-                form["linkedin_filter_prompt"] = (
-                    "" if raw_prompt == DEFAULT_LINKEDIN_FILTER_PROMPT.strip() else raw_prompt
-                )
-                current_cfg = {**settings(), **form}
-                if "apify_linkedin_filters_json" in form:
-                    form["apify_linkedin_filters_json"] = _validate_linkedin_filter_form(
-                        form["apify_linkedin_filters_json"], current_cfg
-                    )
-                save_settings(form)
-                cfg = settings()
-                generated = ai_generate_linkedin_search_filters(cfg)
-                previous = _normalize_linkedin_filters(
-                    json.loads(cfg.get("apify_linkedin_filters_json") or "[]"),
-                    cfg,
-                    fallback_if_empty=False,
-                )
-                previous_states = {item["name"].casefold(): item["enabled"] for item in previous}
-                for item in generated:
-                    if item["name"].casefold() in previous_states:
-                        item["enabled"] = previous_states[item["name"].casefold()]
-                payload = json.dumps(generated, ensure_ascii=False)
-                set_setting("apify_linkedin_filters_json", payload)
-                set_setting("apify_linkedin_filter_json", json.dumps(generated[0], ensure_ascii=False))
-                set_setting("apify_linkedin_filter_hash", _resume_filter_fingerprint(cfg))
-                log_event("info", "apify", f"IA gerou {len(generated)} filtros LinkedIn.")
-                self.redirect(f"A IA gerou {len(generated)} filtros LinkedIn. Revise e salve os que deseja usar.")
-            except Exception as exc:
-                log_event("warning", "apify", f"Falha ao gerar filtros LinkedIn: {exc}")
-                self.redirect(f"Não foi possível gerar filtros com IA: {exc}", notice_kind="error")
-            return
-        if path == "/reanalyze-resume":
-            language = (form.get("language") or "").strip().casefold()
-            if language not in {"pt", "en"}:
-                self.respond_notice("Idioma inválido para reanálise.", notice_kind="error", ok=False)
-                return
-            with connect() as db:
-                row = get_resume(db, language)
-                if not row:
-                    self.respond_notice(f"Não há currículo {language.upper()} salvo.", notice_kind="error", ok=False)
-                    return
-                if not (row["extracted_text"] or "").strip() and not (
-                    row["stored_path"] and os.path.exists(row["stored_path"])
-                ):
-                    self.respond_notice(
-                        f"Currículo {language.upper()} sem arquivo/texto para reanalisar. Envie o PDF novamente.",
-                        notice_kind="error",
-                        ok=False,
-                    )
-                    return
-                db.execute(
-                    """UPDATE resumes SET analysis_status='pending', analysis_error='',
-                           analysis_message=?, updated_at=? WHERE language=?""",
-                    (
-                        f"Currículo {language.upper()}: reanálise forçada — na fila.",
-                        now_iso(),
-                        language,
-                    ),
-                )
-                actives = db.execute(
-                    """SELECT id FROM queue_jobs
-                       WHERE kind=? AND status IN ('pending','running','retry_wait')
-                         AND payload LIKE ?""",
-                    (KIND_RESUME, f'%"language": "{language}"%'),
-                ).fetchall()
-            for active in actives:
-                queue.cancel(int(active["id"]))
-            # Sem dedupe: sempre cria job novo para garantir nova chamada à IA.
-            qid = queue.enqueue(
-                KIND_RESUME,
-                {"language": language, "force": True, "requested_at": now_iso()},
-                dedupe_key=None,
-            )
-            msg = f"Reanálise do currículo {language.upper()} enfileirada (job #{qid}). Acompanhe em Filas/Logs."
-            log_event("info", "resume", msg)
-            self.respond_notice(msg, notice_kind="info")
-            return
-
-        if path == "/settings":
-            if "apify_actors_json" in form and form.get("apify_actors_json", "").strip():
-                try:
-                    # Validate before persist.
-                    load_apify_actors({**settings(), "apify_actors_json": form["apify_actors_json"]})
-                except ValueError as exc:
-                    self.redirect(f"Actors Apify inválidos: {exc}", notice_kind="error")
-                    return
-            if "apify_linkedin_filters_json" in form:
-                try:
-                    form["apify_linkedin_filters_json"] = _validate_linkedin_filter_form(
-                        form["apify_linkedin_filters_json"], {**settings(), **form}
-                    )
-                except ValueError as exc:
-                    self.redirect(f"Filtros LinkedIn inválidos: {exc}", notice_kind="error")
-                    return
-            old_prompt = effective_linkedin_filter_prompt(settings())
-            raw_prompt = (form.get("linkedin_filter_prompt") or "").strip()
-            # Mesmo texto do default embutido → guarda vazio (usa DEFAULT).
-            if raw_prompt == DEFAULT_LINKEDIN_FILTER_PROMPT.strip():
-                form["linkedin_filter_prompt"] = ""
-            else:
-                form["linkedin_filter_prompt"] = raw_prompt
-            save_settings(form)
-            new_cfg = settings()
-            new_prompt = effective_linkedin_filter_prompt(new_cfg)
-            notice = "Filtros salvos."
-            notice_kind = "success"
-            if new_prompt != old_prompt:
-                try:
-                    regenerated = get_linkedin_search_filters(new_cfg, force_refresh=True)
-                    notice = f"Preferências salvas e {len(regenerated)} filtros LinkedIn regenerados."
-                    log_event("info", "settings", f"Prompt LinkedIn alterado; {len(regenerated)} filtros regenerados.")
-                except Exception as exc:
-                    notice = (
-                        "Preferências salvas, mas falhou ao regenerar o filtro LinkedIn: "
-                        f"{exc}. Ele tentará de novo na próxima coleta."
-                    )
-                    notice_kind = "warning"
-                    log_event("warning", "settings", f"Regeneração do filtro LinkedIn falhou: {exc}")
-            else:
-                if "apify_linkedin_filters_json" in form:
-                    set_setting("apify_linkedin_filter_hash", _resume_filter_fingerprint(new_cfg))
-                log_event("info", "settings", "Preferências de busca salvas.")
-            self.redirect(notice, notice_kind=notice_kind)
-        elif path == "/candidate-settings":
-            save_settings(form)
-            log_event("info", "settings", "Perfil do candidato salvo (dados, salário, diversidade).")
-            self.redirect("Perfil salvo.")
-        elif path == "/ai-settings":
-            # Assisted-only: strip any legacy auto-submit flag if present in DB form posts.
-            form.pop("linkedin_stop_before_submit", None)
-            optimism, _ = job_selection_optimism_instruction(form.get("job_selection_optimism"))
-            form["job_selection_optimism"] = str(optimism)
-            selection_prompt = str(form.get("job_selection_prompt") or "").strip()[:30000]
-            form["job_selection_prompt"] = (
-                "" if selection_prompt == DEFAULT_JOB_SELECTION_PROMPT.strip() else selection_prompt
-            )
-            save_settings(form)
-            provider = form.get("ai_provider", "gemini").casefold()
-            try:
-                if form.get("api_key", "").strip():
-                    save_ai_key(provider, form.get("api_key", ""))
-                secret_set("adzuna_app_id", form.get("adzuna_app_id", ""))
-                secret_set("adzuna_app_key", form.get("adzuna_app_key", ""))
-                secret_set("apify_token", form.get("apify_token", ""))
-            except RuntimeError as exc:
-                log_event("error", "settings", str(exc))
-                self.redirect(str(exc), notice_kind="error")
-                return
-            log_event("info", "settings", f"IA/integrações salvas (provedor={provider}).")
-            self.redirect("IA e integrações salvas.")
-        elif path == "/automation-settings":
-            if "auto_apply" not in form:
-                form["auto_apply"] = "0"
-            if "copilot_ask_sound" not in form:
-                form["copilot_ask_sound"] = "0"
-            try:
-                vol = float(form.get("copilot_ask_sound_volume") or "55")
-                if vol > 1.0:
-                    vol = vol / 100.0
-                form["copilot_ask_sound_volume"] = f"{max(0.0, min(1.0, vol)):.2f}"
-            except ValueError:
-                form["copilot_ask_sound_volume"] = "0.55"
-            save_settings(form)
-            log_event(
-                "info",
-                "settings",
-                f"Automação salva (auto_apply={form.get('auto_apply')}, "
-                f"copilot_ask_sound={form.get('copilot_ask_sound')}).",
-            )
-            self.redirect("Automação salva.")
-        elif path == "/smtp-settings":
-            save_settings({k: form.get(k, "") for k in ("smtp_host", "smtp_port", "smtp_user", "smtp_from", "smtp_use_tls")})
-            try:
-                if form.get("smtp_password", "").strip():
-                    secret_set("smtp_password", form["smtp_password"])
-            except RuntimeError as exc:
-                self.redirect(str(exc), notice_kind="error")
-                return
-            log_event("info", "smtp", "Configuração SMTP salva.")
-            self.redirect("SMTP salvo.")
-        elif path == "/smtp-test":
-            cfg = settings()
-            to_addr = (cfg.get("candidate_email") or cfg.get("smtp_from") or "").strip()
-            if not to_addr:
-                self.redirect("Configure candidate_email ou smtp_from para testar.", notice_kind="warning")
-                return
-            try:
-                send_smtp_email(
-                    cfg=cfg,
-                    password=secret_get("smtp_password"),
-                    to_addrs=[to_addr],
-                    subject="Odradek Scraper — teste SMTP",
-                    body="Este é um e-mail de teste do Odradek Scraper.",
-                    attachment_path=None,
-                )
-                log_event("success", "smtp", f"E-mail de teste enviado para {to_addr}.")
-                self.redirect(f"E-mail de teste enviado para {to_addr}.")
-            except Exception as exc:
-                log_event("error", "smtp", f"Falha no teste SMTP: {exc}")
-                self.redirect(f"Falha no teste SMTP: {exc}", notice_kind="error")
-        elif path == "/clear-logs":
-            n = clear_logs()
-            log_event("info", "logs", f"Histórico limpo ({n} entradas removidas).")
-            self.respond_notice("Logs limpos.", notice_kind="info")
-        elif path == "/usage-refresh":
-            snap = refresh_apify_quota_snapshot()
-            if snap.get("error") and not snap.get("fetched_at"):
-                self.respond_notice(str(snap.get("error")), notice_kind="warning")
-            elif snap.get("error"):
-                self.respond_notice(f"Apify atualizado com aviso: {snap.get('error')}", notice_kind="warning")
-            else:
-                used = float(snap.get("used_usd") or 0)
-                lim = float(snap.get("local_limit_usd") or snap.get("api_limit_usd") or 0)
-                self.respond_notice(
-                    f"Apify: ${used:.2f} de ${lim:.2f} no ciclo {format_cycle_label_display(snap.get('cycle_label') or 'atual')}.",
-                    notice_kind="success",
-                )
-        elif path == "/queue-cancel":
-            jid = form.get("id", "")
-            if jid.isdigit() and queue.cancel(int(jid)):
-                self.respond_notice(f"Job #{jid} cancelado.", notice_kind="warning")
-            else:
-                self.respond_notice("Não foi possível cancelar o job.", notice_kind="error", ok=False)
-        elif path == "/queue-retry":
-            jid = form.get("id", "")
-            if jid.isdigit() and queue.retry_now(int(jid)):
-                self.respond_notice(f"Job #{jid} reenfileirado.", notice_kind="info")
-            else:
-                self.respond_notice("Não foi possível reenfileirar o job.", notice_kind="error", ok=False)
-        elif path == "/queue-retry-all":
-            n = queue.retry_all()
-            if n:
-                self.respond_notice(f"{n} job(s) reenfileirado(s).", notice_kind="info")
-            else:
-                self.respond_notice("Nenhum job elegível para reenfileirar.", notice_kind="warning")
-        elif path == "/queue-eval-new":
-            note = enqueue_new_jobs_for_triage()
-            kind = "warning" if "nenhuma" in note else "info"
-            self.respond_notice(note, notice_kind=kind)
-        elif path == "/queue-clear":
-            n = queue.clear_terminal()
-            self.respond_notice(f"{n} job(s) removido(s) da fila.", notice_kind="info")
-        elif path == "/profile-settings":
-            save_settings(form)
-            with connect() as db:
-                save_rules_from_form(db, form)
-            log_event("info", "forms", "Regras de formulário salvas.")
-            self.redirect("Regras de formulário salvas.")
-        elif path == "/start":
-            started = collector.start()
-            self.respond_notice("Coleta iniciada." if started else "A coleta já está em execução.")
-        elif path == "/stop":
-            collector.stop()
-            self.respond_notice("Solicitação para parar enviada.")
-        elif path == "/job-status":
-            if form.get("status") in STATUSES and form.get("id", "").isdigit():
-                with connect() as db:
-                    applied = now_iso() if form["status"] == "applied" else None
-                    db.execute(
-                        "UPDATE jobs SET status=?, applied_at=COALESCE(?, applied_at) WHERE id=?",
-                        (form["status"], applied, int(form["id"])),
-                    )
-                labels = {"applied": "marcada como aplicada", "ignored": "ignorada", "saved": "salva"}
-                label = labels.get(form["status"], "atualizada")
-                self.respond_notice(f"Vaga {label}.")
-            else:
-                self.respond_notice("Pedido inválido.", notice_kind="error", ok=False)
-        elif path == "/worth-ignore-all":
-            with connect() as db:
-                cur = db.execute("UPDATE jobs SET status='ignored' WHERE status='worth'")
-                n = cur.rowcount if cur.rowcount is not None else 0
-            if n <= 0:
-                self.respond_notice("Nenhuma vaga em Vale a pena olhar para ignorar.", notice_kind="info")
-            elif n == 1:
-                self.respond_notice("1 vaga ignorada.")
-            else:
-                self.respond_notice(f"{n} vagas ignoradas.")
-        elif path == "/copilot-ask-cancel":
-            ask_id = int(form["id"]) if form.get("id", "").isdigit() else 0
-            if not ask_id:
-                self.respond_notice("Pergunta inválida.", notice_kind="error", ok=False)
-                return
-            from copilot_asks import cancel_ask
-
-            ok = cancel_ask(connect, ask_id)
-            if ok:
-                log_event("info", "copilot", f"Ask #{ask_id} cancelada no painel.")
-                self.respond_notice("Pergunta cancelada — o copiloto vai abortar.", notice_kind="warning")
-            else:
-                self.respond_notice("Pergunta já fechada.", notice_kind="info")
-        elif path == "/copilot-ask-manual":
-            ask_id = int(form["id"]) if form.get("id", "").isdigit() else 0
-            if not ask_id:
-                self.respond_notice("Pergunta inválida.", notice_kind="error", ok=False)
-                return
-            from copilot_asks import manual_ask
-
-            ok = manual_ask(connect, ask_id)
-            if ok:
-                log_event("info", "copilot", f"Ask #{ask_id} — modo manual (Chrome permanece aberto).")
-                self.respond_notice(
-                    "Modo manual: IA e bot pararam. O Chrome fica aberto com você — conclua e feche a janela quando terminar.",
-                    notice_kind="info",
-                )
-            else:
-                self.respond_notice("Pergunta já fechada.", notice_kind="info")
-        elif path == "/notes":
-            if form.get("id", "").isdigit():
-                with connect() as db:
-                    db.execute("UPDATE jobs SET notes=? WHERE id=?", (form.get("notes", ""), int(form["id"])))
-            self.redirect("Anotação salva.")
-        else:
-            self.send_page("Não encontrado", 404)
-
-    #: endpoints de polling — o browser bate a cada poucos segundos; sem isso
-    #: o terminal/LOG enche de linha repetida e sota o que importa.
-    QUIET_PATHS = ("/live", "/health", "/favicon.ico", "/odradek-icon.png")
-
-    def log_message(self, fmt: str, *args: object) -> None:
-        line = fmt % args
-        if any(p in line for p in self.QUIET_PATHS):
-            LOG.debug("%s - %s", self.address_string(), line)
-            return
-        LOG.info("%s - %s", self.address_string(), line)
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    initialize()
-    _boot_logging()
-    _boot_queue()
-    _boot_worth_check_scheduler()
-    print(f"Odradek Scraper disponível em http://{HOST}:{PORT}")
-    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+    import uvicorn
+
+    uvicorn.run("api_asgi:api", host=HOST, port=PORT)
