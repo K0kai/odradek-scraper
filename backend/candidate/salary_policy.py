@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from typing import Literal
 
-from form_rules import (
+from jobs.form_rules import (
     _parse_amount,
     detect_contract_regime,
     detect_salary_currency,

@@ -6,7 +6,7 @@ import logging
 import re
 from typing import Any
 
-from resume_pipeline import AiUnavailableError
+from candidate.resume_pipeline import AiUnavailableError
 
 LOG = logging.getLogger("odradek-scraper")
 
@@ -107,8 +107,8 @@ def review_salary_value(
     if not (provider and model and api_key):
         return value, meta
 
-    from candidate_context import panel_profile_block
-    from ai_client import call_ai_text
+    from candidate.candidate_context import panel_profile_block
+    from integrations.ai_client import call_ai_text
 
     prompt = build_salary_review_prompt(
         field_hint=field_hint,
@@ -160,7 +160,7 @@ def review_salary_value(
                 pass
         if callable(connect_fn):
             try:
-                from copilot_asks import (
+                from jobs.copilot_asks import (
                     STATUS_AWAITING_AI,
                     STATUS_ANSWERED,
                     complete_ask,
@@ -204,7 +204,7 @@ def needs_salary_ai_review(
     field_hint: str = "",
 ) -> bool:
     """Chama IA quando período ambíguo, select, moeda de mercado, ou intern/junior."""
-    from salary_policy import detect_role_tier
+    from candidate.salary_policy import detect_role_tier
 
     period = str(proposal.get("period") or "unknown").casefold()
     currency = str(proposal.get("currency") or "").upper()
@@ -233,7 +233,7 @@ def finalize_salary_value(
     fallback: str = "",
 ) -> str:
     """Proposta do bot + review quando necessário (sempre para intern/junior)."""
-    from salary_policy import propose_salary
+    from candidate.salary_policy import propose_salary
 
     prop = propose_salary(cfg, field_hint=field_hint, job_text=job_text)
     proposed = str(prop.get("formatted") or fallback or "")

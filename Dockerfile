@@ -13,4 +13,4 @@ RUN pip install --no-cache-dir -r backend/requirements.txt
 COPY . ./
 COPY --from=frontend-build /frontend/dist ./frontend/dist
 EXPOSE 8765
-CMD ["sh", "-c", "uvicorn api_asgi:api --app-dir backend --host 0.0.0.0 --port ${PORT:-8765}"]
+CMD ["sh", "-c", "uvicorn web.api_asgi:api --app-dir backend --host 0.0.0.0 --port ${PORT:-8765}"]

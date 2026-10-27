@@ -25,7 +25,7 @@ def _record_usage(
     quota_error: bool,
 ) -> None:
     try:
-        from usage_tracker import try_record_ai_result
+        from integrations.usage_tracker import try_record_ai_result
 
         try_record_ai_result(
             provider=provider,

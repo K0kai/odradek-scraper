@@ -10,6 +10,16 @@ def using_postgres() -> bool:
     return bool((os.environ.get("DATABASE_URL") or "").strip())
 
 
+class SQLiteConnection(sqlite3.Connection):
+    """Commit or roll back, then close when used in a with block."""
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> Any:
+        try:
+            return super().__exit__(exc_type, exc, tb)
+        finally:
+            self.close()
+
+
 def _qmark_to_psycopg(query: str) -> str:
     """Translate SQLite-style placeholders without touching quoted SQL text."""
     out: list[str] = []
@@ -82,7 +92,7 @@ def open_connection(path: str, *, timeout: float = 60.0) -> Any:
         )
         return PostgresConnection(connection)
 
-    db = sqlite3.connect(path, timeout=timeout)
+    db = sqlite3.connect(path, timeout=timeout, factory=SQLiteConnection)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA busy_timeout=60000")

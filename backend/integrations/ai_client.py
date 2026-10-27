@@ -11,7 +11,7 @@ from urllib.error import HTTPError
 from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
 
-from resume_pipeline import AiUnavailableError
+from candidate.resume_pipeline import AiUnavailableError
 
 
 def ai_http_error_detail(exc: HTTPError, *, provider: str, model: str, operation: str, api_key: str) -> str:
@@ -110,7 +110,7 @@ def call_ai_text(
 
 def _record(provider: str, model: str, result: dict | None, *, ok: bool, quota_error: bool) -> None:
     try:
-        from usage_tracker import try_record_ai_result
+        from integrations.usage_tracker import try_record_ai_result
 
         try_record_ai_result(
             provider=provider,

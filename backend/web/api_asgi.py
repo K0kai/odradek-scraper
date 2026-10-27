@@ -16,12 +16,13 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
 import app as core
-from form_rules import list_rules, save_rules_from_form
-from job_queue import KIND_RESUME
-from panel_log import clear_logs, log_event
-from resume_pipeline import AiUnavailableError, get_resume, persist_resume_upload
-from panel_auth import configured, requires_auth, same_origin_post
-from panel_session import (clear_session_cookie, issue_session, login_form, login_page,
+from web import panel_queries, panel_settings
+from jobs.form_rules import list_rules, save_rules_from_form
+from jobs.job_queue import KIND_RESUME
+from web.panel_log import clear_logs, log_event
+from candidate.resume_pipeline import AiUnavailableError, get_resume, persist_resume_upload
+from web.panel_auth import configured, requires_auth, same_origin_post
+from web.panel_session import (clear_session_cookie, issue_session, login_form, login_page,
                            safe_next, secure_cookie, session_cookie, session_expiry, verify_login)
 
 
@@ -134,14 +135,14 @@ api.mount("/ui/assets", StaticFiles(directory=str(_dist / "assets"), check_dir=F
 
 @api.get("/api/dashboard")
 def dashboard() -> dict:
-    return core.dashboard_api_payload()
+    return panel_queries.dashboard_api_payload()
 
 
 @api.get("/api/jobs")
 def jobs(page: int = 1, page_size: int = 15, status: str = "worth", min_match: int = 0,
          sort: str = "", date_from: str = "", date_to: str = "") -> dict:
     try:
-        return core.jobs_api_payload(page=page, page_size=page_size, status=status,
+        return panel_queries.jobs_api_payload(page=page, page_size=page_size, status=status,
                                      min_match=min_match, sort=sort, date_from=date_from, date_to=date_to)
     except ValueError:
         return JSONResponse({"error": "Parâmetros de filtro inválidos"}, status_code=400)
@@ -149,35 +150,35 @@ def jobs(page: int = 1, page_size: int = 15, status: str = "worth", min_match: i
 
 @api.get("/api/queue")
 def queue() -> dict:
-    return core.queue_api_payload()
+    return panel_queries.queue_api_payload()
 
 
 @api.get("/api/logs")
 def logs(limit: int = 200) -> dict:
-    return core.logs_api_payload(limit)
+    return panel_queries.logs_api_payload(limit)
 
 
 @api.get("/api/usage")
 def usage() -> dict:
-    return core.usage_api_payload()
+    return panel_queries.usage_api_payload()
 
 
 @api.get("/api/resumes")
 def resumes() -> dict:
-    return core.resumes_api_payload()
+    return panel_queries.resumes_api_payload()
 
 
 @api.get("/api/copilot-asks/pending")
 def pending_ask() -> dict:
-    from copilot_asks import get_pending_ask
+    from jobs.copilot_asks import get_pending_ask
     return {"ask": get_pending_ask(core.connect)}
 
 
 @api.get("/api/settings/{group}")
 def settings_group(group: str) -> dict:
-    if group not in core.SETTINGS_API_GROUPS:
+    if group not in panel_settings.SETTINGS_API_GROUPS:
         return JSONResponse({"error": "Grupo de configuração inválido"}, status_code=404)
-    return core.settings_api_payload(group)
+    return panel_settings.settings_api_payload(group)
 
 
 @api.get("/api/form-rules")
@@ -240,7 +241,7 @@ def cover_letter(job_id: int):
         row = db.execute("SELECT body FROM cover_letters WHERE job_id=?", (job_id,)).fetchone()
     if not row or not (row["body"] or "").strip():
         return _error("Carta não encontrada", 404)
-    from cover_letter_pdf import render_cover_letter_pdf
+    from candidate.cover_letter_pdf import render_cover_letter_pdf
     data = render_cover_letter_pdf(row["body"])
     return Response(data, media_type="application/pdf", headers={
         "Content-Disposition": f'attachment; filename="cover-letter-{job_id}.pdf"',
@@ -355,36 +356,36 @@ def refresh_usage():
     snapshot = core.refresh_apify_quota_snapshot()
     return {"ok": not bool(snapshot.get("error")),
             "notice": snapshot.get("error") or "Cotas Apify atualizadas.",
-            "usage": core.usage_api_payload()}
+            "usage": panel_queries.usage_api_payload()}
 
 
 @api.post("/api/settings/{group}")
 def save_settings(group: str, body: dict = Body(...)):
-    if group not in core.SETTINGS_API_GROUPS:
+    if group not in panel_settings.SETTINGS_API_GROUPS:
         return _error("Grupo de configuração inválido", 404)
     try:
-        notice = core.save_settings_api_group(group, body)
+        notice = panel_settings.save_settings_api_group(group, body)
     except ValueError as exc:
         return _error(str(exc) or "Configuração inválida")
     except RuntimeError as exc:
         return _error(str(exc), 503)
-    return {"ok": True, "notice": notice, "values": core.settings_api_payload(group)["values"]}
+    return {"ok": True, "notice": notice, "values": panel_settings.settings_api_payload(group)["values"]}
 
 
 @api.post("/api/linkedin-filters/generate")
 def generate_linkedin_filters(body: dict = Body(...)):
     if any(not isinstance(value, str) or len(value) > 30000 for value in body.values()):
         return _error("Valor inválido para a configuração de busca")
-    form = {key: value for key, value in body.items() if key in core.SETTINGS_API_GROUPS["search"]}
+    form = {key: value for key, value in body.items() if key in panel_settings.SETTINGS_API_GROUPS["search"]}
     try:
-        generated = core.generate_linkedin_filters(form)
+        generated = panel_settings.generate_linkedin_filters(form)
     except ValueError as exc:
         return _error(str(exc))
     except Exception as exc:
         log_event("warning", "apify", f"Falha ao gerar filtros LinkedIn: {exc}")
         return _error("Não foi possível gerar filtros com IA.", 503)
     return {"ok": True, "notice": f"A IA gerou {len(generated)} filtros LinkedIn.",
-            "values": core.settings_api_payload("search")["values"]}
+            "values": panel_settings.settings_api_payload("search")["values"]}
 
 
 @api.post("/api/form-rules")
@@ -416,7 +417,7 @@ def save_form_rules(body: dict = Body(...)):
 
 @api.post("/api/smtp/test")
 def smtp_test():
-    ok, notice = core.send_smtp_test()
+    ok, notice = panel_settings.send_smtp_test()
     return JSONResponse({"ok": ok, "notice": notice}, status_code=200 if ok else 400)
 
 
@@ -498,7 +499,7 @@ async def reanalyze_resume(request: Request):
 
 
 def _answer_assistant(message: str, history: str) -> str:
-    from assistant_chat import answer_form_question
+    from candidate.assistant_chat import answer_form_question
     cfg = core.settings()
     provider = (cfg.get("ai_provider") or "gemini").strip()
     model = (cfg.get("ai_model") or "gemini-2.5-flash").strip()
@@ -526,7 +527,7 @@ async def assistant(request: Request):
 
 
 def _answer_copilot(ask_id: int, answer: str, upload: tuple[str, bytes] | None):
-    from copilot_asks import answer_ask, get_ask, save_ask_upload
+    from jobs.copilot_asks import answer_ask, get_ask, save_ask_upload
     if ask_id <= 0 or (not answer and not upload):
         raise ValueError("Informe a resposta ou anexe o arquivo.")
     pending = get_ask(core.connect, ask_id)
@@ -564,7 +565,7 @@ async def copilot_answer(request: Request):
 
 @api.post("/api/copilot-asks/{action}")
 async def copilot_action(action: str, request: Request):
-    from copilot_asks import cancel_ask, manual_ask
+    from jobs.copilot_asks import cancel_ask, manual_ask
     if action not in {"cancel", "manual"}:
         return _error("Ação inválida", 404)
     try:

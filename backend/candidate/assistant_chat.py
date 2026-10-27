@@ -8,10 +8,10 @@ import json
 import sqlite3
 from typing import Any
 
-from ai_client import call_ai_text
-from candidate_context import panel_profile_block
-from experience_priority import EXPERIENCE_PRIORITY_RULE
-from resume_pipeline import AiUnavailableError, compose_analysis_dossier, get_resume
+from integrations.ai_client import call_ai_text
+from candidate.candidate_context import panel_profile_block
+from candidate.experience_priority import EXPERIENCE_PRIORITY_RULE
+from candidate.resume_pipeline import AiUnavailableError, compose_analysis_dossier, get_resume
 
 MAX_QUESTION_CHARS = 4000
 MAX_HISTORY_TURNS = 8

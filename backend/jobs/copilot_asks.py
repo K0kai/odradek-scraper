@@ -7,7 +7,7 @@ import sqlite3
 import time
 from typing import Callable
 
-from dbutil import using_postgres
+from data.dbutil import using_postgres
 
 LOG = logging.getLogger("odradek-scraper")
 

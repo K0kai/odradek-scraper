@@ -11,6 +11,10 @@ A **personal, educational** project for exploring the following in a local envir
 
 The interface code lives in `frontend/`. The API, collection, and business modules live in `backend/`. The SQLite database and persistent files remain in the project root to preserve existing local data.
 
+Database access uses Neon/PostgreSQL when `DATABASE_URL` is set. Without it, the app uses the local `jobs.db` SQLite fallback, including isolated local tests.
+
+Within `backend/`, `web/` contains routes, authentication, and panel responses; `data/` contains database and secrets; `jobs/` contains queues, filters, and rules; `candidate/` contains resume processing and candidate context; `integrations/` contains external clients. `app.py` coordinates collection and workflows.
+
 **This is not a product, commercial service, or tool intended for mass use.**  
 The code is intended for learning and experimentation **on your own computer**.
 

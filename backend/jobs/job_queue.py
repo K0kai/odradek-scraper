@@ -12,8 +12,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
-from panel_log import log_event
-from dbutil import using_postgres
+from web.panel_log import log_event
+from data.dbutil import using_postgres
 
 LOG = logging.getLogger("odradek-scraper")
 
@@ -117,7 +117,7 @@ class JobQueue:
     def _connect(self) -> sqlite3.Connection:
         if self._connect_fn:
             return self._connect_fn()
-        from dbutil import open_connection
+        from data.dbutil import open_connection
 
         return open_connection(self.db_path, timeout=60.0)
 

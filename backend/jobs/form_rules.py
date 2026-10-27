@@ -195,7 +195,7 @@ def resolve_rule_value(
     if mode == "file":
         return resume_path
     if mode == "salary":
-        from salary_policy import propose_salary
+        from candidate.salary_policy import propose_salary
 
         prop = propose_salary(cfg, field_hint=field_hint, job_text=job_text)
         value = str(prop.get("formatted") or "")
@@ -414,7 +414,7 @@ def salary_for(cfg: dict[str, str], currency: str, *, regime: str | None = None)
             base = base * _pj_multiplier(cfg)
         return format_brl(str(base))
 
-    from fx_rates import convert_amount
+    from integrations.fx_rates import convert_amount
 
     usd_raw = (cfg.get("salary_expectation_usd") or "").strip()
     brl_raw = (cfg.get("salary_expectation_brl") or "").strip()

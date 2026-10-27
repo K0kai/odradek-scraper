@@ -11,7 +11,7 @@ import time
 from http.cookies import CookieError, SimpleCookie
 from urllib.parse import parse_qs, urlparse
 
-from panel_auth import configured
+from web.panel_auth import configured
 
 
 SESSION_COOKIE = "odradek_session"

@@ -13,7 +13,7 @@ _lock = threading.Lock()
 
 
 def _connect() -> sqlite3.Connection:
-    from dbutil import open_connection
+    from data.dbutil import open_connection
 
     return open_connection(DB_PATH, timeout=60.0)
 

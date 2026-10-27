@@ -11,6 +11,10 @@ Projeto **pessoal e educacional** para estudar, em ambiente local:
 
 O código da interface fica em `frontend/`. A API, a coleta e os módulos de negócio ficam em `backend/`. O banco SQLite e os arquivos persistentes continuam na raiz do projeto para preservar os dados locais anteriores.
 
+O acesso ao banco usa Neon/PostgreSQL quando `DATABASE_URL` está definida. Sem essa variável, usa o SQLite local em `jobs.db`, inclusive para testes locais isolados.
+
+Dentro de `backend/`, `web/` contém rotas, autenticação e respostas do painel; `data/` contém banco e segredos; `jobs/` contém fila, filtros e regras; `candidate/` contém currículo e contexto; `integrations/` contém clientes externos. `app.py` coordena a coleta e os fluxos de trabalho.
+
 **Não é um produto, serviço comercial nem ferramenta oferecida para uso em massa.**  
 O código existe para aprendizado e experimentação **na sua máquina**.
 
@@ -41,7 +45,7 @@ npm run build
 cd ..
 # dependências de browser, se for estudar esses módulos:
 # playwright install
-python -m uvicorn api_asgi:api --app-dir backend --host 127.0.0.1 --port 8765
+python -m uvicorn web.api_asgi:api --app-dir backend --host 127.0.0.1 --port 8765
 ```
 
 Abra `http://127.0.0.1:8765`. O painel local não exige senha por padrão. Configure `PANEL_PASSWORD` se expuser a porta além da sua máquina.

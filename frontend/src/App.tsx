@@ -7,13 +7,13 @@ import { RulesView } from './Rules'
 import odradekIcon from '../../assets/public/odradek-icon.png'
 import { formatDate } from './format'
 import { JobCard } from './JobCard'
-
-type View = 'overview' | 'jobs' | 'queue' | 'logs' | 'usage' | 'assistant' | 'resumes' | 'settings' | 'rules'
+import { isView, navigation, viewLabels, type View } from './views'
 
 function readLocation(): { view: View; filters: JobFilters } {
   const q = new URLSearchParams(location.search)
+  const requestedView = q.get('view')
   return {
-    view: (['overview', 'jobs', 'queue', 'logs', 'usage', 'assistant', 'resumes', 'settings', 'rules'].includes(q.get('view') || '') ? q.get('view') : 'overview') as View,
+    view: isView(requestedView) ? requestedView : 'overview',
     filters: {
       status: q.get('status') || 'worth',
       min_match: q.get('min_match') || '0',
@@ -101,20 +101,14 @@ export function App() {
       <div className="brand"><span className="brand-mark"><img src={odradekIcon} alt="" width="30" height="30" /></span><div><strong>Odradek</strong><small>coleta · triagem · candidaturas</small></div></div>
       <nav aria-label="Navegação principal" className="nav">
         <span className="nav-label">OPERAR</span>
-        <button className={view === 'overview' ? 'nav-item selected' : 'nav-item'} onClick={() => show('overview')}>Visão geral</button>
-        <button className={view === 'jobs' ? 'nav-item selected' : 'nav-item'} onClick={() => show('jobs')}>Vagas para revisar <span className="nav-count">{dashboard?.counts.worth || 0}</span></button>
-        <button className={view === 'queue' ? 'nav-item selected' : 'nav-item'} onClick={() => show('queue')}>Filas de IA</button>
-        <button className={view === 'assistant' ? 'nav-item selected' : 'nav-item'} onClick={() => show('assistant')}>Assistente</button>
-        <button className={view === 'logs' ? 'nav-item selected' : 'nav-item'} onClick={() => show('logs')}>Logs</button>
-        <button className={view === 'usage' ? 'nav-item selected' : 'nav-item'} onClick={() => show('usage')}>Uso e cotas</button>
-        <button className={view === 'resumes' ? 'nav-item selected' : 'nav-item'} onClick={() => show('resumes')}>Currículos</button>
-        <button className={view === 'settings' ? 'nav-item selected' : 'nav-item'} onClick={() => show('settings')}>Configurações</button>
-        <button className={view === 'rules' ? 'nav-item selected' : 'nav-item'} onClick={() => show('rules')}>Regras de formulário</button>
+        {navigation.map(item => <button key={item} className={view === item ? 'nav-item selected' : 'nav-item'} onClick={() => show(item)}>
+          {viewLabels[item]} {item === 'jobs' && <span className="nav-count">{dashboard?.counts.worth || 0}</span>}
+        </button>)}
       </nav>
       <div className="sidebar-bottom"><span className={`state-dot ${dashboard?.collector.state || ''}`} />{dashboard?.collector.state === 'running' ? 'Coleta em execução' : dashboard?.collector.state === 'stopping' ? 'Parando coleta' : 'Coleta parada'}</div>
     </aside>
     <main className="main">
-      <header className="topbar"><div><p className="eyebrow">PAINEL DE OPERAÇÃO</p><h1>{{ overview: 'Visão geral', jobs: 'Vagas para revisar', queue: 'Filas de IA', logs: 'Logs', usage: 'Uso e cotas', assistant: 'Assistente', resumes: 'Currículos', settings: 'Configurações', rules: 'Regras de formulário' }[view]}</h1></div><div className="topbar-actions"><button className="secondary" onClick={reload}>Atualizar</button>{authRequired && <form method="post" action="/logout"><button className="secondary" type="submit">Sair</button></form>}</div></header>
+      <header className="topbar"><div><p className="eyebrow">PAINEL DE OPERAÇÃO</p><h1>{viewLabels[view]}</h1></div><div className="topbar-actions"><button className="secondary" onClick={reload}>Atualizar</button>{authRequired && <form method="post" action="/logout"><button className="secondary" type="submit">Sair</button></form>}</div></header>
       {error && <div className="banner error" role="alert">{error} <button onClick={reload}>Tentar novamente</button></div>}
       {notice && <div className="banner" role="status">{notice}</div>}
       <CopilotAsk notify={notify} />

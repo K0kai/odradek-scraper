@@ -5,29 +5,27 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import math
 import os
 import re
-import sqlite3
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus, urlparse
 from urllib.request import Request, urlopen
 
-from dbutil import open_connection, using_postgres
-from apply_channels import apply_via_email, record_blocked, send_smtp_email
+from data.repository import connect, initialize, settings, save_settings, set_setting
+from data.secrets import SecretStore
+from jobs.apply_channels import apply_via_email, record_blocked
 from dates_br import BRASILIA, format_cycle_range, parse_utc
 
-from form_rules import ensure_default_rules
-from job_queue import (
+from jobs.job_queue import (
     KIND_APPLY,
     KIND_RESUME,
     KIND_WORTH_REVERIFY,
     JobQueue,
 )
-from resume_pipeline import (
+from candidate.resume_pipeline import (
     AiUnavailableError,
     get_resume,
     mark_resume_analysis_error,
@@ -35,133 +33,17 @@ from resume_pipeline import (
     resume_summaries,
     run_resume_analysis,
 )
-from panel_log import attach_to_logger, ensure_log_table, list_logs, log_event
-from paths import PROJECT_ROOT, DB_PATH as DEFAULT_DB_PATH, FRONTEND_DIST as DEFAULT_FRONTEND_DIST, ICON_PATH
+from web.panel_log import attach_to_logger, ensure_log_table, log_event
+from paths import DB_PATH as DEFAULT_DB_PATH, FRONTEND_DIST as DEFAULT_FRONTEND_DIST, ICON_PATH, RESUMES_DIR, COPILOT_UPLOADS_DIR
 
 
 DB_PATH = str(DEFAULT_DB_PATH)
-RESUMES_DIR = os.environ.get("RESUMES_DIR", str(PROJECT_ROOT / "resumes"))
-COPILOT_UPLOADS_DIR = os.environ.get(
-    "COPILOT_UPLOADS_DIR", str(PROJECT_ROOT / "copilot_uploads")
-)
 FAVICON_PATH = str(ICON_PATH)
 FRONTEND_DIST = str(DEFAULT_FRONTEND_DIST)
 HOST = os.environ.get("HOST", "0.0.0.0" if os.environ.get("RENDER", "").casefold() == "true" else "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8765"))
 LOG = logging.getLogger("odradek-scraper")
 
-# Estrutura persistente. As vagas são deduplicadas pela impressão digital; cartas e execuções
-# ficam separadas para poder registrar versões e resultados sem alterar os dados da vaga.
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS settings (
-  key TEXT PRIMARY KEY,
-  value TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS jobs (
-  id INTEGER PRIMARY KEY,
-  source TEXT NOT NULL,
-  source_id TEXT,
-  title TEXT NOT NULL,
-  company TEXT NOT NULL DEFAULT '',
-  location TEXT NOT NULL DEFAULT '',
-  description TEXT NOT NULL DEFAULT '',
-  url TEXT NOT NULL,
-  posted_at TEXT,
-  first_seen_at TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'new',
-  applied_at TEXT,
-  notes TEXT NOT NULL DEFAULT '',
-  fingerprint TEXT NOT NULL UNIQUE
-);
-CREATE INDEX IF NOT EXISTS jobs_status_idx ON jobs(status);
-CREATE INDEX IF NOT EXISTS jobs_seen_idx ON jobs(first_seen_at DESC);
-CREATE INDEX IF NOT EXISTS jobs_status_seen_idx ON jobs(status, first_seen_at DESC);
-CREATE TABLE IF NOT EXISTS runs (
-  id INTEGER PRIMARY KEY,
-  started_at TEXT NOT NULL,
-  finished_at TEXT,
-  state TEXT NOT NULL,
-  found_count INTEGER NOT NULL DEFAULT 0,
-  message TEXT NOT NULL DEFAULT ''
-);
-CREATE TABLE IF NOT EXISTS ai_decisions (
-  id INTEGER PRIMARY KEY,
-  job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-  decided_at TEXT NOT NULL,
-  match_score INTEGER NOT NULL,
-  should_apply INTEGER NOT NULL,
-  letter_required INTEGER NOT NULL,
-  reason TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS ai_decisions_job_latest_idx ON ai_decisions(job_id, id DESC);
-"""
-
-DEFAULT_SETTINGS = {
-    "keywords": "software engineer, desenvolvedor, developer, backend, frontend, full stack, data engineer, devops",
-    "locations": "remote, remoto, brazil, brasil, worldwide, anywhere",
-    "sources": "remotive,remoteok",
-    "ai_provider": "gemini",
-    "ai_model": "gemini-2.5-flash",
-    "candidate_name": "",
-    "candidate_email": "",
-    "candidate_phone": "",
-    "candidate_linkedin": "",
-    "candidate_city": "",
-    "candidate_street": "",
-    "candidate_postal_code": "",
-    "candidate_state": "",
-    "candidate_country": "",
-    "candidate_current_company": "",
-    "candidate_cpf": "",
-    # Expectativa salarial — o robô escolhe BRL×USD pela moeda do campo/vaga
-    "salary_expectation_brl": "",
-    "salary_expectation_usd": "",
-    "salary_currency_preference": "auto",
-    "salary_pj_multiplier": "1.3",
-    # Preferência de contratação (radio Contractor/Employee); 'ask' = deixar com você
-    "candidate_contract_type": "employee",
-    "candidate_profile_pt": "",
-    "candidate_profile_en": "",
-    "candidate_facts_pt": "",
-    "candidate_facts_en": "",
-    "resume_pt_path": "",
-    "resume_en_path": "",
-    "auto_apply": "0",
-    "browser_engine": "pydoll",
-    "minimum_match_score": "65",
-    "job_selection_optimism": "75",
-    "job_selection_prompt": "",
-    "maximum_applications_per_run": "5",
-    "adzuna_countries": "br,us,gb,ca",
-    "apify_monthly_credit_limit_usd": "5",
-    "apify_job_count": "25",
-    "apify_actors_json": "[{\"id\": \"curious_coder~linkedin-jobs-scraper\", \"label\": \"LinkedIn Jobs\", \"enabled\": true, \"input_mode\": \"linkedin_search\", \"count\": 25}]",
-    "apify_linkedin_filter_json": "",
-    "apify_linkedin_filter_hash": "",
-    "apify_linkedin_filters_json": "",
-    # Vazio = DEFAULT_LINKEDIN_FILTER_PROMPT (editável em Busca & coleta)
-    "linkedin_filter_prompt": "",
-    "ai_usage_json": "",
-    "apify_quota_snapshot_json": "",
-    "smtp_host": "",
-    "smtp_port": "587",
-    "smtp_user": "",
-    "smtp_from": "",
-    "smtp_use_tls": "1",
-    "queue_max_workers": "3",
-    "queue_max_attempts": "40",
-    "queue_ttl_hours": "24",
-    "worth_reverify_last_daily": "",
-    # Som no painel quando o copiloto pede um dado (Web Audio)
-    "copilot_ask_sound": "1",
-    "copilot_ask_sound_volume": "0.55",
-    # Perfil de diversidade (identidade NUNCA vem de IA; 'not_informed' = não informar)
-    "candidate_gender": "not_informed",
-    "candidate_race": "not_informed",
-    "candidate_lgbtq": "not_informed",
-    "candidate_pcd": "no",
-    "candidate_diversity_note": "",
-}
 STATUSES = {"new": "Nova", "review": "Na fila", "worth": "Vale a pena olhar", "saved": "Salva", "prepared": "Carta preparada", "applied": "Aplicada", "ignored": "Ignorada", "blocked": "Envio indisponível"}
 
 
@@ -169,204 +51,8 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def connect() -> sqlite3.Connection:
-    return open_connection(DB_PATH, timeout=60.0)
-
-
-def initialize() -> None:
-    """Cria o banco e aplica pequenas migrações compatíveis com versões anteriores."""
-    os.makedirs(RESUMES_DIR, exist_ok=True)
-    if using_postgres():
-        required_tables = {
-            "settings", "jobs", "runs", "ai_decisions", "cover_letters", "resumes",
-            "form_field_rules", "applications", "form_answers", "ai_answer_cache",
-            "copilot_asks", "queue_jobs", "event_logs",
-        }
-        with connect() as db:
-            rows = db.execute(
-                "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema = current_schema()"
-            ).fetchall()
-            available = {row["table_name"] for row in rows}
-            missing = sorted(required_tables - available)
-            if missing:
-                raise RuntimeError(
-                    "Neon schema is incomplete. Run the PostgreSQL schema SQL in the Neon console; "
-                    "missing tables: " + ", ".join(missing)
-                )
-            for key, value in DEFAULT_SETTINGS.items():
-                db.execute(
-                    "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING",
-                    (key, value),
-                )
-            ensure_default_rules(db)
-            db.execute(
-                "CREATE INDEX IF NOT EXISTS ai_decisions_job_latest_idx "
-                "ON ai_decisions(job_id, id DESC)"
-            )
-            db.execute(
-                "CREATE INDEX IF NOT EXISTS jobs_status_seen_idx "
-                "ON jobs(status, first_seen_at DESC)"
-            )
-            db.execute(
-                "UPDATE settings SET value='65' WHERE key='minimum_match_score' AND value='80'"
-            )
-            db.execute(
-                "UPDATE settings SET value='' WHERE key='apify_linkedin_filter_hash' "
-                "AND COALESCE((SELECT value FROM settings WHERE key='apify_linkedin_geo_v2'), '') <> '1'"
-            )
-            db.execute(
-                "INSERT INTO settings(key,value) VALUES('apify_linkedin_geo_v2','1') "
-                "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value"
-            )
-            ensure_log_table(db)
-        return
-
-    with connect() as db:
-        db.executescript(SCHEMA)
-        # Additions are applied in place so an existing jobs.db remains usable.
-        columns = {row["name"] for row in db.execute("PRAGMA table_info(jobs)")}
-        if "language" not in columns:
-            db.execute("ALTER TABLE jobs ADD COLUMN language TEXT NOT NULL DEFAULT 'unknown'")
-        if "language_confidence" not in columns:
-            db.execute("ALTER TABLE jobs ADD COLUMN language_confidence REAL NOT NULL DEFAULT 0")
-        db.execute("""CREATE TABLE IF NOT EXISTS cover_letters (
-          id INTEGER PRIMARY KEY,
-          job_id INTEGER NOT NULL UNIQUE REFERENCES jobs(id) ON DELETE CASCADE,
-          language TEXT NOT NULL,
-          provider TEXT NOT NULL,
-          model TEXT NOT NULL,
-          body TEXT NOT NULL,
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL
-        )""")
-        db.execute("""CREATE TABLE IF NOT EXISTS resumes (
-          id INTEGER PRIMARY KEY,
-          language TEXT NOT NULL UNIQUE,
-          original_filename TEXT NOT NULL DEFAULT '',
-          stored_path TEXT NOT NULL,
-          file_sha256 TEXT NOT NULL,
-          extracted_text TEXT NOT NULL DEFAULT '',
-          analysis_json TEXT NOT NULL DEFAULT '',
-          analysis_summary TEXT NOT NULL DEFAULT '',
-          analyzed_at TEXT,
-          provider TEXT NOT NULL DEFAULT '',
-          model TEXT NOT NULL DEFAULT '',
-          analysis_status TEXT NOT NULL DEFAULT 'none',
-          analysis_error TEXT NOT NULL DEFAULT '',
-          analysis_message TEXT NOT NULL DEFAULT '',
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL
-        )""")
-        resume_cols = {row["name"] for row in db.execute("PRAGMA table_info(resumes)")}
-        if "analysis_status" not in resume_cols:
-            db.execute("ALTER TABLE resumes ADD COLUMN analysis_status TEXT NOT NULL DEFAULT 'none'")
-        if "analysis_error" not in resume_cols:
-            db.execute("ALTER TABLE resumes ADD COLUMN analysis_error TEXT NOT NULL DEFAULT ''")
-        if "analysis_message" not in resume_cols:
-            db.execute("ALTER TABLE resumes ADD COLUMN analysis_message TEXT NOT NULL DEFAULT ''")
-        # Backfill: resumes with summary count as successful analysis.
-        db.execute(
-            """UPDATE resumes SET analysis_status='ok',
-                   analysis_message=COALESCE(NULLIF(analysis_message,''), 'Análise concluída com sucesso.')
-               WHERE IFNULL(analysis_summary,'') != '' AND analysis_status IN ('none', '')"""
-        )
-        db.execute("""CREATE TABLE IF NOT EXISTS form_field_rules (
-          id INTEGER PRIMARY KEY,
-          key TEXT NOT NULL,
-          aliases TEXT NOT NULL DEFAULT '',
-          mode TEXT NOT NULL DEFAULT 'text',
-          value_from TEXT NOT NULL DEFAULT '',
-          value TEXT NOT NULL DEFAULT '',
-          sort_order INTEGER NOT NULL DEFAULT 0
-        )""")
-        db.execute("""CREATE TABLE IF NOT EXISTS applications (
-          id INTEGER PRIMARY KEY,
-          job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-          channel TEXT NOT NULL,
-          recipient TEXT NOT NULL DEFAULT '',
-          resume_id INTEGER,
-          cover_letter_id INTEGER,
-          status TEXT NOT NULL,
-          detail TEXT NOT NULL DEFAULT '',
-          attempted_at TEXT NOT NULL
-        )""")
-        db.execute("""CREATE TABLE IF NOT EXISTS form_answers (
-          id INTEGER PRIMARY KEY,
-          job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-          question TEXT NOT NULL,
-          answer TEXT NOT NULL,
-          provider TEXT NOT NULL DEFAULT '',
-          model TEXT NOT NULL DEFAULT '',
-          created_at TEXT NOT NULL
-        )""")
-        # Cache GLOBAL de respostas de IA por pergunta normalizada ('open' ou 'choices').
-        db.execute("""CREATE TABLE IF NOT EXISTS ai_answer_cache (
-          id INTEGER PRIMARY KEY,
-          question_norm TEXT NOT NULL UNIQUE,
-          question_raw TEXT NOT NULL,
-          kind TEXT NOT NULL DEFAULT 'open',
-          answer TEXT NOT NULL,
-          provider TEXT NOT NULL DEFAULT '',
-          model TEXT NOT NULL DEFAULT '',
-          hits INTEGER NOT NULL DEFAULT 0,
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL
-        )""")
-        from copilot_asks import ensure_table as ensure_copilot_asks
-
-        ensure_copilot_asks(db)
-        decision_cols = {row["name"] for row in db.execute("PRAGMA table_info(ai_decisions)")}
-        if "resume_language" not in decision_cols:
-            db.execute("ALTER TABLE ai_decisions ADD COLUMN resume_language TEXT NOT NULL DEFAULT ''")
-        if "apply_channel" not in decision_cols:
-            db.execute("ALTER TABLE ai_decisions ADD COLUMN apply_channel TEXT NOT NULL DEFAULT ''")
-        if "apply_result" not in decision_cols:
-            db.execute("ALTER TABLE ai_decisions ADD COLUMN apply_result TEXT NOT NULL DEFAULT ''")
-        ensure_default_rules(db)
-        for key, value in DEFAULT_SETTINGS.items():
-            db.execute(
-                "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING",
-                (key, value),
-            )
-        # Default antigo (80) era rígido demais com a triagem generosa.
-        db.execute(
-            "UPDATE settings SET value='65' WHERE key='minimum_match_score' AND value='80'"
-        )
-        # Uma vez: regenerar filtro LinkedIn com geo remote global + híbrido BH.
-        row = db.execute(
-            "SELECT value FROM settings WHERE key='apify_linkedin_geo_v2'"
-        ).fetchone()
-        if not row or row["value"] != "1":
-            db.execute("UPDATE settings SET value='' WHERE key='apify_linkedin_filter_hash'")
-            db.execute(
-                "INSERT INTO settings(key,value) VALUES('apify_linkedin_geo_v2','1') "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
-            )
-        ensure_log_table(db)
-
-
-def settings() -> dict[str, str]:
-    """Lê as preferências salvas no SQLite."""
-    with connect() as db:
-        return {row["key"]: row["value"] for row in db.execute("SELECT key,value FROM settings")}
-
-
-def save_settings(data: dict[str, str]) -> None:
-    """Atualiza somente os campos enviados pelo formulário atual."""
-    with connect() as db:
-        for key in DEFAULT_SETTINGS:
-            if key in data:
-                db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, data.get(key, "")))
-
-
-def set_setting(key: str, value: str) -> None:
-    with connect() as db:
-        db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
-
-
 def _boot_usage_tracker() -> None:
-    from usage_tracker import STORE_KEY, configure_persistence
+    from integrations.usage_tracker import STORE_KEY, configure_persistence
 
     configure_persistence(
         lambda: settings().get(STORE_KEY, "") or "",
@@ -405,7 +91,7 @@ def detect_language(text: str) -> tuple[str, float]:
 
 def ai_generate_letter(provider: str, model: str, language: str, job: dict, cfg: dict[str, str]) -> str:
     """Pede somente a carta; o modelo não recebe, cria ou altera o arquivo de currículo."""
-    from experience_priority import EXPERIENCE_PRIORITY_RULE
+    from candidate.experience_priority import EXPERIENCE_PRIORITY_RULE
 
     provider = provider.casefold().strip()
     language_name = "Portuguese" if language == "pt" else "English"
@@ -481,7 +167,7 @@ def _record_ai_usage(
     quota_error: bool,
 ) -> None:
     try:
-        from usage_tracker import try_record_ai_result
+        from integrations.usage_tracker import try_record_ai_result
 
         try_record_ai_result(
             provider=provider,
@@ -494,112 +180,10 @@ def _record_ai_usage(
         pass
 
 
-SECRET_ENV_VARS = {
-    "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
-    "openai": ("OPENAI_API_KEY",),
-    "adzuna_app_id": ("ADZUNA_APP_ID",),
-    "adzuna_app_key": ("ADZUNA_APP_KEY",),
-    "apify_token": ("APIFY_TOKEN", "APIFY_API_TOKEN"),
-    "smtp_password": ("SMTP_PASSWORD",),
-}
-SECRET_SETTING_PREFIX = "__encrypted_secret__:"
-SECRET_MASTER_KEY_ENV = "SECRET_ENCRYPTION_KEY"
-
-
-def _secret_from_environment(name: str) -> str:
-    for env_name in SECRET_ENV_VARS.get(name.casefold(), ()):
-        value = os.environ.get(env_name, "").strip()
-        if value:
-            return value
-    return ""
-
-
-def _secret_from_keyring(name: str) -> str:
-    try:
-        import keyring
-        return keyring.get_password("job-scraper", name) or ""
-    except Exception:
-        return ""
-
-
-def _secret_from_database(name: str) -> str | None:
-    with connect() as db:
-        row = db.execute(
-            "SELECT value FROM settings WHERE key=?",
-            (SECRET_SETTING_PREFIX + name.casefold(),),
-        ).fetchone()
-    if not row:
-        return None
-    master_key = os.environ.get(SECRET_MASTER_KEY_ENV, "").strip()
-    if not master_key:
-        raise RuntimeError(f"Configure {SECRET_MASTER_KEY_ENV} para descriptografar os segredos salvos.")
-    try:
-        from cryptography.fernet import Fernet, InvalidToken
-
-        return Fernet(master_key.encode("ascii")).decrypt(row["value"].encode("ascii")).decode("utf-8")
-    except Exception as exc:
-        raise RuntimeError(
-            f"Não foi possível descriptografar o segredo '{name}'. Confira {SECRET_MASTER_KEY_ENV}; "
-            "ela precisa ser a mesma usada quando o segredo foi salvo."
-        ) from exc
-
-
-def _secret_save(name: str, value: str, *, delete_empty: bool = False) -> None:
-    if not value.strip() and not delete_empty:
-        return
-    master_key = os.environ.get(SECRET_MASTER_KEY_ENV, "").strip()
-    if master_key:
-        try:
-            from cryptography.fernet import Fernet
-
-            encrypted = Fernet(master_key.encode("ascii")).encrypt(value.strip().encode("utf-8")).decode("ascii")
-        except Exception as exc:
-            raise RuntimeError(f"{SECRET_MASTER_KEY_ENV} inválida. Gere uma chave Fernet válida.") from exc
-        db_key = SECRET_SETTING_PREFIX + name.casefold()
-        with connect() as db:
-            if not value.strip() and delete_empty:
-                db.execute("DELETE FROM settings WHERE key=?", (db_key,))
-            elif value.strip():
-                db.execute(
-                    "INSERT INTO settings(key,value) VALUES(?,?) "
-                    "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-                    (db_key, encrypted),
-                )
-        return
-    if os.environ.get("RENDER"):
-        raise RuntimeError(
-            f"Configure {SECRET_MASTER_KEY_ENV} no Render para salvar segredos criptografados no banco."
-        )
-    try:
-        import keyring
-
-        if value.strip():
-            keyring.set_password("job-scraper", name, value.strip())
-        elif delete_empty:
-            keyring.delete_password("job-scraper", name)
-    except Exception as exc:
-        raise RuntimeError(
-            f"Não foi possível acessar o cofre local. Configure {SECRET_MASTER_KEY_ENV} para usar o banco criptografado."
-        ) from exc
-
-
-def get_ai_key(provider: str) -> str:
-    return secret_get(provider)
-
-
-def save_ai_key(provider: str, key: str) -> None:
-    _secret_save(provider, key)
-
-
-def secret_get(name: str) -> str:
-    stored = _secret_from_database(name)
-    if stored is not None:
-        return stored
-    return _secret_from_environment(name) or _secret_from_keyring(name)
-
-
-def secret_set(name: str, value: str) -> None:
-    _secret_save(name, value)
+_secrets = SecretStore(connect)
+secret_get = _secrets.get
+secret_set = _secrets.set
+get_ai_key = _secrets.get
 
 
 def create_cover_letter(job_id: int, resume_language: str | None = None) -> int:
@@ -741,7 +325,7 @@ Description: {re.sub(r'<[^>]+>', ' ', job['description'])[:10000]}"""
         with urlopen(request, timeout=60) as response:
             result = json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
-        from ai_client import ai_http_error_detail
+        from integrations.ai_client import ai_http_error_detail
 
         detail = ai_http_error_detail(exc, provider=provider, model=model, operation="Triagem da vaga", api_key=api_key)
         quota = exc.code in {401, 403, 429, 502, 503, 504} or "quota" in detail.casefold()
@@ -979,7 +563,7 @@ def handle_job_apply_job(payload: dict) -> str:
 
 
 def handle_worth_reverify_job(payload: dict) -> str:
-    from worth_reverify import format_summary, reverify_worth_jobs
+    from jobs.worth_reverify import format_summary, reverify_worth_jobs
 
     summary = reverify_worth_jobs(connect)
     msg = format_summary(summary)
@@ -1161,7 +745,7 @@ def apify_monthly_usage_usd(token: str) -> tuple[float, str]:
 
 
 def load_apify_quota_snapshot() -> dict:
-    from usage_tracker import APIFY_SNAPSHOT_KEY
+    from integrations.usage_tracker import APIFY_SNAPSHOT_KEY
 
     raw = (settings().get(APIFY_SNAPSHOT_KEY) or "").strip()
     if not raw:
@@ -1175,7 +759,7 @@ def load_apify_quota_snapshot() -> dict:
 
 def refresh_apify_quota_snapshot() -> dict:
     """Busca limites oficiais da Apify e grava cache em settings."""
-    from usage_tracker import APIFY_SNAPSHOT_KEY, parse_apify_limits
+    from integrations.usage_tracker import APIFY_SNAPSHOT_KEY, parse_apify_limits
 
     token = secret_get("apify_token")
     cfg = settings()
@@ -1930,7 +1514,7 @@ def _linkedin_within_max_age(posted_at: object, *, max_days: int = LINKEDIN_MAX_
 
 def normalize_apify_items(items: list, *, label: str) -> list[dict]:
     """Normaliza itens Apify e descarta vagas já fechadas (filtro de coleta)."""
-    from worth_reverify import apify_item_indicates_closed
+    from jobs.worth_reverify import apify_item_indicates_closed
 
     results: list[dict] = []
     source_name = f"Apify:{label}" if label else "Apify"
@@ -2302,413 +1886,7 @@ def _boot_queue() -> None:
     queue.start()
 
 
-def load_dashboard() -> tuple[dict, list, list]:
-    with connect() as db:
-        counts = {row["status"]: row["n"] for row in db.execute("SELECT status,COUNT(*) n FROM jobs GROUP BY status")}
-        jobs = db.execute("SELECT jobs.*, cover_letters.body AS cover_letter FROM jobs LEFT JOIN cover_letters ON cover_letters.job_id=jobs.id ORDER BY first_seen_at DESC LIMIT 250").fetchall()
-        runs = db.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 8").fetchall()
-    return counts, jobs, runs
-
-
-def _job_api_record(row) -> dict:
-    """Keep the browser contract independent from database row implementations."""
-    data = dict(row)
-    data["description"] = re.sub(r"<[^>]+>", " ", data.get("description") or "")[:1800]
-    data["match_score"] = int(data["match_score"]) if data.get("match_score") is not None else None
-    data["has_cover_letter"] = bool(data.pop("cover_letter", None))
-    if urlparse(data.get("url") or "").scheme not in {"http", "https"}:
-        data["url"] = ""
-    data.pop("fingerprint", None)
-    return data
-
-
-def dashboard_api_payload() -> dict:
-    with connect() as db:
-        counts = {row["status"]: row["n"] for row in db.execute("SELECT status, COUNT(*) n FROM jobs GROUP BY status")}
-        rows = db.execute(
-            "SELECT jobs.id, jobs.title, jobs.company, jobs.location, jobs.source, jobs.url, "
-            "jobs.posted_at, jobs.first_seen_at, jobs.status, jobs.description, jobs.notes, "
-            "cover_letters.body AS cover_letter, " + _worth_match_expr() + " AS match_score "
-            "FROM jobs LEFT JOIN cover_letters ON cover_letters.job_id=jobs.id "
-            "ORDER BY jobs.first_seen_at DESC LIMIT 20"
-        ).fetchall()
-        runs = [dict(row) for row in db.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 8")]
-    return {"counts": counts, "jobs": [{**_job_api_record(row), "description": "", "notes": ""} for row in rows], "runs": runs,
-            "collector": collector.snapshot(), "status_labels": STATUSES}
-
-
-def jobs_api_payload(*, page: int = 1, page_size: int = 15, status: str = "worth",
-                     min_match: int = 0, sort: str = "", date_from: str = "", date_to: str = "") -> dict:
-    page = max(1, page)
-    page_size = max(5, min(50, page_size))
-    min_match = max(0, min(100, min_match))
-    status = status if status in STATUSES else "worth"
-    sort = normalize_worth_sort(sort)
-    if date_from and date_to and date_from > date_to:
-        date_from, date_to = date_to, date_from
-    lo, hi = worth_date_bounds_utc(date_from, date_to)
-    where = "jobs.status = ?"
-    params: list[object] = [status]
-    if min_match:
-        where += f" AND COALESCE({_worth_match_expr()}, 0) >= ?"
-        params.append(min_match)
-    if lo:
-        where += " AND jobs.first_seen_at >= ?"
-        params.append(lo)
-    if hi:
-        where += " AND jobs.first_seen_at < ?"
-        params.append(hi)
-    with connect() as db:
-        total = int(db.execute(f"SELECT COUNT(*) n FROM jobs WHERE {where}", params).fetchone()["n"])
-        pages = max(1, (total + page_size - 1) // page_size)
-        page = min(page, pages)
-        rows = db.execute(
-            "SELECT jobs.id, jobs.title, jobs.company, jobs.location, jobs.source, jobs.url, "
-            "jobs.posted_at, jobs.first_seen_at, jobs.status, jobs.description, jobs.notes, "
-            "cover_letters.body AS cover_letter, " + _worth_match_expr() + " AS match_score "
-            "FROM jobs LEFT JOIN cover_letters ON cover_letters.job_id=jobs.id "
-            f"WHERE {where} ORDER BY {worth_order_sql(sort)} LIMIT ? OFFSET ?",
-            [*params, page_size, (page - 1) * page_size],
-        ).fetchall()
-    return {"items": [_job_api_record(row) for row in rows], "total": total, "page": page,
-            "pages": pages, "page_size": page_size, "filters": {"status": status,
-            "min_match": min_match, "sort": sort, "date_from": date_from, "date_to": date_to}}
-
-
-def queue_api_payload() -> dict:
-    items = []
-    for row in queue.list_jobs(limit=100):
-        record = dict(row)
-        progress = (record.get("progress_log") or "").splitlines()
-        items.append({key: record.get(key) for key in (
-            "id", "kind", "status", "attempts", "max_attempts", "next_run_at",
-            "created_at", "updated_at",
-        )} | {"last_step": (progress[-1] if progress else "")[:280],
-             "progress": "\n".join(progress[-40:])[-4000:],
-             "outcome": (record.get("last_error") or record.get("result") or "")[:500]})
-    return {"counts": queue.counts(), "items": items}
-
-
-def logs_api_payload(limit: int = 200) -> dict:
-    return {"items": [dict(row) for row in list_logs(max(1, min(500, limit)))]}
-
-
-def usage_api_payload() -> dict:
-    from usage_tracker import STORE_KEY, load_store, summarize_ai_usage
-
-    cfg = settings()
-    provider = (cfg.get("ai_provider") or "gemini").casefold()
-    store = load_store(cfg.get(STORE_KEY) or "")
-    return {"provider": provider, "model": cfg.get("ai_model") or "",
-            "apify": load_apify_quota_snapshot(),
-            "ai": summarize_ai_usage(store, provider=provider)}
-
-
-def resumes_api_payload() -> dict:
-    with connect() as db:
-        rows = {lang: get_resume(db, lang) for lang in ("pt", "en")}
-    result = {}
-    for lang, row in rows.items():
-        result[lang] = None if row is None else {
-            "language": lang,
-            "filename": row["original_filename"],
-            "status": row["analysis_status"],
-            "message": row["analysis_message"],
-            "error": row["analysis_error"],
-            "summary": row["analysis_summary"],
-            "analysis_json": row["analysis_json"],
-            "analyzed_at": row["analyzed_at"],
-            "provider": row["provider"],
-            "model": row["model"],
-        }
-    return result
-
-
-def send_smtp_test() -> tuple[bool, str]:
-    cfg = settings()
-    to_addr = (cfg.get("candidate_email") or cfg.get("smtp_from") or "").strip()
-    if not to_addr:
-        return False, "Configure o e-mail do candidato ou remetente para testar."
-    try:
-        send_smtp_email(
-            cfg=cfg,
-            password=secret_get("smtp_password"),
-            to_addrs=[to_addr],
-            subject="Odradek Scraper — teste SMTP",
-            body="Este é um e-mail de teste do Odradek Scraper.",
-            attachment_path=None,
-        )
-        log_event("success", "smtp", f"E-mail de teste enviado para {to_addr}.")
-        return True, f"E-mail de teste enviado para {to_addr}."
-    except Exception as exc:
-        log_event("error", "smtp", f"Falha no teste SMTP: {exc}")
-        return False, f"Falha no teste SMTP: {exc}"
-
-
-SETTINGS_API_GROUPS = {
-    "search": ("keywords", "locations", "sources", "adzuna_countries", "apify_monthly_credit_limit_usd",
-               "apify_job_count", "apify_actors_json", "linkedin_filter_prompt", "apify_linkedin_filters_json"),
-    "profile": ("candidate_name", "candidate_email", "candidate_phone", "candidate_linkedin",
-                "candidate_city", "candidate_street", "candidate_postal_code", "candidate_state",
-                "candidate_country", "candidate_current_company", "candidate_cpf", "salary_expectation_brl",
-                "salary_expectation_usd", "salary_currency_preference", "salary_pj_multiplier",
-                "candidate_contract_type", "candidate_gender", "candidate_race", "candidate_lgbtq",
-                "candidate_pcd", "candidate_diversity_note"),
-    "ai": ("ai_provider", "ai_model", "candidate_facts_pt", "candidate_facts_en",
-           "job_selection_optimism", "job_selection_prompt"),
-    "automation": ("auto_apply", "minimum_match_score", "queue_max_workers", "queue_max_attempts",
-                   "queue_ttl_hours", "copilot_ask_sound", "copilot_ask_sound_volume"),
-    "smtp": ("smtp_host", "smtp_port", "smtp_user", "smtp_from", "smtp_use_tls"),
-}
-
-
-def settings_api_payload(group: str) -> dict:
-    cfg = settings()
-    values = {key: cfg.get(key, "") for key in SETTINGS_API_GROUPS[group]}
-    if group == "search":
-        values["linkedin_filter_prompt"] = effective_linkedin_filter_prompt(cfg)
-        if not values["apify_linkedin_filters_json"].strip():
-            try:
-                legacy = json.loads((cfg.get("apify_linkedin_filter_json") or "").strip() or "null")
-            except json.JSONDecodeError:
-                legacy = None
-            if isinstance(legacy, dict):
-                filters = _normalize_linkedin_filters([legacy], cfg, fallback_if_empty=False)
-                values["apify_linkedin_filters_json"] = json.dumps(filters, ensure_ascii=False)
-    return {"group": group, "values": values}
-
-
-def save_settings_api_group(group: str, incoming: dict) -> str:
-    if not isinstance(incoming, dict):
-        raise ValueError("Configuração inválida")
-    keys = SETTINGS_API_GROUPS[group]
-    form = {}
-    for key in keys:
-        if key in incoming:
-            value = incoming[key]
-            if not isinstance(value, str) or len(value) > 30000:
-                raise ValueError(f"Valor inválido para {key}")
-            form[key] = value
-    for key in ("api_key", "adzuna_app_id", "adzuna_app_key", "apify_token", "smtp_password"):
-        if key in incoming and (not isinstance(incoming[key], str) or len(incoming[key]) > 8192):
-            raise ValueError(f"Valor inválido para {key}")
-    if group == "search":
-        if "apify_job_count" in form and not (form["apify_job_count"].isdigit() and 1 <= int(form["apify_job_count"]) <= 100):
-            raise ValueError("Máximo de vagas Apify deve ficar entre 1 e 100")
-        if "apify_monthly_credit_limit_usd" in form:
-            try:
-                amount = float(form["apify_monthly_credit_limit_usd"])
-                if not math.isfinite(amount) or amount < 0:
-                    raise ValueError
-            except ValueError as exc:
-                raise ValueError("Limite Apify inválido") from exc
-        if form.get("apify_actors_json", "").strip():
-            load_apify_actors({**settings(), **form})
-        if "apify_linkedin_filters_json" in form:
-            form["apify_linkedin_filters_json"] = _validate_linkedin_filter_form(
-                form["apify_linkedin_filters_json"], {**settings(), **form}
-            )
-        old_prompt = effective_linkedin_filter_prompt(settings())
-        if "linkedin_filter_prompt" in form and form["linkedin_filter_prompt"].strip() == DEFAULT_LINKEDIN_FILTER_PROMPT.strip():
-            form["linkedin_filter_prompt"] = ""
-        save_settings(form)
-        new_cfg = settings()
-        if effective_linkedin_filter_prompt(new_cfg) != old_prompt:
-            try:
-                generated = get_linkedin_search_filters(new_cfg, force_refresh=True)
-                return f"Preferências salvas e {len(generated)} filtros LinkedIn regenerados."
-            except Exception as exc:
-                log_event("warning", "settings", f"Regeneração do filtro LinkedIn falhou: {exc}")
-                return "Preferências salvas. O filtro LinkedIn será regenerado na próxima coleta."
-        if "apify_linkedin_filters_json" in form:
-            set_setting("apify_linkedin_filter_hash", _resume_filter_fingerprint(new_cfg))
-        return "Preferências de busca salvas."
-    if group == "ai":
-        if "ai_provider" in form and form["ai_provider"] not in {"gemini", "openai"}:
-            raise ValueError("Provedor de IA inválido")
-        if "job_selection_optimism" in form:
-            form["job_selection_optimism"] = str(job_selection_optimism_instruction(form["job_selection_optimism"])[0])
-        if "job_selection_prompt" in form and form["job_selection_prompt"].strip() == DEFAULT_JOB_SELECTION_PROMPT.strip():
-            form["job_selection_prompt"] = ""
-        save_settings(form)
-        provider = form.get("ai_provider") or settings().get("ai_provider") or "gemini"
-        if incoming.get("api_key"):
-            save_ai_key(provider, str(incoming["api_key"]))
-        for key in ("adzuna_app_id", "adzuna_app_key", "apify_token"):
-            if incoming.get(key):
-                secret_set(key, str(incoming[key]))
-        return "IA e integrações salvas."
-    if group == "automation":
-        limits = {"minimum_match_score": (0, 100), "queue_max_workers": (1, 8),
-                  "queue_max_attempts": (1, 200), "queue_ttl_hours": (1, 168)}
-        for key, (lower, upper) in limits.items():
-            if key in form and not (form[key].isdigit() and lower <= int(form[key]) <= upper):
-                raise ValueError(f"Valor inválido para {key}: use {lower} a {upper}")
-        for key in ("auto_apply", "copilot_ask_sound"):
-            if key in form:
-                form[key] = "1" if form[key] == "1" else "0"
-        if "copilot_ask_sound_volume" in form:
-            try:
-                volume = float(form["copilot_ask_sound_volume"])
-            except ValueError as exc:
-                raise ValueError("Volume inválido") from exc
-            form["copilot_ask_sound_volume"] = f"{max(0.0, min(1.0, volume)):.2f}"
-    if group == "smtp":
-        if "smtp_port" in form and not (form["smtp_port"].isdigit() and 1 <= int(form["smtp_port"]) <= 65535):
-            raise ValueError("Porta SMTP inválida")
-        save_settings(form)
-        if incoming.get("smtp_password"):
-            secret_set("smtp_password", str(incoming["smtp_password"]))
-        return "SMTP salvo."
-    save_settings(form)
-    return "Perfil salvo." if group == "profile" else "Automação salva."
-
-
-def generate_linkedin_filters(form: dict[str, str]) -> list[dict]:
-    if form.get("apify_actors_json", "").strip():
-        load_apify_actors({**settings(), "apify_actors_json": form["apify_actors_json"]})
-    raw_prompt = (form.get("linkedin_filter_prompt") or "").strip()
-    form["linkedin_filter_prompt"] = "" if raw_prompt == DEFAULT_LINKEDIN_FILTER_PROMPT.strip() else raw_prompt
-    current_cfg = {**settings(), **form}
-    if "apify_linkedin_filters_json" in form:
-        form["apify_linkedin_filters_json"] = _validate_linkedin_filter_form(
-            form["apify_linkedin_filters_json"], current_cfg
-        )
-    save_settings(form)
-    cfg = settings()
-    generated = ai_generate_linkedin_search_filters(cfg)
-    previous = _normalize_linkedin_filters(
-        json.loads(cfg.get("apify_linkedin_filters_json") or "[]"), cfg, fallback_if_empty=False,
-    )
-    previous_states = {item["name"].casefold(): item["enabled"] for item in previous}
-    for item in generated:
-        if item["name"].casefold() in previous_states:
-            item["enabled"] = previous_states[item["name"].casefold()]
-    set_setting("apify_linkedin_filters_json", json.dumps(generated, ensure_ascii=False))
-    set_setting("apify_linkedin_filter_json", json.dumps(generated[0], ensure_ascii=False))
-    set_setting("apify_linkedin_filter_hash", _resume_filter_fingerprint(cfg))
-    log_event("info", "apify", f"IA gerou {len(generated)} filtros LinkedIn.")
-    return generated
-
-
-WORTH_SORT_MATCH_ASC = "match_asc"
-WORTH_SORT_MATCH_DESC = "match_desc"
-WORTH_SORT_SEEN_ASC = "seen_asc"
-WORTH_SORT_SEEN_DESC = "seen_desc"
-WORTH_SORT_POSTED_ASC = "posted_asc"
-WORTH_SORT_POSTED_DESC = "posted_desc"
-# Legado do select antigo.
-WORTH_SORT_TOKEN = {
-    WORTH_SORT_MATCH_ASC,
-    WORTH_SORT_MATCH_DESC,
-    WORTH_SORT_SEEN_ASC,
-    WORTH_SORT_SEEN_DESC,
-    WORTH_SORT_POSTED_ASC,
-    WORTH_SORT_POSTED_DESC,
-}
-
-
-def parse_worth_sorts(sort: str | None) -> list[str]:
-    """Lista ordenada de tokens ativos (primeiro = prioridade). Combináveis."""
-    raw = (sort or "").strip().casefold()
-    if not raw:
-        return []
-    if raw in {"match", "score_desc"}:
-        return [WORTH_SORT_MATCH_DESC]
-    if "," not in raw and "+" not in raw and raw in WORTH_SORT_TOKEN:
-        return [raw]
-    sep = "," if "," in raw else "+"
-    out: list[str] = []
-    seen_cols: set[str] = set()
-    for part in raw.split(sep):
-        token = part.strip().casefold()
-        if token in {"match", "score_desc"}:
-            token = WORTH_SORT_MATCH_DESC
-        if token not in WORTH_SORT_TOKEN:
-            continue
-        col = token.rsplit("_", 1)[0]
-        if col in seen_cols:
-            continue
-        seen_cols.add(col)
-        out.append(token)
-    return out
-
-
-def encode_worth_sorts(tokens: list[str]) -> str:
-    return ",".join(tokens)
-
-
-def normalize_worth_sort(sort: str | None) -> str:
-    """Normaliza string de sort (pode ser multi: match_desc,seen_asc)."""
-    return encode_worth_sorts(parse_worth_sorts(sort))
-
-
-
-
-def _worth_sort_clause(kind: str) -> str:
-    if kind == WORTH_SORT_SEEN_DESC:
-        return "jobs.first_seen_at DESC"
-    if kind == WORTH_SORT_SEEN_ASC:
-        return "jobs.first_seen_at ASC"
-    if kind == WORTH_SORT_MATCH_ASC:
-        return "COALESCE(match_score, 0) ASC"
-    if kind == WORTH_SORT_MATCH_DESC:
-        return "COALESCE(match_score, 0) DESC"
-    if kind == WORTH_SORT_POSTED_ASC:
-        return (
-            "(CASE WHEN COALESCE(jobs.posted_at,'')='' THEN 1 ELSE 0 END) ASC, "
-            "jobs.posted_at ASC"
-        )
-    if kind == WORTH_SORT_POSTED_DESC:
-        return (
-            "(CASE WHEN COALESCE(jobs.posted_at,'')='' THEN 1 ELSE 0 END) ASC, "
-            "jobs.posted_at DESC"
-        )
-    return ""
-
-
-def worth_order_sql(sort: str | None) -> str:
-    clauses = [_worth_sort_clause(t) for t in parse_worth_sorts(sort)]
-    clauses = [c for c in clauses if c]
-    if not clauses:
-        return "jobs.id DESC"
-    return ", ".join(clauses) + ", jobs.id DESC"
-
-
-def _parse_worth_day(raw: str | None) -> datetime | None:
-    text = (raw or "").strip()
-    if not text:
-        return None
-    try:
-        y, m, d = (int(p) for p in text.split("-", 2))
-        return datetime(y, m, d, tzinfo=BRASILIA)
-    except (TypeError, ValueError):
-        return None
-
-
-def worth_date_bounds_utc(
-    date_from: str | None,
-    date_to: str | None,
-) -> tuple[str | None, str | None]:
-    """Converte dias YYYY-MM-DD (Brasília) em limites ISO UTC [lo, hi)."""
-    start_local = _parse_worth_day(date_from)
-    end_local = _parse_worth_day(date_to)
-    lo = start_local.astimezone(timezone.utc).isoformat(timespec="seconds") if start_local else None
-    hi = None
-    if end_local is not None:
-        hi = (end_local + timedelta(days=1)).astimezone(timezone.utc).isoformat(timespec="seconds")
-    return lo, hi
-
-
-def _worth_match_expr() -> str:
-    return """(
-                        SELECT match_score FROM ai_decisions
-                        WHERE ai_decisions.job_id = jobs.id
-                        ORDER BY id DESC LIMIT 1
-                      )"""
-
-
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("api_asgi:api", host=HOST, port=PORT)
+    uvicorn.run("web.api_asgi:api", host=HOST, port=PORT)
