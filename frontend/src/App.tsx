@@ -7,6 +7,7 @@ import { RulesView } from './Rules'
 import odradekIcon from '../../assets/public/odradek-icon.png'
 import { formatDate } from './format'
 import { JobCard } from './JobCard'
+import { BulkIgnore } from './BulkIgnore'
 import { isView, navigation, viewLabels, type View } from './views'
 
 function readLocation(): { view: View; filters: JobFilters } {
@@ -123,6 +124,7 @@ export function App() {
         <section className="filter-panel"><div className="filter-heading"><div><p className="eyebrow">TRIAGEM</p><h2>Encontre o que importa</h2></div><span>{jobs ? `${jobs.total} vaga${jobs.total === 1 ? '' : 's'}` : 'Carregando…'}</span></div>
           <div className="filters"><label>Status<select value={draft.status} onChange={e => updateDraft('status', e.target.value)}>{Object.entries(statusLabels).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label><label>Match mínimo<input type="number" min="0" max="100" value={draft.min_match} onChange={e => updateDraft('min_match', e.target.value)} /></label><label>Ordenar por<select value={draft.sort} onChange={e => updateDraft('sort', e.target.value)}><option value="match_desc">Maior match</option><option value="match_asc">Menor match</option><option value="seen_desc">Mais recentes</option><option value="seen_asc">Mais antigas</option><option value="posted_desc">Publicadas recentemente</option></select></label><label>Encontrada de<input type="date" value={draft.date_from} onChange={e => updateDraft('date_from', e.target.value)} /></label><label>Até<input type="date" value={draft.date_to} onChange={e => updateDraft('date_to', e.target.value)} /></label><button onClick={applyFilters}>Aplicar filtros</button></div>
         </section>
+        <BulkIgnore onDone={reload} notify={notify} />
         {!jobs ? <p className="empty">Carregando vagas…</p> : jobs.items.length ? <div className="job-list">{jobs.items.map(job => <JobCard job={job} statusLabels={statusLabels} onChange={reload} key={job.id} />)}</div> : <p className="empty">Nenhuma vaga corresponde aos filtros. Ajuste o status, o match ou o período.</p>}
         {jobs && jobs.pages > 1 && <div className="pagination"><button className="secondary" disabled={jobs.page <= 1} onClick={() => setFilters(old => ({ ...old, page: String(jobs.page - 1) }))}>Anterior</button><span>Página {jobs.page} de {jobs.pages}</span><button className="secondary" disabled={jobs.page >= jobs.pages} onClick={() => setFilters(old => ({ ...old, page: String(jobs.page + 1) }))}>Próxima</button></div>}
       </> : view === 'queue' ? <QueueView notify={notify} /> : view === 'logs' ? <LogsView notify={notify} /> : view === 'usage' ? <UsageView notify={notify} /> : view === 'resumes' ? <ResumesView notify={notify} /> : view === 'assistant' ? <AssistantView notify={notify} /> : null}

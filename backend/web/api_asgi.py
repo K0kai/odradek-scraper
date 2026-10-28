@@ -18,6 +18,7 @@ from starlette.concurrency import run_in_threadpool
 import app as core
 from web import panel_queries, panel_settings
 from jobs.form_rules import list_rules, save_rules_from_form
+from jobs.bulk_ignore import apply as apply_bulk_ignore, criteria_from_body, preview as preview_bulk_ignore
 from jobs.job_queue import KIND_RESUME
 from web.panel_log import clear_logs, log_event
 from candidate.resume_pipeline import AiUnavailableError, get_resume, persist_resume_upload
@@ -157,6 +158,33 @@ def jobs(page: int = 1, page_size: int = 15, status: str = "worth", min_match: i
                                      min_match=min_match, sort=sort, date_from=date_from, date_to=date_to)
     except ValueError:
         return JSONResponse({"error": "Parâmetros de filtro inválidos"}, status_code=400)
+
+
+@api.post("/api/jobs/bulk-ignore/preview")
+def bulk_ignore_preview(body: dict = Body(...)):
+    try:
+        criteria = criteria_from_body(body)
+    except ValueError as exc:
+        return _error(str(exc))
+    with core.connect() as db:
+        count = preview_bulk_ignore(db, criteria)
+    return {"count": count}
+
+
+@api.post("/api/jobs/bulk-ignore/apply")
+def bulk_ignore_apply(body: dict = Body(...)):
+    try:
+        expected_count = body.get("expected_count")
+        if type(expected_count) is not int or expected_count < 1:
+            raise ValueError("Confira a quantidade antes de ignorar.")
+        criteria = criteria_from_body({key: value for key, value in body.items() if key != "expected_count"})
+    except ValueError as exc:
+        return _error(str(exc))
+    with core.connect() as db:
+        if preview_bulk_ignore(db, criteria) != expected_count:
+            return _error("A quantidade de vagas mudou. Confira novamente antes de ignorar.", 409)
+        count = apply_bulk_ignore(db, criteria)
+    return {"count": count, "notice": f"{count} vaga(s) ignorada(s)."}
 
 
 @api.get("/api/queue")

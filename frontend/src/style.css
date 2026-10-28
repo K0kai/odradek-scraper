@@ -390,6 +390,64 @@ button:hover:not(:disabled),.open-link:hover{
 .filters button{
   white-space:nowrap
 }
+.bulk-ignore{
+  background:#191d1e;
+  border:1px solid #3c4543;
+  border-radius:10px;
+  padding:15px 20px;
+  margin-bottom:18px
+}
+.bulk-ignore summary{
+  cursor:pointer;
+  font-weight:700
+}
+.bulk-ignore p{
+  color:#aeb6af;
+  font-size:12px;
+  margin:12px 0
+}
+.bulk-ignore-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+  gap:10px
+}
+.bulk-ignore-grid label{
+  color:#b8beb8;
+  font-size:11px;
+  font-weight:700
+}
+.bulk-ignore-grid input{
+  display:block;
+  width:100%;
+  margin-top:6px;
+  border:1px solid #3c4543;
+  border-radius:6px;
+  background:#111516;
+  color:#f3f4ef;
+  padding:9px 10px;
+  min-height:38px
+}
+.bulk-ignore-all{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  margin:15px 0;
+  font-size:12px
+}
+.bulk-ignore-all input{
+  accent-color:#c65b54
+}
+.bulk-ignore-actions{
+  display:flex;
+  align-items:center;
+  flex-wrap:wrap;
+  gap:12px;
+  font-size:12px
+}
+.bulk-ignore-confirm{
+  background:#8c3835;
+  border-color:#a94a44
+}
 .job-list{
   display:grid;
   gap:12px

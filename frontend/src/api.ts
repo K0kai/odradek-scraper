@@ -55,6 +55,17 @@ export type JobFilters = {
   page: string
 }
 
+export type BulkIgnoreFilters = {
+  country: string
+  found_from: string
+  found_to: string
+  posted_from: string
+  posted_to: string
+  match_min: string
+  match_max: string
+  all: boolean
+}
+
 export type QueueItem = {
   id: number
   kind: string
@@ -155,6 +166,12 @@ export const api = {
   session: () => request<{ auth_required: boolean; expires_at: number | null }>('/api/session'),
   dashboard: () => request<Dashboard>('/api/dashboard'),
   jobs: (filters: JobFilters) => request<JobList>(`/api/jobs?${new URLSearchParams(filters)}`),
+  previewBulkIgnore: (filters: BulkIgnoreFilters) => request<{ count: number }>('/api/jobs/bulk-ignore/preview', {
+    method: 'POST', body: JSON.stringify(filters),
+  }),
+  applyBulkIgnore: (filters: BulkIgnoreFilters, expectedCount: number) => request<{ count: number; notice: string }>('/api/jobs/bulk-ignore/apply', {
+    method: 'POST', body: JSON.stringify({ ...filters, expected_count: expectedCount }),
+  }),
   collector: (action: 'start' | 'stop') => request<{ notice: string }>(`/api/collector/${action}`, { method: 'POST' }),
   status: (id: number, status: string) => request<{ notice: string }>(`/api/jobs/${id}/status`, { method: 'POST', body: JSON.stringify({ status }) }),
   notes: (id: number, notes: string) => request<{ notice: string }>(`/api/jobs/${id}/notes`, { method: 'POST', body: JSON.stringify({ notes }) }),
