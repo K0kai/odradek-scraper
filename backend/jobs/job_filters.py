@@ -64,9 +64,9 @@ def _worth_sort_clause(kind: str) -> str:
     if kind == WORTH_SORT_SEEN_ASC:
         return "jobs.first_seen_at ASC"
     if kind == WORTH_SORT_MATCH_ASC:
-        return "COALESCE(match_score, 0) ASC"
+        return f"COALESCE({_worth_match_expr()}, 0) ASC"
     if kind == WORTH_SORT_MATCH_DESC:
-        return "COALESCE(match_score, 0) DESC"
+        return f"COALESCE({_worth_match_expr()}, 0) DESC"
     if kind == WORTH_SORT_POSTED_ASC:
         return (
             "(CASE WHEN COALESCE(jobs.posted_at,'')='' THEN 1 ELSE 0 END) ASC, "
