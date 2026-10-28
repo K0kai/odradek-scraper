@@ -50,7 +50,8 @@ async def guard(request: Request, call_next):
     if request.method not in {"GET", "HEAD", "POST"}:
         return JSONResponse({"error": "Método não permitido"}, status_code=405)
     if request.method == "POST" and not same_origin_post(
-        request.headers.get("origin"), request.headers.get("host"), request.headers.get("sec-fetch-site")
+        request.headers.get("origin"), request.headers.get("host"),
+        request.headers.get("sec-fetch-site"), request.headers.get("referer"), request.url.scheme,
     ):
         return JSONResponse({"error": "Origem não permitida"}, status_code=403)
     public_path = request.url.path in {"/health", "/odradek-icon.png", "/favicon.ico"}
@@ -73,6 +74,16 @@ async def guard(request: Request, call_next):
     return response
 
 
+@api.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Content-Security-Policy"] = "frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+    return response
+
+
 @api.get("/login", include_in_schema=False)
 def login(request: Request):
     target = safe_next(request.query_params.get("next"))
@@ -84,7 +95,7 @@ def login(request: Request):
 @api.post("/login", include_in_schema=False)
 async def login_submit(request: Request):
     try:
-        password, target = login_form(await request.body())
+        password, target = login_form(await _bounded_body(request, max_bytes=8192))
     except (ValueError, UnicodeError):
         return HTMLResponse(login_page(error="Formulário inválido."), status_code=400)
     result = verify_login(password, request.client.host if request.client else "unknown")
@@ -192,8 +203,7 @@ def _error(message: str, status: int = 400) -> JSONResponse:
     return JSONResponse({"error": message}, status_code=status)
 
 
-async def _form_data(request: Request, *, max_bytes: int = 16 * 1024 * 1024):
-    """Read bounded form data without accepting unbounded request bodies."""
+async def _bounded_body(request: Request, *, max_bytes: int) -> bytes:
     size = 0
     chunks = []
     async for chunk in request.stream():
@@ -201,7 +211,12 @@ async def _form_data(request: Request, *, max_bytes: int = 16 * 1024 * 1024):
         if size > max_bytes:
             raise ValueError("Arquivo ou formulário muito grande")
         chunks.append(chunk)
-    body = b"".join(chunks)
+    return b"".join(chunks)
+
+
+async def _form_data(request: Request, *, max_bytes: int = 16 * 1024 * 1024):
+    """Read bounded form data without accepting unbounded request bodies."""
+    body = await _bounded_body(request, max_bytes=max_bytes)
     content_type = request.headers.get("content-type", "")
     if content_type.startswith("application/x-www-form-urlencoded"):
         parsed = parse_qs(body.decode("utf-8"), keep_blank_values=True)

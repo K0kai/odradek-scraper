@@ -8,6 +8,7 @@ import os
 import secrets
 import threading
 import time
+from collections import OrderedDict
 from http.cookies import CookieError, SimpleCookie
 from urllib.parse import parse_qs, urlparse
 
@@ -18,7 +19,8 @@ SESSION_COOKIE = "odradek_session"
 SESSION_SECONDS = 7 * 24 * 60 * 60
 _ATTEMPT_WINDOW = 15 * 60
 _ATTEMPT_LIMIT = 10
-_attempts: dict[str, list[float]] = {}
+_TRACKED_CLIENT_LIMIT = 4096
+_attempts: OrderedDict[str, list[float]] = OrderedDict()
 _attempts_lock = threading.Lock()
 
 
@@ -86,6 +88,7 @@ def verify_login(password: str, client_id: str, *, now: float | None = None) -> 
         recent = [stamp for stamp in _attempts.get(client_id, []) if current - stamp < _ATTEMPT_WINDOW]
         if len(recent) >= _ATTEMPT_LIMIT:
             _attempts[client_id] = recent
+            _attempts.move_to_end(client_id)
             return "blocked"
         valid = configured() and hmac.compare_digest(
             password.encode("utf-8"), os.environ["PANEL_PASSWORD"].encode("utf-8")
@@ -94,6 +97,9 @@ def verify_login(password: str, client_id: str, *, now: float | None = None) -> 
             _attempts.pop(client_id, None)
             return "ok"
         _attempts[client_id] = recent + [current]
+        _attempts.move_to_end(client_id)
+        if len(_attempts) > _TRACKED_CLIENT_LIMIT:
+            _attempts.popitem(last=False)
         return "invalid"
 
 

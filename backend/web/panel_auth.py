@@ -13,10 +13,18 @@ def configured() -> bool:
     return bool(os.environ.get("PANEL_PASSWORD"))
 
 
-def same_origin_post(origin: str | None, host: str | None, fetch_site: str | None) -> bool:
-    if (fetch_site or "").casefold() == "cross-site":
+def same_origin_post(
+    origin: str | None,
+    host: str | None,
+    fetch_site: str | None,
+    referer: str | None = None,
+    scheme: str = "http",
+) -> bool:
+    if fetch_site and fetch_site.casefold() != "same-origin":
         return False
-    if not origin:
-        return True
-    parsed = urlparse(origin)
-    return parsed.scheme in {"http", "https"} and parsed.netloc.casefold() == (host or "").casefold()
+    source = origin or referer
+    if not source:
+        return (fetch_site or "").casefold() == "same-origin"
+    parsed = urlparse(source)
+    expected_scheme = "https" if os.environ.get("RENDER", "").casefold() == "true" else scheme
+    return parsed.scheme == expected_scheme and parsed.netloc.casefold() == (host or "").casefold()
