@@ -11,7 +11,7 @@ from email.parser import BytesParser
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode
 
-from fastapi import Body, FastAPI, Request
+from fastapi import Body, FastAPI, Request, Query
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
@@ -643,13 +643,26 @@ def qpid_status():
 
 
 @api.get("/api/qpid/queue")
-def qpid_queue():
-    return panel_queries.queue_api_payload()
+def qpid_queue(limit: int = Query(100, ge=1, le=500), position: str = Query("fim", pattern="^(inicio|fim)$")):
+    order = "ASC" if position == "inicio" else "DESC"
+    with core.connect() as db:
+        rows = db.execute(f"SELECT id, kind, status, progress_log FROM queue_jobs ORDER BY id {order} LIMIT ?", (limit,)).fetchall()
+    items = [{"id": row["id"], "kind": row["kind"], "status": row["status"],
+              "last_step": ((row["progress_log"] or "").splitlines() or [""])[-1][:280]} for row in rows]
+    if position == "fim":
+        items.reverse()
+    return {"counts": core.queue.counts(), "items": items}
 
 
 @api.get("/api/qpid/logs")
-def qpid_logs(limit: int = 30):
-    return panel_queries.logs_api_payload(limit)
+def qpid_logs(limit: int = Query(30, ge=1, le=500), position: str = Query("fim", pattern="^(inicio|fim)$")):
+    order = "ASC" if position == "inicio" else "DESC"
+    with core.connect() as db:
+        rows = db.execute(f"SELECT * FROM event_logs ORDER BY id {order} LIMIT ?", (limit,)).fetchall()
+    items = [dict(row) for row in rows]
+    if position == "fim":
+        items.reverse()
+    return {"items": items}
 
 
 @api.post("/api/qpid/collector/{action}")
