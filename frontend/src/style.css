@@ -366,7 +366,7 @@ button:hover:not(:disabled),.open-link:hover{
 }
 .filters{
   display:grid;
-  grid-template-columns:1fr 120px 1fr 150px 150px auto;
+  grid-template-columns:1fr 120px 150px 150px auto;
   gap:11px;
   align-items:end
 }
@@ -389,6 +389,46 @@ button:hover:not(:disabled),.open-link:hover{
 }
 .filters button{
   white-space:nowrap
+}
+.job-sort{
+  border-top:1px solid #303837;
+  margin-top:18px;
+  padding-top:15px
+}
+.job-sort-heading{
+  display:flex;
+  flex-wrap:wrap;
+  align-items:baseline;
+  gap:5px 12px;
+  margin-bottom:10px;
+  font-size:12px
+}
+.job-sort-heading span{
+  color:#aeb6af
+}
+.job-sort-options{
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px
+}
+.job-sort-option{
+  display:flex;
+  align-items:center;
+  gap:14px;
+  background:#111516;
+  border-color:#3c4543;
+  min-height:36px
+}
+.job-sort-option.active{
+  border-color:#b56a63;
+  background:#352321
+}
+.job-sort-state{
+  color:#aeb6af;
+  font-size:11px
+}
+.job-sort-option.active .job-sort-state{
+  color:#f0c5be
 }
 .bulk-ignore{
   background:#191d1e;

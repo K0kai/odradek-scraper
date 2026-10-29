@@ -7,6 +7,7 @@ import { RulesView } from './Rules'
 import odradekIcon from '../../assets/public/odradek-icon.png'
 import { formatDate } from './format'
 import { JobCard } from './JobCard'
+import { JobSort } from './JobSort'
 import { BulkIgnore } from './BulkIgnore'
 import { isView, navigation, viewLabels, type View } from './views'
 
@@ -18,7 +19,7 @@ function readLocation(): { view: View; filters: JobFilters } {
     filters: {
       status: q.get('status') || 'worth',
       min_match: q.get('min_match') || '0',
-      sort: q.get('sort') || 'match_desc',
+      sort: q.has('sort') ? q.get('sort') || '' : 'match_desc',
       date_from: q.get('date_from') || '',
       date_to: q.get('date_to') || '',
       page: q.get('page') || '1',
@@ -89,6 +90,11 @@ export function App() {
   function notify(message: string, isError = false) { if (isError) setError(message); else { setNotice(message); setError('') } }
   function updateDraft(name: keyof JobFilters, value: string) { setDraft(old => ({ ...old, [name]: value })) }
   function applyFilters() { setFilters({ ...draft, page: '1' }); setJobs(null) }
+  function changeSort(sort: string) {
+    setDraft(old => ({ ...old, sort, page: '1' }))
+    setFilters(old => ({ ...old, sort, page: '1' }))
+    setJobs(null)
+  }
 
   async function collectorAction(action: 'start' | 'stop') {
     setBusy(true); setNotice('')
@@ -122,7 +128,8 @@ export function App() {
         <section className="section"><div className="section-head"><div><p className="eyebrow">ATIVIDADE</p><h2>Execuções recentes</h2></div></div>{dashboard?.runs.length ? <ul className="runs">{dashboard.runs.map(run => <li key={run.id}><time>{formatDate(run.started_at, true)}</time><span>{run.message || run.state}</span></li>)}</ul> : <p className="empty">Nenhuma execução registrada.</p>}</section>
       </> : view === 'jobs' ? <>
         <section className="filter-panel"><div className="filter-heading"><div><p className="eyebrow">TRIAGEM</p><h2>Encontre o que importa</h2></div><span>{jobs ? `${jobs.total} vaga${jobs.total === 1 ? '' : 's'}` : 'Carregando…'}</span></div>
-          <div className="filters"><label>Status<select value={draft.status} onChange={e => updateDraft('status', e.target.value)}>{Object.entries(statusLabels).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label><label>Match mínimo<input type="number" min="0" max="100" value={draft.min_match} onChange={e => updateDraft('min_match', e.target.value)} /></label><label>Ordenar por<select value={draft.sort} onChange={e => updateDraft('sort', e.target.value)}><option value="match_desc">Maior match</option><option value="match_asc">Menor match</option><option value="seen_desc">Encontrada: mais recente</option><option value="seen_asc">Encontrada: mais antiga</option><option value="posted_desc">Publicada: mais recente</option><option value="posted_asc">Publicada: mais antiga</option></select></label><label>Encontrada de<input type="date" value={draft.date_from} onChange={e => updateDraft('date_from', e.target.value)} /></label><label>Até<input type="date" value={draft.date_to} onChange={e => updateDraft('date_to', e.target.value)} /></label><button onClick={applyFilters}>Aplicar filtros</button></div>
+          <div className="filters"><label>Status<select value={draft.status} onChange={e => updateDraft('status', e.target.value)}>{Object.entries(statusLabels).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label><label>Match mínimo<input type="number" min="0" max="100" value={draft.min_match} onChange={e => updateDraft('min_match', e.target.value)} /></label><label>Encontrada de<input type="date" value={draft.date_from} onChange={e => updateDraft('date_from', e.target.value)} /></label><label>Até<input type="date" value={draft.date_to} onChange={e => updateDraft('date_to', e.target.value)} /></label><button onClick={applyFilters}>Aplicar filtros</button></div>
+          <JobSort value={draft.sort} onChange={changeSort} />
         </section>
         <BulkIgnore onDone={reload} notify={notify} />
         {!jobs ? <p className="empty">Carregando vagas…</p> : jobs.items.length ? <div className="job-list">{jobs.items.map(job => <JobCard job={job} statusLabels={statusLabels} onChange={reload} key={job.id} />)}</div> : <p className="empty">Nenhuma vaga corresponde aos filtros. Ajuste o status, o match ou o período.</p>}
