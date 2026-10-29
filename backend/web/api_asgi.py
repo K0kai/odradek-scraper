@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import hmac
 import os
 import re
 from contextlib import asynccontextmanager
@@ -50,6 +51,16 @@ api = FastAPI(title="Odradek API", lifespan=lifespan)
 async def guard(request: Request, call_next):
     if request.method not in {"GET", "HEAD", "POST"}:
         return JSONResponse({"error": "Método não permitido"}, status_code=405)
+    if request.url.path.startswith("/api/qpid/"):
+        token = os.environ.get("QPID_API_TOKEN", "")
+        if not token:
+            return JSONResponse({"error": "Configure QPID_API_TOKEN."}, status_code=503)
+        supplied = request.headers.get("authorization", "")
+        if not hmac.compare_digest(supplied.encode(), ("Bearer " + token).encode()):
+            return JSONResponse({"error": "Token inválido."}, status_code=401)
+        response = await call_next(request)
+        response.headers["Cache-Control"] = "no-store"
+        return response
     if request.method == "POST" and not same_origin_post(
         request.headers.get("origin"), request.headers.get("host"),
         request.headers.get("sec-fetch-site"), request.headers.get("referer"), request.url.scheme,
@@ -624,3 +635,23 @@ async def copilot_action(action: str, request: Request):
         log_event("info", "copilot", f"Ask #{ask_id} {action} no painel.")
     return {"ok": ok, "notice": ("Pergunta cancelada." if action == "cancel" else "Modo manual ativado.")
             if ok else "Pergunta já fechada."}
+
+
+@api.get("/api/qpid/status")
+def qpid_status():
+    return {"collector": core.collector.snapshot()}
+
+
+@api.get("/api/qpid/queue")
+def qpid_queue():
+    return panel_queries.queue_api_payload()
+
+
+@api.get("/api/qpid/logs")
+def qpid_logs(limit: int = 30):
+    return panel_queries.logs_api_payload(limit)
+
+
+@api.post("/api/qpid/collector/{action}")
+def qpid_collector(action: str):
+    return collector_action(action)
