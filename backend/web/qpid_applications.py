@@ -9,8 +9,9 @@ def register(api, core):
 
     @api.get("/api/qpid/applications")
     def candidates(limit: int = Query(30, ge=1, le=100)):
+        from jobs.job_filters import _worth_match_expr
         with core.connect() as db:
-            rows = db.execute("SELECT id, title, company, status FROM jobs WHERE status IN ('worth','saved') ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            rows = db.execute("SELECT jobs.id, jobs.title, jobs.company, jobs.status, " + _worth_match_expr() + " AS match_score FROM jobs WHERE jobs.status IN ('worth','saved') ORDER BY jobs.id DESC LIMIT ?", (limit,)).fetchall()
         return {"items": [dict(row) for row in rows]}
 
     @api.get("/api/qpid/applications/{job_id}")
