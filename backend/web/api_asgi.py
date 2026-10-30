@@ -668,3 +668,7 @@ def qpid_logs(limit: int = Query(30, ge=1, le=500), position: str = Query("fim",
 @api.post("/api/qpid/collector/{action}")
 def qpid_collector(action: str):
     return collector_action(action)
+
+
+from web.qpid_applications import register as register_qpid_applications
+register_qpid_applications(api, core)
