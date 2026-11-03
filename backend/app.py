@@ -874,7 +874,6 @@ LINKEDIN_MAX_AGE_DAYS = 7
 #: Quantos keywords a IA pode gravar / usar nas URLs (antes era 4–5 e estreita demais).
 LINKEDIN_FILTER_MAX_KEYWORDS = 12
 LINKEDIN_FILTER_MAX_COUNT = 12
-LINKEDIN_URL_MAX_KEYWORDS = 8
 LINKEDIN_SEARCH_MAX_URLS = 8
 
 # Placeholders obrigatórios no texto editável: {pref_keywords} {facts_pt} {facts_en} {resume_pt} {resume_en}
@@ -901,7 +900,11 @@ KEYWORD BREADTH (mandatory):
 - Do NOT invent employers or skills; only use the resume summaries and facts.
 
 Other rules:
-- Prefer 2–4 experience codes centered on the candidate's seniority (usually one level below + main; avoid Director/Executive unless clearly supported).
+- Assess the candidate's realistic seniority separately for each skill/domain, using actual responsibilities, dated professional roles, and project evidence. Do not equate the number of skills with seniority.
+- If resume translations disagree, reconcile their claims against the underlying experience rather than automatically choosing a label.
+- Choose experience codes and any seniority qualifiers independently for each filter. Do not use a fixed seniority-to-code mapping, mandatory qualifier list, or universal years-of-experience cutoff.
+- Refine searches enough to avoid flooding results with roles beyond the candidate's demonstrated scope, while preserving plausible adjacent opportunities and the breadth of supported skills.
+- Avoid full job titles and intersections of unrelated skills. Explain the chosen level, supporting candidate evidence, and relevant uncertainty in each reason.
 - RECENCY (mandatory — the URL builder enforces this; mention it in reason):
   * Only consider jobs from the last 7 days (LinkedIn f_TPR=r604800).
   * Strongly prioritize jobs posted today / last 24 hours (f_TPR=r86400) over older ones in the week.
@@ -992,7 +995,7 @@ def _fallback_linkedin_filters(cfg: dict[str, str]) -> list[dict]:
             "enabled": True,
             "keywords": group,
             "locations": ["Remote", "Belo Horizonte"],
-            "experience_levels": [3, 4],
+            "experience_levels": [],
             "workplace_types": [2, 3],
             "reason": "Filtro alternativo baseado nas preferências, remoto global e híbrido em Belo Horizonte.",
             "source": "fallback",
@@ -1100,6 +1103,11 @@ def _validate_linkedin_filter_form(raw: str, cfg: dict[str, str]) -> str:
         keywords = item.get("keywords")
         if not isinstance(keywords, list) or not any(str(x).strip() for x in keywords):
             raise ValueError(f"Adicione ao menos uma keyword ao filtro #{index}.")
+        if len(keywords) > LINKEDIN_FILTER_MAX_KEYWORDS:
+            raise ValueError(f"Use até {LINKEDIN_FILTER_MAX_KEYWORDS} keywords no filtro #{index}; divida as demais em outro filtro.")
+        locations = item.get("locations")
+        if isinstance(locations, list) and len(locations) > 4:
+            raise ValueError(f"Use até 4 locais no filtro #{index}; divida os demais em outro filtro.")
     filters = _normalize_linkedin_filters(submitted, cfg, fallback_if_empty=False)
     return json.dumps(filters, ensure_ascii=False)
 
@@ -1133,8 +1141,10 @@ def ai_generate_linkedin_search_filters(cfg: dict[str, str]) -> list[dict]:
     prompt += (
         "\n\nMANDATORY OUTPUT OVERRIDE: Return JSON exactly as "
         '{"filters":[{"name":"...","keywords":["..."],"locations":["..."],'
-        '"experience_levels":[3,4],"workplace_types":[2,3],"reason":"..."}]}. '
-        "Create multiple independent filters (ideally 4–8), with only 1–3 related keywords per filter."
+        '"experience_levels":[],"workplace_types":[],"reason":"..."}]}. '
+        "Create multiple independent filters (ideally 4–8), with only 1–3 related keywords per filter. "
+        "The empty arrays illustrate the schema only; populate them from the candidate context "
+        "and the search instructions above."
     )
     try:
         if provider == "openai":
@@ -1220,18 +1230,19 @@ def ai_generate_linkedin_search_filters(cfg: dict[str, str]) -> list[dict]:
 
 
 def get_linkedin_search_filters(cfg: dict[str, str], *, force_refresh: bool = False) -> list[dict]:
-    """Retorna filtros em cache ou gera uma coleção quando currículo/prompt mudarem."""
-    fingerprint = _resume_filter_fingerprint(cfg)
-    cached_hash = (cfg.get("apify_linkedin_filter_hash") or "").strip()
+    """Preserva a coleção salva; só substitui mediante regeneração explícita."""
     cached_raw = (cfg.get("apify_linkedin_filters_json") or "").strip()
-    if not force_refresh and cached_hash == fingerprint and cached_raw:
+    if not force_refresh and cached_raw:
         try:
+            cached = json.loads(cached_raw)
+            if not isinstance(cached, (list, dict)):
+                raise ValueError("Coleção de filtros inválida")
             filters = _normalize_linkedin_filters(
-                json.loads(cached_raw), cfg, fallback_if_empty=False
+                cached, cfg, fallback_if_empty=False
             )
             return filters
-        except json.JSONDecodeError:
-            pass
+        except (ValueError, TypeError):
+            log_event("warning", "apify", "Coleção LinkedIn salva inválida; tentando gerar filtros.")
 
     legacy_filter: dict | None = None
     if not cached_raw:
@@ -1241,6 +1252,9 @@ def get_linkedin_search_filters(cfg: dict[str, str], *, force_refresh: bool = Fa
                 legacy_filter = old
         except json.JSONDecodeError:
             pass
+    if legacy_filter and not force_refresh:
+        return _normalize_linkedin_filters([legacy_filter], cfg)
+    fingerprint = _resume_filter_fingerprint(cfg)
     try:
         generated = ai_generate_linkedin_search_filters(cfg)
     except (AiUnavailableError, ValueError, json.JSONDecodeError) as exc:
@@ -1282,14 +1296,12 @@ def get_linkedin_search_filter(cfg: dict[str, str], *, force_refresh: bool = Fal
     return next((item for item in filters if item.get("enabled")), filters[0] if filters else _fallback_linkedin_filter(cfg))
 
 
-def build_linkedin_search_urls(filter_data: dict, *, max_urls: int = 4) -> list[str]:
-    """Monta URLs de busca LinkedIn com recência obrigatória.
+def build_linkedin_search_urls(filter_data: dict) -> list[str]:
+    """Cobre todas as combinações, primeiro 24 horas e depois até 7 dias.
 
-    Toda URL leva ``f_TPR``: metade (arredondando pra cima) prioriza o mesmo dia
-    (``r86400``); o restante completa a janela de 7 dias (``r604800``). Nunca
-    busca sem teto de tempo — evita vagas velhas no scrape.
+    O limite por execução é aplicado em lotes, nunca descartando URLs aqui.
     """
-    keywords = [str(k) for k in (filter_data.get("keywords") or []) if str(k).strip()][:LINKEDIN_URL_MAX_KEYWORDS]
+    keywords = [str(k) for k in (filter_data.get("keywords") or []) if str(k).strip()]
     locations = [str(x) for x in (filter_data.get("locations") or []) if str(x).strip()][:4]
     if not keywords:
         keywords = ["software engineer"]
@@ -1303,18 +1315,11 @@ def build_linkedin_search_urls(filter_data: dict, *, max_urls: int = 4) -> list[
         low = loc.casefold()
         return "belo horizonte" in low or low in {"bh", "bh, mg", "bh - mg"}
 
-    def _is_remote_loc(loc: str) -> bool:
-        low = loc.casefold()
-        return any(
-            token in low
-            for token in ("remote", "remoto", "worldwide", "anywhere", "global", "europe", "united states", "usa", "eua")
-        )
-
     # Pares intencionais: remote → qualquer lugar remoto; hybrid → só BH.
     pairs: list[tuple[str, str]] = []
     if 2 in workplace:
-        remote_locs = [loc for loc in locations if _is_remote_loc(loc)] or ["Remote"]
-        for loc in remote_locs[:2]:
+        remote_locs = [loc for loc in locations if not _is_bh(loc) and loc.casefold() not in {"brazil", "brasil"}] or ["Remote"]
+        for loc in remote_locs:
             pairs.append((loc, "2"))
     if 3 in workplace:
         bh_locs = [loc for loc in locations if _is_bh(loc)] or ["Belo Horizonte"]
@@ -1346,25 +1351,30 @@ def build_linkedin_search_urls(filter_data: dict, *, max_urls: int = 4) -> list[
             day_urls.append(_url(keyword, location, f_wt, LINKEDIN_TPR_DAY))
             week_urls.append(_url(keyword, location, f_wt, LINKEDIN_TPR_WEEK))
 
-    # Prioridade: mesmo dia primeiro (≥ metade dos slots); resto ≤7 dias.
-    day_slots = max(1, (max_urls + 1) // 2)
-    urls: list[str] = []
-    for u in day_urls[:day_slots]:
-        if u not in urls:
-            urls.append(u)
-        if len(urls) >= max_urls:
-            return urls
-    for u in week_urls:
-        if u not in urls:
-            urls.append(u)
-        if len(urls) >= max_urls:
-            return urls
-    for u in day_urls[day_slots:]:
-        if u not in urls:
-            urls.append(u)
-        if len(urls) >= max_urls:
-            return urls
-    return urls
+    return list(dict.fromkeys(day_urls + week_urls))
+
+
+def plan_apify_runs(actors: list[dict], filters: list[dict]) -> list[tuple[dict, dict | None, list[str] | None]]:
+    """Distribui todas as URLs em lotes; todos os filtros do dia vêm primeiro."""
+    planned: list[tuple[dict, dict | None, list[str] | None]] = []
+    active_filters = [item for item in filters if item.get("enabled", True)]
+    for actor in actors:
+        if not actor.get("enabled", True):
+            continue
+        if actor.get("input_mode") != "linkedin_search":
+            planned.append((actor, None, None))
+            continue
+        searches = [(item, build_linkedin_search_urls(item)) for item in active_filters]
+        for tpr in (LINKEDIN_TPR_DAY, LINKEDIN_TPR_WEEK):
+            for item, urls in searches:
+                phase_urls = [url for url in urls if f"f_TPR={tpr}" in url]
+                for offset in range(0, len(phase_urls), LINKEDIN_SEARCH_MAX_URLS):
+                    batch = phase_urls[offset:offset + LINKEDIN_SEARCH_MAX_URLS]
+                    label = str(actor.get("label") or actor["id"])
+                    phase = "24h" if tpr == LINKEDIN_TPR_DAY else "7d"
+                    run_actor = {**actor, "label": f"{label}: {item['name']} ({phase}, lote {offset // LINKEDIN_SEARCH_MAX_URLS + 1})"}
+                    planned.append((run_actor, item, batch))
+    return planned
 
 
 def build_apify_run_input(
@@ -1372,6 +1382,7 @@ def build_apify_run_input(
     cfg: dict[str, str],
     *,
     linkedin_filter: dict | None = None,
+    linkedin_urls: list[str] | None = None,
 ) -> dict:
     keywords = terms(cfg.get("keywords", ""))[:3] or ["software engineer"]
     locations = terms(cfg.get("locations", ""))[:3] or ["remote"]
@@ -1379,7 +1390,7 @@ def build_apify_run_input(
     mode = str(actor.get("input_mode") or "linkedin_search")
     if mode == "linkedin_search":
         filter_data = linkedin_filter or get_linkedin_search_filter(cfg)
-        urls = build_linkedin_search_urls(filter_data, max_urls=LINKEDIN_SEARCH_MAX_URLS)
+        urls = linkedin_urls if linkedin_urls is not None else build_linkedin_search_urls(filter_data)
         return {"urls": urls, "count": count, "scrapeCompany": False}
 
     template = actor.get("input_template")
@@ -1387,13 +1398,7 @@ def build_apify_run_input(
         raise ValueError(
             f"Actor {actor.get('label')} em modo custom precisa de input_template (objeto JSON)."
         )
-    # Prefer AI LinkedIn filter keywords when available for template placeholders.
-    try:
-        linkedin_filter = get_linkedin_search_filter(cfg)
-        keywords = list(linkedin_filter.get("keywords") or keywords)[:3] or keywords
-        locations = list(linkedin_filter.get("locations") or locations)[:3] or locations
-    except Exception:
-        pass
+    # Custom actors use their own template and the general panel preferences.
     ctx = {
         "count": str(count),
         "keywords": ", ".join(keywords),
@@ -1609,10 +1614,11 @@ def run_apify_actor(
     cfg: dict[str, str],
     *,
     linkedin_filter: dict | None = None,
+    linkedin_urls: list[str] | None = None,
 ) -> list[dict]:
     actor_id = normalize_apify_actor_id(str(actor["id"]))
     label = str(actor.get("label") or actor_id)
-    run_input = build_apify_run_input(actor, cfg, linkedin_filter=linkedin_filter)
+    run_input = build_apify_run_input(actor, cfg, linkedin_filter=linkedin_filter, linkedin_urls=linkedin_urls)
     log_event("info", "apify", f"Iniciando actor {label} ({actor_id}).")
     started = fetch_json(
         f"{APIFY_API}/actors/{quote_plus(actor_id)}/runs",
@@ -1648,7 +1654,7 @@ def run_apify_actor(
 
 
 def iter_apify_jobs():
-    """Run enabled actors; LinkedIn actors run once for each enabled filter."""
+    """Executa todos os lotes dos filtros ativos, respeitando parada e orçamento."""
     token = secret_get("apify_token")
     if not token:
         raise ValueError("Configure o token da Apify no painel.")
@@ -1678,42 +1684,36 @@ def iter_apify_jobs():
 
     results: list[dict] = []
     errors: list[str] = []
-    budget_exhausted = False
-    for actor in actors:
+    planned = plan_apify_runs(actors, linkedin_filters)
+    log_event("info", "apify", f"Coleta planejada: {len(linkedin_filters)} filtro(s) LinkedIn ativo(s), {len(planned)} execução(ões) Apify.")
+    attempted = 0
+    for run_actor, linkedin_filter, linkedin_urls in planned:
         if collector.stop_event.is_set():
             break
-        actor_runs = (
-            [(actor, item) for item in linkedin_filters]
-            if actor.get("input_mode") == "linkedin_search"
-            else [(actor, None)]
-        )
-        for run_actor, linkedin_filter in actor_runs:
-            if collector.stop_event.is_set():
-                break
-            run_label = str(actor.get("label") or actor["id"])
-            if linkedin_filter:
-                run_actor = {**actor, "label": f"{run_label} — {linkedin_filter['name']}"}
-                run_label = run_actor["label"]
-            # Re-check the configured monthly credit ceiling before every run.
-            try:
-                used_now, _ = apify_monthly_usage_usd(token)
-                if used_now >= limit:
-                    errors.append(f"{run_label}: limite de créditos atingido antes da execução")
-                    budget_exhausted = True
-                    break
-            except Exception:
-                pass
-            try:
-                batch = run_apify_actor(token, run_actor, cfg, linkedin_filter=linkedin_filter)
-                results.extend(batch)
-            except Exception as exc:
-                LOG.exception("Falha no actor Apify %s", run_label)
-                errors.append(f"{run_label}: {exc}")
-                log_event("error", "apify", f"Falha no actor {run_label}: {exc}")
-            else:
-                yield from batch
-        if budget_exhausted:
+        run_label = str(run_actor.get("label") or run_actor["id"])
+        # A failed usage check must not start additional paid batches unchecked.
+        try:
+            used_now, _ = apify_monthly_usage_usd(token)
+        except Exception as exc:
+            errors.append(f"{run_label}: não foi possível verificar créditos ({exc})")
             break
+        if used_now >= limit:
+            errors.append(f"{run_label}: limite de créditos atingido antes da execução")
+            break
+        attempted += 1
+        try:
+            batch = run_apify_actor(token, run_actor, cfg, linkedin_filter=linkedin_filter, linkedin_urls=linkedin_urls)
+            if linkedin_filter:
+                batch = [{**job, "_linkedin_filter_id": linkedin_filter["id"]} for job in batch]
+            results.extend(batch)
+        except Exception as exc:
+            LOG.exception("Falha no actor Apify %s", run_label)
+            errors.append(f"{run_label}: {exc}")
+            log_event("error", "apify", f"Falha no actor {run_label}: {exc}")
+        else:
+            yield from batch
+    if attempted < len(planned):
+        log_event("warning", "apify", f"Cobertura incompleta: {attempted} de {len(planned)} execução(ões) iniciadas; {len(planned) - attempted} pendente(s).")
     try:
         used_after, cycle_after = apify_monthly_usage_usd(token)
         set_setting("apify_last_usage_usd", f"{used_after:.4f}")
@@ -1731,6 +1731,18 @@ def fetch_apify() -> list[dict]:
 
 
 PROVIDERS = {"remotive": fetch_remotive, "remoteok": fetch_remoteok, "adzuna": fetch_adzuna, "apify": iter_apify_jobs}
+
+
+def matches_collection_preferences(job: dict, keyword_terms: list[str], location_terms: list[str]) -> bool:
+    """Filtros LinkedIn específicos substituem as preferências gerais da coleta."""
+    if job.get("_linkedin_filter_id"):
+        return True
+    searchable = " ".join((job["title"], job["company"], job["location"], re.sub("<[^>]+>", " ", job["description"]))).casefold()
+    if keyword_terms and not any(term in searchable for term in keyword_terms):
+        return False
+    if location_terms and not any(term in searchable for term in location_terms):
+        return False
+    return True
 
 
 class Collector:
@@ -1834,10 +1846,7 @@ class Collector:
                     received += 1
                     if self.stop_event.is_set():
                         break
-                    searchable = " ".join((job["title"], job["company"], job["location"], re.sub("<[^>]+>", " ", job["description"]))).casefold()
-                    if keyword_terms and not any(term in searchable for term in keyword_terms):
-                        continue
-                    if location_terms and not any(term in (job["location"] + " " + searchable).casefold() for term in location_terms):
+                    if not matches_collection_preferences(job, keyword_terms, location_terms):
                         continue
                     if not job["url"] or not job["title"]:
                         continue

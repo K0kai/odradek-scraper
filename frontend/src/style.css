@@ -583,6 +583,14 @@ button:hover:not(:disabled),.open-link:hover{
   max-height:250px;
   overflow:auto
 }
+.cover-letter-text{
+  white-space:pre-wrap;
+  overflow-wrap:anywhere;
+  line-height:1.65;
+  color:#c8cec8;
+  font-size:14px;
+  margin-top:16px
+}
 .job-details label{
   margin-top:15px
 }

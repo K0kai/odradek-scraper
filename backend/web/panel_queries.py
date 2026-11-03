@@ -21,7 +21,8 @@ def _job_api_record(row) -> dict:
     data = dict(row)
     data["description"] = re.sub(r"<[^>]+>", " ", data.get("description") or "")[:1800]
     data["match_score"] = int(data["match_score"]) if data.get("match_score") is not None else None
-    data["has_cover_letter"] = bool(data.pop("cover_letter", None))
+    data["cover_letter"] = data.get("cover_letter") or ""
+    data["has_cover_letter"] = bool(data["cover_letter"].strip())
     if urlparse(data.get("url") or "").scheme not in {"http", "https"}:
         data["url"] = ""
     data.pop("fingerprint", None)

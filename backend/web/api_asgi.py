@@ -289,16 +289,30 @@ def icon():
 
 @api.get("/cover-letter.pdf", include_in_schema=False)
 def cover_letter(job_id: int):
+    return _cover_letter_download(job_id, "pdf")
+
+
+@api.get("/cover-letter.txt", include_in_schema=False)
+def cover_letter_text(job_id: int):
+    return _cover_letter_download(job_id, "txt")
+
+
+def _cover_letter_download(job_id: int, file_format: str):
     if job_id <= 0:
         return _error("Vaga inválida")
     with core.connect() as db:
         row = db.execute("SELECT body FROM cover_letters WHERE job_id=?", (job_id,)).fetchone()
     if not row or not (row["body"] or "").strip():
         return _error("Carta não encontrada", 404)
-    from candidate.cover_letter_pdf import render_cover_letter_pdf
-    data = render_cover_letter_pdf(row["body"])
-    return Response(data, media_type="application/pdf", headers={
-        "Content-Disposition": f'attachment; filename="cover-letter-{job_id}.pdf"',
+    if file_format == "txt":
+        data = row["body"].encode("utf-8")
+        media_type = "text/plain; charset=utf-8"
+    else:
+        from candidate.cover_letter_pdf import render_cover_letter_pdf
+        data = render_cover_letter_pdf(row["body"])
+        media_type = "application/pdf"
+    return Response(data, media_type=media_type, headers={
+        "Content-Disposition": f'attachment; filename="cover-letter-{job_id}.{file_format}"',
         "Cache-Control": "no-store",
     })
 

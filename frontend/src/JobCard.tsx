@@ -39,11 +39,18 @@ export function JobCard({ job, statusLabels, onChange }: {
     <div className="job-meta"><span>{job.source}</span><span>Encontrada {formatDate(job.first_seen_at)}</span><span>Publicada {formatDate(job.posted_at)}</span></div>
     <details className="job-details"><summary>Descrição e anotações</summary>
       <p className="description">{job.description || 'Sem descrição.'}</p>
-      {job.has_cover_letter && <a href={`/cover-letter.pdf?job_id=${job.id}`}>Baixar carta em PDF</a>}
       <label htmlFor={`notes-${job.id}`}>Anotações</label>
       <textarea id={`notes-${job.id}`} value={notes} onChange={event => setNotes(event.target.value)} rows={3} />
       <button className="secondary" disabled={busy || notes === job.notes} onClick={saveNotes}>Salvar anotação</button>
     </details>
+    {job.has_cover_letter && <details className="job-details">
+      <summary>Carta de apresentação</summary>
+      <div className="cover-letter-text">{job.cover_letter}</div>
+      <div className="job-actions">
+        <a className="open-link" href={`/cover-letter.txt?job_id=${job.id}`}>Baixar carta em TXT</a>
+        <a className="open-link" href={`/cover-letter.pdf?job_id=${job.id}`}>Baixar carta em PDF</a>
+      </div>
+    </details>}
     <div className="job-actions">
       {job.url && <a className="open-link" href={job.url} target="_blank" rel="noreferrer">Abrir vaga</a>}
       {job.status !== 'applied' && <button className="secondary" disabled={busy} onClick={() => changeStatus('applied')}>Marcar aplicada</button>}

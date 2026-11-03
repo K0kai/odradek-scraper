@@ -19,6 +19,7 @@ export type Job = {
   notes: string
   match_score: number | null
   has_cover_letter: boolean
+  cover_letter: string
 }
 
 export type Run = {

@@ -15,6 +15,10 @@ O acesso ao banco usa Neon/PostgreSQL quando `DATABASE_URL` está definida. Sem 
 
 Dentro de `backend/`, `web/` contém rotas, autenticação e respostas do painel; `data/` contém banco e segredos; `jobs/` contém fila, filtros e regras; `candidate/` contém currículo e contexto; `integrations/` contém clientes externos. `app.py` coordena a coleta e os fluxos de trabalho.
 
+Na coleta LinkedIn/Apify, todos os filtros ativos salvos são usados. Cada combinação de keyword e local permitido gera buscas de 24 horas e de até 7 dias, em lotes de até 8 URLs, com os lotes de 24 horas de todos os filtros primeiro. Uma coleção ampla pode consumir várias execuções por filtro; o orçamento mensal é consultado antes de cada execução. Interrupções por parada ou orçamento deixam um aviso de cobertura incompleta nos logs. Vagas desses filtros não passam novamente pelas keywords e localidades gerais do painel; as verificações de vagas fechadas, recência e duplicidade continuam valendo. Os filtros salvos só são substituídos por uma regeneração explícita. Actors `custom` usam seu template e as preferências gerais, sem herdar o primeiro filtro LinkedIn.
+
+A IA escolhe as keywords, os qualificadores de senioridade e os níveis de experiência de cada filtro a partir do currículo, dos fatos profissionais e do prompt editável no painel. O programa usa esses filtros sem acrescentar qualificadores, remapear níveis ou descartar vagas por listas de cargos e limites fixos de anos de experiência. A adequação individual pode ser avaliada pela triagem de IA já existente. Para rever filtros salvos, use a geração explícita com IA; editar o prompt não substitui a coleção automaticamente.
+
 **Não é um produto, serviço comercial nem ferramenta oferecida para uso em massa.**  
 O código existe para aprendizado e experimentação **na sua máquina**.
 

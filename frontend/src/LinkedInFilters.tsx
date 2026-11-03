@@ -46,11 +46,11 @@ export function LinkedInFilters({ value, onChange }: { value: string; onChange: 
     const terms = keywords.split(',').map(part => part.trim()).filter(Boolean)
     if (!name.trim() || terms.length === 0) return
     update([...items, { id: crypto.randomUUID(), name: name.trim(), enabled: true,
-      keywords: terms, locations: ['Worldwide'], experience_levels: [2, 3, 4],
+      keywords: terms, locations: ['Worldwide'], experience_levels: [],
       workplace_types: [2, 3], source: 'manual', reason: '' }])
     setName(''); setKeywords('')
   }
-  return <div className="linkedin-editor"><p className="section-description">Cada filtro ativo gera uma busca Apify independente. Edite abaixo e salve as preferências para aplicar.</p>
+  return <div className="linkedin-editor"><p className="section-description">Todos os filtros ativos são pesquisados. As buscas priorizam as últimas 24 horas e depois até 7 dias. As keywords e os níveis de experiência escolhidos pela IA ou editados aqui são usados sem ajustes automáticos de senioridade. Cada filtro pode consumir várias execuções, respeitando o limite mensal Apify. Edite e salve para aplicar; use Gerar filtros LinkedIn com IA para substituir a coleção.</p>
     {parseError && <p className="inline-message" role="alert">{parseError}</p>}
     {!parseError && <><div className="rule-list">{items.map((item, index) => <FilterCard item={item} key={item.id || index} change={next => update(items.map((old, at) => at === index ? next : old))} remove={() => update(items.filter((_, at) => at !== index))} />)}</div>{items.length === 0 && <p className="empty">Nenhum filtro criado. Adicione um abaixo.</p>}
       <div className="filter-add"><label>Nome do filtro<input value={name} onChange={event => setName(event.target.value)} /></label><label>Keywords<input value={keywords} onChange={event => setKeywords(event.target.value)} placeholder="Ex.: Python, Backend" /></label><button className="secondary" disabled={!name.trim() || !keywords.trim()} onClick={add}>Adicionar filtro</button></div></>}

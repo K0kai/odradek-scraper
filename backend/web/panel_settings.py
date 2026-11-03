@@ -6,7 +6,7 @@ from app import (
     DEFAULT_JOB_SELECTION_PROMPT, DEFAULT_LINKEDIN_FILTER_PROMPT,
     _normalize_linkedin_filters, _resume_filter_fingerprint,
     _validate_linkedin_filter_form, ai_generate_linkedin_search_filters,
-    effective_linkedin_filter_prompt, get_linkedin_search_filters,
+    effective_linkedin_filter_prompt,
     job_selection_optimism_instruction, load_apify_actors,
     save_settings, secret_get, secret_set, set_setting, settings,
 )
@@ -98,18 +98,10 @@ def save_settings_api_group(group: str, incoming: dict) -> str:
             form["apify_linkedin_filters_json"] = _validate_linkedin_filter_form(
                 form["apify_linkedin_filters_json"], {**settings(), **form}
             )
-        old_prompt = effective_linkedin_filter_prompt(settings())
         if "linkedin_filter_prompt" in form and form["linkedin_filter_prompt"].strip() == DEFAULT_LINKEDIN_FILTER_PROMPT.strip():
             form["linkedin_filter_prompt"] = ""
         save_settings(form)
         new_cfg = settings()
-        if effective_linkedin_filter_prompt(new_cfg) != old_prompt:
-            try:
-                generated = get_linkedin_search_filters(new_cfg, force_refresh=True)
-                return f"Preferências salvas e {len(generated)} filtros LinkedIn regenerados."
-            except Exception as exc:
-                log_event("warning", "settings", f"Regeneração do filtro LinkedIn falhou: {exc}")
-                return "Preferências salvas. O filtro LinkedIn será regenerado na próxima coleta."
         if "apify_linkedin_filters_json" in form:
             set_setting("apify_linkedin_filter_hash", _resume_filter_fingerprint(new_cfg))
         return "Preferências de busca salvas."
