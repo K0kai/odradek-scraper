@@ -20,11 +20,16 @@ def same_origin_post(
     referer: str | None = None,
     scheme: str = "http",
 ) -> bool:
-    if fetch_site and fetch_site.casefold() != "same-origin":
+    site = (fetch_site or "").casefold()
+    if site == "same-origin":
+        # The browser determines this relative to the public URL, before a
+        # reverse proxy can rewrite Host or the request scheme.
+        return True
+    if site in {"cross-site", "same-site"}:
         return False
     source = origin or referer
     if not source:
-        return (fetch_site or "").casefold() == "same-origin"
+        return False
     parsed = urlparse(source)
     expected_scheme = "https" if os.environ.get("RENDER", "").casefold() == "true" else scheme
     return parsed.scheme == expected_scheme and parsed.netloc.casefold() == (host or "").casefold()
