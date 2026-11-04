@@ -21,6 +21,8 @@ TABLE_ORDER = (
     "resumes",
     "form_field_rules",
     "applications",
+    "qpid_application_attempts",
+    "qpid_application_results",
     "form_answers",
     "ai_answer_cache",
     "copilot_asks",
@@ -59,6 +61,8 @@ def main() -> int:
             print("SQLite source is missing tables (skipping): " + ", ".join(sorted(missing)))
 
         with psycopg.connect(database_url, row_factory=dict_row) as target:
+            from web.qpid_applications import ensure_tables
+            ensure_tables(target)
             with target.cursor() as cur:
                 for table in tables:
                     if table in REPLACED_TABLES:
