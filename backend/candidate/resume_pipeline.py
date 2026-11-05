@@ -1,6 +1,8 @@
 # Upload, extração e análise única de currículos PDF.
 from __future__ import annotations
 
+from io import BytesIO
+from candidate.resume_storage import save_pdf, read_pdf
 import hashlib
 import json
 import os
@@ -38,7 +40,7 @@ def _record_usage(
         pass
 
 
-def extract_pdf_text(path: str) -> str:
+def extract_pdf_text(path: str | BytesIO) -> str:
     from pypdf import PdfReader
 
     reader = PdfReader(path)
@@ -423,7 +425,7 @@ def persist_resume_upload(
     now_iso: str,
     force_reanalyze: bool = False,
 ) -> tuple[str, str, bool]:
-    """Salva o PDF e extrai texto. Não chama a IA.
+    """Salva o PDF no banco e extrai texto. Não chama a IA.
 
     Retorna (mensagem, notice_kind, needs_analysis).
     """
@@ -434,13 +436,8 @@ def persist_resume_upload(
     if len(raw_bytes) > 12 * 1024 * 1024:
         raise ValueError("PDF maior que 12 MB.")
 
-    os.makedirs(resumes_dir, exist_ok=True)
-    stored_name = f"resume_{language}.pdf"
-    stored_path = os.path.join(resumes_dir, stored_name)
-    temp_path = stored_path + ".tmp"
-    with open(temp_path, "wb") as handle:
-        handle.write(raw_bytes)
-    digest = file_sha256(temp_path)
+    stored_path = os.path.join(resumes_dir, f"resume_{language}.pdf")
+    digest = hashlib.sha256(raw_bytes).hexdigest()
     existing = get_resume(db, language)
     same_analyzed = (
         existing
@@ -449,7 +446,6 @@ def persist_resume_upload(
         and not force_reanalyze
     )
     if same_analyzed:
-        os.replace(temp_path, stored_path)
         message = (
             f"Currículo {language.upper()}: PDF idêntico ao já analisado. "
             "Análise reutilizada. Use «Reanalisar currículo» ou marque «Forçar nova análise»."
@@ -459,10 +455,10 @@ def persist_resume_upload(
                    analysis_error='', analysis_message=?, updated_at=? WHERE language=?""",
             (original_filename, stored_path, message, now_iso, language),
         )
+        save_pdf(db, get_resume(db, language), raw_bytes)
         return message, "info", False
 
-    extracted = extract_pdf_text(temp_path)
-    os.replace(temp_path, stored_path)
+    extracted = extract_pdf_text(BytesIO(raw_bytes))
     if force_reanalyze and existing and existing["file_sha256"] == digest:
         message = (
             f"Currículo {language.upper()}: mesmo PDF, mas reanálise forçada foi enfileirada."
@@ -489,6 +485,7 @@ def persist_resume_upload(
         analysis_message=message,
         now_iso=now_iso,
     )
+    save_pdf(db, get_resume(db, language), raw_bytes)
     return message, "info", True
 
 
@@ -507,10 +504,8 @@ def run_resume_analysis(
         raise ValueError(f"Nenhum currículo {language} salvo para analisar.")
     text = (row["extracted_text"] or "").strip()
     if not text:
-        if row["stored_path"] and os.path.exists(row["stored_path"]):
-            text = extract_pdf_text(row["stored_path"])
-        else:
-            raise ValueError("Currículo sem texto extraído.")
+        from paths import RESUMES_DIR
+        text = extract_pdf_text(BytesIO(read_pdf(db, row, RESUMES_DIR)))
     analysis = analyze_resume_text(text, language, provider=provider, model=model, api_key=api_key)
     summary = str(analysis.get("summary") or "").strip()
     message = f"Currículo {language.upper()}: análise da IA concluída ({provider}/{model})."

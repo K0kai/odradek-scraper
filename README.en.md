@@ -80,3 +80,5 @@ Before every push, run `git status` and confirm that no personal data, résumés
 
 Educational / learning use. No license for commercial redistribution has been defined.  
 If you fork the code, retain the notices in this README.
+
+Resume PDFs are now stored transactionally in `resume_files` (PostgreSQL `BYTEA` / SQLite `BLOB`). The Qpid download reads from the database, so uploaded PDFs survive deployments. Startup creates the table and imports accessible legacy PDFs after verifying their hash. Previously lost files must be uploaded once again. Other uploads still require persistent filesystem storage.

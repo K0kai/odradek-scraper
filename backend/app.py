@@ -474,12 +474,15 @@ def process_auto_job(job_id: int) -> str:
         )
         return f"vaga {job_id}: vale a pena olhar (LinkedIn, score {score})"
 
+    from candidate.resume_storage import materialize_pdf
+    with connect() as db:
+        resume_path = materialize_pdf(db, resume, RESUMES_DIR)
     ok, detail = apply_via_email(
         connect,
         job,
         cfg,
         cover_letter=cover_body,
-        resume_path=resume["stored_path"],
+        resume_path=resume_path,
         resume_id=int(resume["id"]),
         cover_letter_id=cover_id,
         smtp_password=secret_get("smtp_password"),

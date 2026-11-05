@@ -19,6 +19,7 @@ TABLE_ORDER = (
     "ai_decisions",
     "cover_letters",
     "resumes",
+    "resume_files",
     "form_field_rules",
     "applications",
     "qpid_application_attempts",
@@ -63,6 +64,8 @@ def main() -> int:
         with psycopg.connect(database_url, row_factory=dict_row) as target:
             from web.qpid_applications import ensure_tables
             ensure_tables(target)
+            from candidate.resume_storage import ensure_table as ensure_resume_files
+            ensure_resume_files(target)
             with target.cursor() as cur:
                 for table in tables:
                     if table in REPLACED_TABLES:
@@ -119,6 +122,11 @@ def main() -> int:
                             (table,),
                         )
                     print(f"{table}: copied {len(rows)} row(s)")
+
+            # Older SQLite databases have only PDF paths; import surviving files too.
+            from candidate.resume_storage import backfill
+            from data.dbutil import PostgresConnection
+            backfill(PostgresConnection(target), str(source_path.parent / "resumes"))
 
         print("SQLite data migration to Neon completed.")
         return 0

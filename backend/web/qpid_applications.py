@@ -1,11 +1,10 @@
 """Qpid application contract v2. Register under the existing token middleware."""
-from pathlib import Path
 import hashlib
 import json
 import re
 from urllib.parse import urlsplit
 from fastapi import Body, Query
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 
 def ensure_tables(db):
@@ -87,10 +86,15 @@ def register(api, core):
             resume = get_resume(db, language)
         if not resume:
             return error("Currículo não cadastrado neste idioma.", 404)
-        target = Path(resume["stored_path"]).resolve()
-        if not target.is_relative_to(Path(RESUMES_DIR).resolve()) or not target.is_file() or target.stat().st_size > 15 * 1024 * 1024:
+        from candidate.resume_storage import read_pdf
+        try:
+            with core.connect() as db:
+                content = read_pdf(db, resume, RESUMES_DIR)
+        except (OSError, ValueError):
             return error("Arquivo de currículo indisponível.", 404)
-        return FileResponse(target, media_type="application/pdf", filename="curriculo.pdf")
+        return Response(content, media_type="application/pdf", headers={
+            "Content-Disposition": 'attachment; filename="curriculo.pdf"', "Cache-Control": "no-store"
+        })
 
     @api.post("/api/qpid/applications/{job_id}/attempt")
     def reserve(job_id: int, body: dict = Body(...)):

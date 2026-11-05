@@ -8,6 +8,7 @@ from data.dbutil import open_connection, using_postgres
 from jobs.form_rules import ensure_default_rules
 from jobs.copilot_asks import ensure_table as ensure_copilot_asks
 from paths import DB_PATH, RESUMES_DIR
+from candidate.resume_storage import ensure_table as ensure_resume_files, backfill as backfill_resume_files
 from web.panel_log import ensure_log_table
 
 
@@ -150,6 +151,8 @@ def initialize() -> None:
                     "Neon schema is incomplete. Run the PostgreSQL schema SQL in the Neon console; "
                     "missing tables: " + ", ".join(missing)
                 )
+            ensure_resume_files(db)
+            backfill_resume_files(db, RESUMES_DIR)
             for key, value in DEFAULT_SETTINGS.items():
                 db.execute(
                     "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING",
@@ -214,6 +217,8 @@ def initialize() -> None:
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         )""")
+        ensure_resume_files(db)
+        backfill_resume_files(db, RESUMES_DIR)
         resume_cols = {row["name"] for row in db.execute("PRAGMA table_info(resumes)")}
         if "analysis_status" not in resume_cols:
             db.execute("ALTER TABLE resumes ADD COLUMN analysis_status TEXT NOT NULL DEFAULT 'none'")
