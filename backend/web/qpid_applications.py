@@ -52,8 +52,10 @@ def register(api, core):
             letter = db.execute("SELECT body FROM cover_letters WHERE job_id=?", (job_id,)).fetchone()
         resolved, facts = [], []
 
-        def append(identifier, aliases, value, source, kind="fact", scope="profile"):
+        def append(identifier, aliases, value, source, kind="fact", scope="profile", source_only=False):
             item = {"id": identifier, "aliases": aliases, "value": str(value), "source": source, "kind": kind, "language": language, "scope": scope}
+            if source_only:
+                item["sourceOnly"] = True
             item["version"] = digest(item)
             resolved.append(item)
             facts.append(dict(item))
@@ -73,6 +75,19 @@ def register(api, core):
             append("candidate:first_name", ["first name", "primeiro nome"], name[0], "candidate_name")
             if len(name) > 1:
                 append("candidate:last_name", ["last name", "sobrenome"], " ".join(name[1:]), "candidate_name")
+        # Uploaded resume text is evidence, never a direct autofill rule or an AI summary.
+        if resume and str(resume["extracted_text"] or "").strip():
+            text = str(resume["extracted_text"]).strip()
+            chunks, chunk = [], ""
+            for word in text.split():
+                if len(chunk) + len(word) + 1 > 900 and chunk:
+                    chunks.append(chunk)
+                    chunk = ""
+                chunk = (chunk + " " + word).strip()
+            if chunk:
+                chunks.append(chunk)
+            for index, chunk in enumerate(chunks):
+                append(f"resume:{language}:excerpt:{index}", [f"Trecho do currículo enviado ({language}) #{index + 1}"], chunk, "uploaded-resume", source_only=True)
         resume_version = digest(dict(resume)) if resume else None
         return {"contract_version": 2, "context_version": digest([facts, resume_version]), "job": dict(row), "rules": resolved, "profile": {"schema": 1, "version": digest([fact for fact in facts if fact["scope"] == "profile"]), "facts": facts}, "resume": bool(resume), "resume_meta": {"id": dict(resume).get("id"), "language": language, "version": resume_version} if resume else None, "language": language}
 

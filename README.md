@@ -92,3 +92,5 @@ Antes de qualquer push: `git status` e confirme que não há dados pessoais, cur
 
 Uso educacional / estudo. Sem licença de redistribuição comercial definida.  
 Se for bifurcar o código, mantenha os avisos deste README.
+
+O contexto de candidatura do Qpid inclui trechos do texto extraído do currículo enviado, identificados como `sourceOnly`. Eles servem como evidência para rascunhos e sugestões revisáveis, não como regras para copiar o texto inteiro em campos. O cliente seleciona trechos relevantes para cada grupo de perguntas e mantém decisões de consentimento, cidadania e disponibilidade individuais.

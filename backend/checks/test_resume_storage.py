@@ -143,6 +143,21 @@ class ResumeStorageTests(unittest.TestCase):
         self.assertEqual(response.status_code,404)
         self.assertEqual(json.loads(response.body)["error"],"Arquivo de currículo indisponível.")
 
+    def test_qpid_exposes_uploaded_text_as_evidence_without_binary_or_generated_summary(self):
+        self.upload()
+        with self.connect() as db:
+            db.execute("UPDATE resumes SET analysis_summary='DO NOT USE GENERATED SUMMARY'")
+            db.execute("INSERT INTO jobs(id,source,title,url,first_seen_at,fingerprint) VALUES(1,'test','Test','https://example.com/job','now','unique')")
+        api=FastAPI();register(api,types.SimpleNamespace(connect=self.connect,settings=lambda:{}))
+        endpoint=next(route.endpoint for route in api.routes if getattr(route,"path","")=="/api/qpid/applications/{job_id}")
+        context=endpoint(1,"pt")
+        evidence=[rule for rule in context["rules"] if rule.get("sourceOnly")]
+        self.assertTrue(evidence)
+        self.assertIn("Synthetic candidate",evidence[0]["value"])
+        self.assertNotIn("DO NOT USE GENERATED SUMMARY",json.dumps(evidence))
+        self.assertEqual(len(context["rules"]),len(context["profile"]["facts"]))
+        json.dumps(context)
+
     def test_postgres_schema_uses_bytea_with_foreign_key(self):
         statements=[]
         ensure_table(types.SimpleNamespace(execute=lambda sql: statements.append(sql)))
