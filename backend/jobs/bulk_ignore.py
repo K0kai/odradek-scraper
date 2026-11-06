@@ -4,7 +4,7 @@ from datetime import date
 from jobs.job_filters import _worth_match_expr, worth_date_bounds_utc
 
 
-FIELDS = ("country", "found_from", "found_to", "posted_from", "posted_to", "match_min", "match_max")
+FIELDS = ("job_id", "country", "found_from", "found_to", "posted_from", "posted_to", "match_min", "match_max")
 DATE_FIELDS = ("found_from", "found_to", "posted_from", "posted_to")
 
 
@@ -15,6 +15,8 @@ def criteria_from_body(body: dict) -> dict:
     if any(not isinstance(value, str) for value in values.values()) or type(body.get("all", False)) is not bool:
         raise ValueError("Filtros inválidos.")
     values = {key: value.strip() for key, value in values.items()}
+    if values["job_id"] and (not values["job_id"].isdigit() or not 1 <= int(values["job_id"]) <= 999_999_999):
+        raise ValueError("O ID da vaga deve ser um número positivo.")
     if len(values["country"]) > 100:
         raise ValueError("Nome do país muito longo.")
     for key in DATE_FIELDS:
@@ -44,6 +46,9 @@ def criteria_from_body(body: dict) -> dict:
 def _where(criteria: dict) -> tuple[str, list[object]]:
     clauses = ["status = 'worth'"]
     params: list[object] = []
+    if criteria["job_id"]:
+        clauses.append("id = ?")
+        params.append(int(criteria["job_id"]))
     if criteria["country"]:
         country = criteria["country"].lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         clauses.append("LOWER(location) LIKE ? ESCAPE '\\'")
