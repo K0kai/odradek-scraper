@@ -171,6 +171,7 @@ def jobs(page: int = 1, page_size: int = 15, status: str = "worth", min_match: i
         return JSONResponse({"error": "Parâmetros de filtro inválidos"}, status_code=400)
 
 
+@api.post("/api/qpid/jobs/bulk-ignore/preview")
 @api.post("/api/jobs/bulk-ignore/preview")
 def bulk_ignore_preview(body: dict = Body(...)):
     try:
@@ -182,6 +183,7 @@ def bulk_ignore_preview(body: dict = Body(...)):
     return {"count": count}
 
 
+@api.post("/api/qpid/jobs/bulk-ignore/apply")
 @api.post("/api/jobs/bulk-ignore/apply")
 def bulk_ignore_apply(body: dict = Body(...)):
     try:
