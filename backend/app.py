@@ -1842,10 +1842,11 @@ class Collector:
         location_terms = terms(cfg.get("locations", ""))
         sources = [value.strip().casefold() for value in cfg.get("sources", "").split(",") if value.strip()]
         found = 0
+        limit_reached = False
         errors: list[str] = []
         self._set_progress("Buscando vagas…", 0)
         for source in sources:
-            if self.stop_event.is_set():
+            if self.stop_event.is_set() or limit_reached:
                 break
             provider = PROVIDERS.get(source)
             if not provider:
@@ -1860,6 +1861,9 @@ class Collector:
                     received += 1
                     if self.stop_event.is_set():
                         break
+                    if self.max_apply and found >= self.max_apply:
+                        limit_reached = True
+                        break
                     if not matches_collection_preferences(job, keyword_terms, location_terms):
                         continue
                     if not job["url"] or not job["title"]:
@@ -1872,6 +1876,11 @@ class Collector:
                     found += inserted
                     if inserted:
                         self._set_progress(f"Consultando {source}… {found} vaga(s) nova(s) salva(s) nesta execução.", found)
+                        if self.max_apply and found >= self.max_apply:
+                            limit_reached = True
+                            break
+                if limit_reached and hasattr(jobs, "close"):
+                    jobs.close()  # impede que o gerador inicie novos lotes pagos
                 log_event("info", "collector", f"{source}: {received} anúncio(s) recebidos antes dos filtros.")
             except Exception as exc:  # keep other sources running if one is unavailable
                 LOG.exception("Falha ao consultar %s", source)
@@ -1886,7 +1895,7 @@ class Collector:
         elif not self.stop_event.is_set():
             log_event("info", "auto-apply", "auto_apply desligado; triagem automática ignorada neste ciclo.")
         finished = now_iso()
-        message = f"Busca concluída: {found} vaga(s) nova(s)." + (" Avisos: " + "; ".join(errors) if errors else "")
+        message = f"Busca concluída: {found} vaga(s) nova(s)." + (f" Limite de {self.max_apply} atingido; coleta encerrada." if limit_reached else "") + (" Avisos: " + "; ".join(errors) if errors else "")
         if apply_note:
             message += f" Auto-apply: {apply_note}"
         log_event("success" if not errors else "warning", "collector", message)
