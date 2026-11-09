@@ -28,7 +28,7 @@ def register(api, core):
 
     @api.get("/api/qpid/capabilities")
     def capabilities():
-        return {"version": 2, "application_contract": 2, "features": ["profile-facts-v1", "application-reservation-v1", "application-result-v1"]}
+        return {"version": 2, "application_contract": 2, "features": ["profile-facts-v1", "application-reservation-v1", "application-result-v1", "collector-apply-limit-v1"]}
 
     @api.get("/api/qpid/applications")
     def candidates(limit: int = Query(30, ge=1, le=100)):

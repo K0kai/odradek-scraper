@@ -1,6 +1,7 @@
 """HTTP API and static frontend for Odradek."""
 from __future__ import annotations
 
+import json
 import logging
 import hmac
 import os
@@ -360,8 +361,12 @@ def autofill_rules():
 
 @api.post("/api/collector/{action}")
 def collector_action(action: str):
+    return _collector_action(action)
+
+
+def _collector_action(action: str, max_apply: int | None = None):
     if action == "start":
-        started = core.collector.start()
+        started = core.collector.start(max_apply)
         notice = "Coleta iniciada." if started else "A coleta já está em execução."
     elif action == "stop":
         core.collector.stop()
@@ -682,8 +687,20 @@ def qpid_logs(limit: int = Query(30, ge=1, le=500), position: str = Query("fim",
 
 
 @api.post("/api/qpid/collector/{action}")
-def qpid_collector(action: str):
-    return collector_action(action)
+async def qpid_collector(action: str, request: Request):
+    max_apply = None
+    if action == "start":
+        raw = await _bounded_body(request, max_bytes=1024)
+        if raw.strip():
+            try:
+                body = json.loads(raw)
+            except ValueError:
+                return _error("Corpo inválido")
+            value = body.get("max_apply") if isinstance(body, dict) else None
+            if value is not None and (type(value) is not int or not 1 <= value <= 500):
+                return _error("max_apply deve ser um inteiro de 1 a 500")
+            max_apply = value
+    return _collector_action(action, max_apply)
 
 
 from web.qpid_applications import register as register_qpid_applications

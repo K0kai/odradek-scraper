@@ -508,13 +508,18 @@ def process_auto_job(job_id: int) -> str:
     return f"vaga {job_id}: aplicada via {channel} — {detail}"
 
 
-def enqueue_new_jobs_for_triage() -> str:
-    """Enfileira vagas com status 'new' para triagem IA. Não exige auto_apply."""
+def enqueue_new_jobs_for_triage(limit: int | None = None) -> str:
+    """Enfileira vagas com status 'new' para triagem IA. Não exige auto_apply.
+
+    `limit` restringe quantas vagas são enfileiradas; as demais continuam 'new'."""
     cfg = settings()
     with connect() as db:
         rows = db.execute("SELECT id FROM jobs WHERE status='new' ORDER BY id ASC").fetchall()
     if not rows:
         return "nenhuma vaga nova para enfileirar"
+    remaining = max(len(rows) - limit, 0) if limit is not None else 0
+    if limit is not None:
+        rows = rows[:limit]
     queued = 0
     for row in rows:
         job_id = int(row["id"])
@@ -526,12 +531,15 @@ def enqueue_new_jobs_for_triage() -> str:
             )
         queued += 1
     workers = cfg.get("queue_max_workers", "3")
-    return f"{queued} vaga(s) enfileirada(s) para triagem (até {workers} worker(s) em paralelo)"
+    note = f"{queued} vaga(s) enfileirada(s) para triagem (até {workers} worker(s) em paralelo)"
+    if remaining:
+        note += f"; limite atingido, {remaining} vaga(s) nova(s) ficaram para a próxima execução"
+    return note
 
 
-def process_auto_apply_batch() -> str:
+def process_auto_apply_batch(limit: int | None = None) -> str:
     """Usado pelo ciclo de coleta quando auto_apply=1; delega ao enqueue manual."""
-    return enqueue_new_jobs_for_triage()
+    return enqueue_new_jobs_for_triage(limit)
 
 
 def handle_resume_analysis_job(payload: dict) -> str:
@@ -1759,6 +1767,7 @@ class Collector:
         self.last_run: str | None = None
         self.last_found = 0
         self.next_run_at: str | None = None
+        self.max_apply: int | None = None
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -1768,12 +1777,14 @@ class Collector:
                 "last_run": self.last_run,
                 "last_found": self.last_found,
                 "next_run_at": self.next_run_at,
+                "max_apply": self.max_apply,
             }
 
-    def start(self) -> bool:
+    def start(self, max_apply: int | None = None) -> bool:
         with self.lock:
             if self.thread and self.thread.is_alive():
                 return False
+            self.max_apply = max_apply
             self.stop_event.clear()
             self.state = "running"
             self.message = "Iniciando busca…"
@@ -1870,7 +1881,7 @@ class Collector:
         if not self.stop_event.is_set() and settings().get("auto_apply") == "1":
             self._set_progress(f"Triagem/candidatura automática… {found} vaga(s) nova(s).", found)
             log_event("info", "auto-apply", "Iniciando triagem/candidatura automática do ciclo.")
-            apply_note = process_auto_apply_batch()
+            apply_note = process_auto_apply_batch(self.max_apply)
             log_event("info", "auto-apply", apply_note or "Batch concluído sem mensagens.")
         elif not self.stop_event.is_set():
             log_event("info", "auto-apply", "auto_apply desligado; triagem automática ignorada neste ciclo.")
