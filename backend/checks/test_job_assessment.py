@@ -176,13 +176,18 @@ class AssessmentTests(unittest.TestCase):
 
     FOREIGN = {"job_country": "Germany", "job_country_quote": "Located in Germany"}
 
-    def test_foreign_remote_job_needs_a_verified_open_to_foreigners_guarantee(self):
+    def test_foreign_remote_job_is_not_blocked_when_the_posting_is_silent_about_foreigners(self):
         open_ = {**self.FOREIGN, "foreign_eligibility": "open_to_candidate", "eligibility_quote": "work from anywhere"}
         self.assertEqual(self.geo(open_)[0], [])
-        silent = self.geo(self.FOREIGN)[0]
-        self.assertTrue(any("sem garantia" in b for b in silent))
+        remote = {**self.FOREIGN, "workplace": "remote", "workplace_quote": "Modalidade: remoto"}
+        self.assertEqual(self.geo(remote)[0], [])  # remoto no exterior sem dizer nada sobre estrangeiros
+        self.assertEqual(self.geo(self.FOREIGN)[0], [])  # nem o modelo de trabalho foi dito
         invented = self.geo({**open_, "eligibility_quote": "everyone is welcome to apply"})[0]
-        self.assertTrue(any("sem garantia" in b for b in invented))  # citação inventada cai para "não informado"
+        self.assertEqual(invented, [])  # citação inventada cai para "não informado", que também passa
+
+    def test_foreign_job_with_a_quoted_restriction_still_blocks(self):
+        restricted = {**self.FOREIGN, "foreign_eligibility": "restricted", "eligibility_quote": "Trabalho presencial"}
+        self.assertTrue(any("restrita" in b for b in self.geo(restricted)[0]))
 
     def test_foreign_hybrid_or_onsite_job_is_blocked_even_when_open_to_foreigners(self):
         stated = {**self.FOREIGN, "workplace": "hybrid", "workplace_quote": "Hybrid in Berlin",

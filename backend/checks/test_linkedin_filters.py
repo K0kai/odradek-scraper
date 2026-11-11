@@ -92,6 +92,33 @@ class LegacyPromptMigrationTests(AppDbCase):
         self.assertEqual(repository.settings()["linkedin_filter_prompt"], "my own single-filter prompt")
 
 
+class LegacySelectionPromptTests(AppDbCase):
+    LEGACY = ("You are a fair, practical job-fit evaluator.\n- Reject only for a genuine hard blocker.\n"
+              "- Base the score and recommendation on the optimism calibration supplied below.")
+
+    def migrate(self):
+        with repository.connect() as db:
+            db.execute("DELETE FROM settings WHERE key='selection_prompt_v2_migrated'")
+        repository.initialize()
+
+    def test_legacy_saved_prompt_is_reset_once_and_later_custom_prompts_survive(self):
+        repository.set_setting("job_selection_prompt", self.LEGACY)
+        self.migrate()
+        self.assertEqual(repository.settings()["job_selection_prompt"], "")
+        repository.set_setting("job_selection_prompt", self.LEGACY)
+        repository.initialize()  # já migrado: não apaga de novo
+        self.assertEqual(repository.settings()["job_selection_prompt"], self.LEGACY)
+
+    def test_custom_prompt_without_the_legacy_line_is_kept(self):
+        repository.set_setting("job_selection_prompt", "Prefiro vagas de backend com Python.")
+        self.migrate()
+        self.assertEqual(repository.settings()["job_selection_prompt"], "Prefiro vagas de backend com Python.")
+
+    def test_default_prompt_covers_entry_level_evidence_and_silence_is_not_a_restriction(self):
+        self.assertIn("internships and entry-level", app.DEFAULT_JOB_SELECTION_PROMPT)
+        self.assertIn("Silence in the posting", app.DEFAULT_JOB_SELECTION_PROMPT)
+
+
 def kw(phrase, *ids):
     return {"phrase": phrase, "evidence_ids": list(ids)}
 

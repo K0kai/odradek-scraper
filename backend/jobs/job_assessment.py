@@ -375,9 +375,11 @@ def _country_key(value: object) -> str:
 
 
 def geo_blocks(stated: dict, job: dict, cfg: dict, language: str = "") -> list[str]:
-    """Exterior: só remoto e aberto a estrangeiros. Presencial/híbrido: só na cidade de residência.
+    """Exterior: bloqueia presencial/híbrido citado ou restrição citada a candidatos de fora.
+    Presencial/híbrido no país: só na cidade de residência.
 
-    Tudo vem de afirmações citadas e verificadas da vaga; sem garantia explícita no exterior, bloqueia.
+    Tudo vem de afirmações citadas e verificadas da vaga. Vaga no exterior que não diz nada sobre aceitar
+    estrangeiros (ou sobre o modelo de trabalho) não é bloqueada: só uma restrição explícita bloqueia.
     """
     if not geo_enabled(cfg):
         return []
@@ -398,10 +400,10 @@ def geo_blocks(stated: dict, job: dict, cfg: dict, language: str = "") -> list[s
     else:
         foreign = language not in ("", "pt")  # sem país citado: vaga em outro idioma é tratada como exterior
     if foreign:
-        if workplace != "remote":
+        # Só bloqueia o que a vaga afirma (presencial/híbrido citado, ou restrição citada acima).
+        # Silêncio sobre estrangeiros ou sobre o modelo de trabalho não é recusa.
+        if workplace in ("onsite", "hybrid"):
             return ["vaga no exterior não remota"]
-        if eligibility != "open_to_candidate":
-            return ["vaga no exterior sem garantia explícita de candidatura estrangeira"]
         return []
     if workplace == "remote":
         return []

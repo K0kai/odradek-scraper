@@ -171,6 +171,8 @@ DEFAULT_JOB_SELECTION_PROMPT = """You are a fair, practical job-fit evaluator. J
 - Give credit to transferable skills and adjacent experience only when the resume proves the underlying capability.
 - Treat missing secondary or preferred tools as a modest gap, not an automatic rejection.
 - Requirements that contradict the posting itself (e.g. an internship asking for many years of experience) should be disregarded.
+- For internships and entry-level roles, judge potential at the level the posting itself describes: an in-progress degree and the portfolio projects cited in the profile count as evidence of skill.
+- Silence in the posting about something (for example whether foreigners may apply, or the work model) is not a restriction. Treat a restriction as real only when the posting states it.
 - Do not invent employers, degrees, skills, or experience absent from the candidate information.
 """
 

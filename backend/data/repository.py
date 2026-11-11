@@ -194,6 +194,27 @@ def migrate_filter_prompts(db) -> None:
     )
 
 
+# Frase do prompt antigo que manda basear o score numa "calibração de otimismo" que a triagem v2 não envia.
+_LEGACY_SELECTION_PROMPT_MARKER = "optimism calibration supplied below"
+
+
+def migrate_selection_prompt(db) -> None:
+    """Uma vez: o prompt de seleção antigo salvo como 'personalizado' volta ao padrão atual.
+
+    Ele passava por cima do padrão novo e pedia à IA para decidir/rejeitar, o que na v2 é do código.
+    """
+    marker = db.execute("SELECT value FROM settings WHERE key='selection_prompt_v2_migrated'").fetchone()
+    if marker and marker["value"] == "1":
+        return
+    row = db.execute("SELECT value FROM settings WHERE key='job_selection_prompt'").fetchone()
+    if row and _LEGACY_SELECTION_PROMPT_MARKER in (row["value"] or ""):
+        db.execute("UPDATE settings SET value='' WHERE key='job_selection_prompt'")
+    db.execute(
+        "INSERT INTO settings(key,value) VALUES('selection_prompt_v2_migrated','1') "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+    )
+
+
 def connect() -> sqlite3.Connection:
     return open_connection(str(DB_PATH), timeout=60.0)
 
@@ -238,6 +259,7 @@ def initialize() -> None:
             ensure_new_columns(db, postgres=True)
             migrate_scoring_v2_defaults(db)
             migrate_filter_prompts(db)
+            migrate_selection_prompt(db)
             ensure_log_table(db)
         return
 
@@ -351,6 +373,7 @@ def initialize() -> None:
         ensure_new_columns(db, postgres=False)
         migrate_scoring_v2_defaults(db)
         migrate_filter_prompts(db)
+        migrate_selection_prompt(db)
         ensure_log_table(db)
 
 
