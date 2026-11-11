@@ -768,9 +768,10 @@ The main area is IT and programming: the area where the candidate has the most v
 LinkedIn experience codes (f_E): 1 Internship, 2 Entry, 3 Associate, 4 Mid-Senior, 5 Director, 6 Executive.
 
 KEYWORD RULES (mandatory):
-- `keywords` holds 1 or 2 phrases that all name the SAME role: the title plus at most ONE equivalent variant of that same title (for example its Portuguese/English version or its most common synonym). Never a second, different role. Never a bare skill ("Python", "SQL") and never an intersection of unrelated skills.
-- Pick the role with the most dated months and/or the current role. Add ONE central stack qualifier (e.g. "Backend Developer Python") only when that skill has 12+ months of use or is used in the current role.
-- EVERY phrase must list `evidence_ids`, and at least one must be a ROLE id ([R1]) or one of its responsibilities ([R1.2]). Phrases that do not are discarded by the program.
+- `keywords` holds 1 or 2 phrases that all name the SAME role: the title plus at most ONE equivalent variant of that same title (for example its Portuguese/English version or its most common synonym). Never a second, different role and never an intersection of unrelated skills.
+- NO PROGRAMMING LANGUAGE, FRAMEWORK OR TOOL in any phrase (no "C#", "Python", "Java", "ASP.NET Core", "React", "SQL", "AWS"...). With AI-assisted development, the specific language matters little for this candidate; what defines the career is logical reasoning, problem solving and knowledge of software architecture (system design, APIs, data modeling, integrations, automation). Search by stack-agnostic role title ("Software Engineer", "Software Developer", "Desenvolvedor de Software", "Backend Engineer", "Full Stack Developer"...). Phrases that name a language, framework or tool found in the profile are discarded by the program.
+- Choose the role family from what the dated roles show the candidate DOES (building, designing and automating software and integrations), not from the language used. A role whose title is not a developer title but whose responsibilities are software development or automation can anchor the filter; explain it in `reason`.
+- EVERY phrase must list `evidence_ids`, and at least one must be a ROLE id ([R1]) or one of its responsibilities ([R1.2]). Phrases that do not are discarded by the program. Prefer responsibilities that show reasoning, architecture, integrations or automation.
 - `anchor_role_ids`: the role ids that prove this career line.
 - Do NOT invent employers, titles or skills. No fixed seniority-to-code mapping and no universal years cutoff: choose `experience_levels` from the computed months of the anchor roles and explain the level and the evidence in `reason` (Portuguese).
 - Location and work model are NOT yours to choose (the program derives them); do not mention them.
@@ -792,7 +793,7 @@ How to choose (use the profile's TRANSFERABLE CAPABILITIES, roles and skills as 
 - Think function x sector. Functions where IT plus an administrative background is a differentiator: IT support/helpdesk, systems/ERP-oriented administrative analyst, process/automation analyst, data/BI assistant, back-office with systems, implementation or support of business software. Sectors that tend to hold up in downturns: healthcare, public sector and outsourced public services, education, utilities/energy, logistics/supply chain, insurance, accounting/tax, back-office of financial services. These lists are only illustrative: choose what THIS profile evidences and justify the choice.
 - The candidate's hint for the backup area (a direction, not an order; ignore it if the profile gives no evidence for it): {area_hint}
 - The MAIN filter already covers: {main_filter}. Choose a DIFFERENT role family; do not repeat its titles.
-- `keywords` holds 1 or 2 phrases that all name the SAME role (the title plus at most one equivalent variant), optionally with a sector qualifier. Never a bare skill.
+- `keywords` holds 1 or 2 phrases that all name the SAME role (the title plus at most one equivalent variant), optionally with a sector qualifier. Never a bare skill, and never a programming language, framework or tool name (phrases that name one found in the profile are discarded).
 - EVERY phrase must list `evidence_ids`, and at least one must be a TRANSFERABLE capability ([T1]) or a role/responsibility ([R1], [R1.2]). Phrases without valid ids are discarded.
 - `anchor_role_ids`: the roles whose experience transfers.
 - Fill `sector` (the target sector) and `resilience_reason` (why this sector/function is comparatively resilient AND which profile evidence transfers). Stay qualitative; no statistics you cannot support.
@@ -1018,21 +1019,17 @@ def _verify_filter(raw: dict, profile: dict, slot: str, avoid: tuple[str, ...] =
     index = evidence_index(profile)
     derived = profile.get("derived", {})
     roles = {role["id"]: role for role in profile.get("roles", [])}
-    current = set(derived.get("current_role_ids", []))
-    skill_stats = derived.get("skills", {})
     avoid_keys = {item.casefold() for item in avoid}
     wanted_kinds = {"role", "responsibility"} if slot == "main" else {"transferable", "role", "responsibility"}
 
-    def weak_skill(phrase: str) -> str:
+    def named_technology(phrase: str) -> str:
+        """Linguagem, framework ou ferramenta do perfil citada na frase: o filtro é por cargo, não por stack."""
         norm = f" {normalize_text(phrase)} "
         for skill in profile.get("skills", []):
             if skill.get("category") not in _TECH_SKILL_CATEGORIES:
                 continue
             name = normalize_text(skill.get("name", ""))
-            if not name or f" {name} " not in norm:
-                continue
-            stat = skill_stats.get(skill["id"], {})
-            if stat.get("months", 0) < 12 and not (set(stat.get("role_ids", [])) & current):
+            if name and f" {name} " in norm:
                 return skill["name"]
         return ""
 
@@ -1051,8 +1048,8 @@ def _verify_filter(raw: dict, profile: dict, slot: str, avoid: tuple[str, ...] =
             reason = "repete o filtro principal"
         elif not {index[i]["kind"] for i in ids} & wanted_kinds:
             reason = "não cita um cargo do currículo" if slot == "main" else "não cita capacidade transferível nem cargo"
-        elif (skill := weak_skill(phrase)):
-            reason = f"qualificador '{skill}' sem 12 meses de uso comprovado"
+        elif (skill := named_technology(phrase)):
+            reason = f"cita a tecnologia '{skill}'; o filtro é pelo cargo, não pela stack"
         if reason:
             log_event("info", "apify", f"Keyword descartada ({reason}): {phrase}")
             continue

@@ -76,6 +76,22 @@ class MigrationTests(AppDbCase):
         self.assertEqual(repository.settings()["minimum_match_score"], "65")
 
 
+class LegacyPromptMigrationTests(AppDbCase):
+    LEGACY = "You design multiple LinkedIn Jobs search filters.\nMULTIPLE FILTERS (mandatory):\n- 4 to 8"
+
+    def test_saved_multi_filter_prompts_are_reset_once_and_later_custom_prompts_survive(self):
+        for key in ("linkedin_filter_prompt", "transferable_prompt"):
+            repository.set_setting(key, self.LEGACY)
+        with repository.connect() as db:
+            db.execute("DELETE FROM settings WHERE key='filter_prompts_v3_migrated'")
+        repository.initialize()
+        cfg = repository.settings()
+        self.assertEqual((cfg["linkedin_filter_prompt"], cfg["transferable_prompt"]), ("", ""))
+        repository.set_setting("linkedin_filter_prompt", "my own single-filter prompt")
+        repository.initialize()
+        self.assertEqual(repository.settings()["linkedin_filter_prompt"], "my own single-filter prompt")
+
+
 def kw(phrase, *ids):
     return {"phrase": phrase, "evidence_ids": list(ids)}
 
@@ -109,13 +125,20 @@ class FilterVerificationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.verify(raw_filter([kw("Quantum Chef", "R99"), kw("Outro", [])]))
 
-    def test_stack_qualifier_needs_twelve_months_or_current_use(self):
-        profile = grounded_profile()
-        profile["skills"].append({"id": "S9", "name": "Rust", "category": "language", "canonical": "rust", "quotes": []})
-        profile["derived"]["skills"]["S9"] = {"months": 3, "role_ids": ["R1"], "last_used": "2021-12", "canonical": "rust"}
-        raw = raw_filter([kw("Backend Developer Rust", "R2"), kw("Backend Developer Python", "R2")])
-        out = app._verify_filter(raw, profile, "main")
-        self.assertEqual(out["keywords"], ["Backend Developer Python"])  # Python: 59 meses, cargo atual
+    def test_phrases_never_name_a_language_framework_or_tool_even_with_long_use(self):
+        raw = raw_filter([kw("Backend Developer Python", "R2"), kw("Python Developer", "R2"),
+                          kw("Software Engineer", "R2"), kw("Desenvolvedor de Software", "R2.1")])
+        out = self.verify(raw)
+        self.assertEqual(out["keywords"], ["Software Engineer", "Desenvolvedor de Software"])  # Python: 59 meses, mas é stack
+
+    def test_secondary_phrases_also_exclude_named_technologies(self):
+        out = self.verify(raw_filter([kw("Python Support Analyst", "T1"), kw("IT Support Analyst", "T1")]), slot="secondary")
+        self.assertEqual(out["keywords"], ["IT Support Analyst"])
+
+    def test_default_main_prompt_asks_for_one_stack_agnostic_role(self):
+        self.assertIn("NO PROGRAMMING LANGUAGE, FRAMEWORK OR TOOL", app.DEFAULT_LINKEDIN_FILTER_PROMPT)
+        self.assertIn("architecture", app.DEFAULT_LINKEDIN_FILTER_PROMPT)
+        self.assertNotIn("stack qualifier", app.DEFAULT_LINKEDIN_FILTER_PROMPT)
 
     def test_career_months_and_anchor_roles_come_from_code_not_from_the_model(self):
         out = self.verify(raw_filter([kw("Backend Developer", "R2.1")], career_months=999, anchor_role_ids=["R1", "R42"]))

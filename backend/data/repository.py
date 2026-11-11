@@ -166,6 +166,27 @@ def migrate_scoring_v2_defaults(db) -> None:
     )
 
 
+_LEGACY_FILTER_PROMPT_MARKERS = ("MULTIPLE FILTERS (mandatory)", "KEYWORD BREADTH (mandatory)", "Produce 4-8 separate filters")
+
+
+def migrate_filter_prompts(db) -> None:
+    """Uma vez: prompts salvos do modelo antigo (vários filtros, uma skill basta) viram o padrão novo.
+
+    O painel salvava o texto antigo como 'personalizado' e ele passava por cima do prompt novo.
+    """
+    marker = db.execute("SELECT value FROM settings WHERE key='filter_prompts_v3_migrated'").fetchone()
+    if marker and marker["value"] == "1":
+        return
+    for key in ("linkedin_filter_prompt", "transferable_prompt"):
+        row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        if row and any(m in (row["value"] or "") for m in _LEGACY_FILTER_PROMPT_MARKERS):
+            db.execute("UPDATE settings SET value='' WHERE key=?", (key,))
+    db.execute(
+        "INSERT INTO settings(key,value) VALUES('filter_prompts_v3_migrated','1') "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+    )
+
+
 def connect() -> sqlite3.Connection:
     return open_connection(str(DB_PATH), timeout=60.0)
 
@@ -209,6 +230,7 @@ def initialize() -> None:
             )
             ensure_new_columns(db, postgres=True)
             migrate_scoring_v2_defaults(db)
+            migrate_filter_prompts(db)
             ensure_log_table(db)
         return
 
@@ -321,6 +343,7 @@ def initialize() -> None:
             )
         ensure_new_columns(db, postgres=False)
         migrate_scoring_v2_defaults(db)
+        migrate_filter_prompts(db)
         ensure_log_table(db)
 
 
