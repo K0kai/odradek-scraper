@@ -9,56 +9,58 @@ import os
 import re
 import sqlite3
 from typing import Callable
-from urllib.error import HTTPError
-from urllib.parse import quote_plus
-from urllib.request import Request, urlopen
 
 
 class AiUnavailableError(RuntimeError):
     """Chave ausente, quota esgotada ou falha de autenticação/billing da IA."""
 
 
-def _record_usage(
-    provider: str,
-    model: str,
-    result: dict | None,
-    *,
-    ok: bool,
-    quota_error: bool,
-) -> None:
-    try:
-        from integrations.usage_tracker import try_record_ai_result
+class AiResponseError(AiUnavailableError):
+    """O modelo respondeu, mas com JSON inválido/truncado mesmo após retry.
 
-        try_record_ai_result(
-            provider=provider,
-            model=model,
-            result=result,
-            ok=ok,
-            quota_error=quota_error,
-        )
-    except Exception:
-        pass
+    Subclasse de AiUnavailableError: a fila tenta de novo em vez de bloquear a vaga.
+    """
+
+
+def _clean_pdf_pages(pages: list[str]) -> str:
+    """Preserva linhas/seções; remove cabeçalhos/rodapés repetidos e junta hifenização."""
+    page_lines = [
+        [re.sub(r" {2,}", " ", line.replace("\t", " ").replace(" ", " ")).strip() for line in (page or "").splitlines()]
+        for page in pages
+    ]
+    repeated: set[str] = set()
+    if len(page_lines) >= 3:
+        counts: dict[str, int] = {}
+        for lines in page_lines:
+            for line in {ln.casefold() for ln in lines if ln and len(ln) < 80}:
+                counts[line] = counts.get(line, 0) + 1
+        repeated = {line for line, n in counts.items() if n >= max(3, int(len(page_lines) * 0.6 + 0.999))}
+    merged: list[str] = []
+    for lines in page_lines:
+        for line in lines:
+            if line and line.casefold() in repeated:
+                continue
+            if (
+                line and merged and re.search(r"[A-Za-zÀ-ÿ]-$", merged[-1]) and re.match(r"[a-zà-ÿ]", line)
+            ):
+                merged[-1] = merged[-1][:-1] + line
+                continue
+            if not line and (not merged or not merged[-1]):
+                continue
+            merged.append(line)
+        if merged and merged[-1]:
+            merged.append("")
+    return "\n".join(merged).strip()
 
 
 def extract_pdf_text(path: str | BytesIO) -> str:
     from pypdf import PdfReader
 
     reader = PdfReader(path)
-    chunks: list[str] = []
-    for page in reader.pages:
-        chunks.append(page.extract_text() or "")
-    text = re.sub(r"\s+", " ", "\n".join(chunks)).strip()
-    if len(text) < 40:
+    text = _clean_pdf_pages([page.extract_text() or "" for page in reader.pages])
+    if len(re.sub(r"\s+", " ", text)) < 40:
         raise ValueError("Não foi possível extrair texto útil deste PDF. Use um PDF com texto selecionável.")
     return text[:50000]
-
-
-def file_sha256(path: str) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(65536), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def get_resume(db: sqlite3.Connection, language: str) -> sqlite3.Row | None:
@@ -68,57 +70,6 @@ def get_resume(db: sqlite3.Connection, language: str) -> sqlite3.Row | None:
 def resume_summaries(db: sqlite3.Connection) -> dict[str, str]:
     rows = db.execute("SELECT language, analysis_summary FROM resumes").fetchall()
     return {row["language"]: row["analysis_summary"] or "" for row in rows}
-
-
-def resume_match_snippets(db: sqlite3.Connection, *, max_chars: int = 3500) -> dict[str, str]:
-    """Trechos densos (skills/senioridade/headline) para a triagem de match."""
-    rows = db.execute(
-        "SELECT language, analysis_json, analysis_summary FROM resumes"
-    ).fetchall()
-    out: dict[str, str] = {}
-    for row in rows:
-        lang = row["language"]
-        parts: list[str] = []
-        try:
-            data = json.loads(row["analysis_json"] or "{}")
-        except json.JSONDecodeError:
-            data = {}
-        if isinstance(data, dict) and data:
-            headline = str(data.get("headline") or "").strip()
-            if headline:
-                parts.append(f"Headline: {headline}")
-            seniority = str(data.get("seniority") or "").strip()
-            years = str(data.get("years_of_experience") or "").strip()
-            if seniority or years:
-                parts.append(f"Seniority: {seniority or '—'} | Years: {years or '—'}")
-            for label, key in (
-                ("Technical skills", "technical_skills"),
-                ("Skills", "skills"),
-                ("Tools", "tools"),
-                ("Domains", "domains"),
-            ):
-                value = data.get(key)
-                if isinstance(value, list) and value:
-                    parts.append(f"{label}: " + ", ".join(str(v) for v in value[:50] if str(v).strip()))
-            experience = data.get("experience")
-            if isinstance(experience, list) and experience:
-                exp_bits = []
-                for item in experience[:8]:
-                    exp_bits.append(str(item)[:220])
-                if exp_bits:
-                    parts.append("Recent experience:\n- " + "\n- ".join(exp_bits))
-            loc = str(data.get("location_notes") or "").strip()
-            auth = str(data.get("work_authorization_notes") or "").strip()
-            if loc:
-                parts.append(f"Location notes: {loc}")
-            if auth:
-                parts.append(f"Work authorization: {auth}")
-        summary = (row["analysis_summary"] or "").strip()
-        if summary:
-            parts.append("Summary excerpt:\n" + summary[:1800])
-        text = "\n".join(parts).strip()
-        out[lang] = text[:max_chars] if text else summary[:max_chars]
-    return out
 
 
 def _experience_is_current(item: object) -> bool:
@@ -170,27 +121,42 @@ def _format_experience_item(item: object) -> str:
     return text
 
 
-def _ordered_experience(experience: object) -> list[object]:
-    """Mantém a ordem do currículo (em geral mais recente primeiro); sem reordenar por 'atual'."""
-    if not isinstance(experience, list) or not experience:
-        return []
-    return list(experience)
+_DOSSIER_LABELS = {
+    "pt": {
+        "headline": "Headline", "profile": "Perfil profissional", "level": "Senioridade",
+        "years": "Anos de experiência", "tech": "Competências técnicas", "tools": "Ferramentas e plataformas",
+        "soft": "Soft skills", "experience": "Experiência profissional (todas as funções)",
+        "projects": "Projetos e automações relevantes", "achievements": "Conquistas / resultados mensuráveis",
+        "education": "Formação", "certs": "Certificações", "languages": "Idiomas", "domains": "Domínios / indústrias",
+        "auth": "Notas de autorização de trabalho", "location": "Localidade / mobilidade", "coverage": "Cobertura da extração",
+    },
+    "en": {
+        "headline": "Headline", "profile": "Professional profile", "level": "Seniority",
+        "years": "Years of experience", "tech": "Technical skills", "tools": "Tools and platforms",
+        "soft": "Soft skills", "experience": "Professional experience (all roles)",
+        "projects": "Relevant projects and automations", "achievements": "Achievements / measurable results",
+        "education": "Education", "certs": "Certifications", "languages": "Languages", "domains": "Domains / industries",
+        "auth": "Work authorization notes", "location": "Location / mobility", "coverage": "Extraction coverage",
+    },
+}
 
 
 def compose_analysis_dossier(analysis: dict, language: str) -> str:
-    """Monta um dossiê longo e estruturado para match e visualização no painel."""
+    """Dossiê estruturado (rótulos no idioma do currículo). Experiência vem antes das listas de skills,
+    para que cortes por tamanho percam skills repetidas e não o histórico profissional."""
+    label = _DOSSIER_LABELS["pt" if language == "pt" else "en"]
     language_name = "Português" if language == "pt" else "English"
     lines: list[str] = []
     headline = str(analysis.get("headline") or analysis.get("summary") or "").strip()
     if headline:
-        lines.append(f"Headline: {headline}")
+        lines.append(f"{label['headline']}: {headline}")
     profile = str(analysis.get("professional_profile") or "").strip()
     if profile:
-        lines.append(f"Perfil profissional:\n{profile}")
+        lines.append(f"{label['profile']}:\n{profile}")
     seniority = str(analysis.get("seniority") or "").strip()
     years = str(analysis.get("years_of_experience") or "").strip()
     if seniority or years:
-        lines.append(f"Senioridade: {seniority or '—'} | Anos de experiência (declarados/inferíveis só do texto): {years or '—'}")
+        lines.append(f"{label['level']}: {seniority or '—'} | {label['years']}: {years or '—'}")
 
     def _section(title: str, value: object) -> None:
         if isinstance(value, list):
@@ -202,29 +168,26 @@ def compose_analysis_dossier(analysis: dict, language: str) -> str:
             if text_v:
                 lines.append(f"{title}:\n{text_v}")
 
-    _section("Competências técnicas", analysis.get("technical_skills") or analysis.get("skills"))
-    _section("Ferramentas e plataformas", analysis.get("tools"))
-    _section("Soft skills", analysis.get("soft_skills"))
-    exp_items = _ordered_experience(analysis.get("experience"))
+    exp_items = analysis.get("experience") if isinstance(analysis.get("experience"), list) else []
     if exp_items:
         formatted = [_format_experience_item(item) for item in exp_items]
         formatted = [f for f in formatted if f.strip()]
         if formatted:
-            lines.append(
-                "Experiência profissional (todas as funções — não omitir nenhuma):\n- "
-                + "\n- ".join(formatted)
-            )
-    _section("Projetos e automações relevantes", analysis.get("projects"))
-    _section("Conquistas / resultados mensuráveis", analysis.get("achievements"))
-    _section("Formação", analysis.get("education"))
-    _section("Certificações", analysis.get("certifications"))
-    _section("Idiomas", analysis.get("languages"))
-    _section("Domínios / indústrias", analysis.get("domains"))
-    _section("Notas de autorização de trabalho", analysis.get("work_authorization_notes"))
-    _section("Localidade / mobilidade", analysis.get("location_notes"))
+            lines.append(f"{label['experience']}:\n- " + "\n- ".join(formatted))
+    _section(label["tech"], analysis.get("technical_skills") or analysis.get("skills"))
+    _section(label["tools"], analysis.get("tools"))
+    _section(label["soft"], analysis.get("soft_skills"))
+    _section(label["projects"], analysis.get("projects"))
+    _section(label["achievements"], analysis.get("achievements"))
+    _section(label["education"], analysis.get("education"))
+    _section(label["certs"], analysis.get("certifications"))
+    _section(label["languages"], analysis.get("languages"))
+    _section(label["domains"], analysis.get("domains"))
+    _section(label["auth"], analysis.get("work_authorization_notes"))
+    _section(label["location"], analysis.get("location_notes"))
     coverage = str(analysis.get("coverage_notes") or "").strip()
     if coverage:
-        lines.append(f"Cobertura da extração:\n{coverage}")
+        lines.append(f"{label['coverage']}:\n{coverage}")
     dossier = "\n\n".join(lines).strip()
     if not dossier:
         dossier = headline or f"Análise sem conteúdo estruturado ({language_name})."
@@ -240,121 +203,38 @@ def analyze_resume_text(
     api_key: str,
     call_json: Callable[..., dict] | None = None,
 ) -> dict:
+    """Extrai o perfil canônico ancorado e devolve o formato legado de analysis_json.
+
+    A chave "_profile" carrega o perfil verificado (persistido em resumes.profile_json).
+    """
+    from candidate.resume_profile import (
+        PROFILE_SCHEMA, build_profile_prompt, ground_profile, legacy_analysis,
+    )
+
     language_name = "Portuguese" if language == "pt" else "English"
-    prompt = f"""You are extracting a COMPLETE structured profile from a resume written primarily in {language_name}.
-Be thorough: cover every role, every notable skill, tool, project, achievement, education item, and language that appears in the text.
-Do NOT invent employers, dates, skills, metrics, or claims that are not supported by the resume.
-If something is missing, use empty string or empty array — never guess.
-
-Ordering / emphasis rules:
-- List experience NEWEST FIRST. Mark ongoing roles with is_current=true and period ending in Present/Atual/Current.
-- In headline and professional_profile, cover the FULL arc: include BOTH current and recent past roles when both exist.
-  Do not write a profile that only mentions one employer if the resume has two substantial roles.
-  Emphasize by relevance/stack, not by which role has more metrics — keep both visible.
-- Keep ALL roles in the experience array; do not drop any.
-
-Return ONLY JSON with these keys:
-- headline (string, 1 sentence positioning statement in {language_name})
-- professional_profile (string, 2-5 paragraphs in {language_name} covering career arc, stacks, domains, and strengths — dense, specific, not generic)
-- summary (string, longer dossier-style summary in {language_name}, 1200-2500 characters if the resume supports it)
-- seniority (string)
-- years_of_experience (string, only if clearly stated or safely countable from dated roles; else "")
-- technical_skills (array of strings — exhaustive list of technologies/languages/frameworks mentioned)
-- tools (array of strings — IDEs, cloud, CI/CD, databases, OS, etc.)
-- soft_skills (array of strings — only if evidenced)
-- experience (array of objects OR detailed strings; prefer objects with keys: role, employer, period, is_current (boolean), responsibilities (array), highlights (array); newest first)
-- projects (array of strings — automations, systems, notable deliverables)
-- achievements (array of strings — quantified results when present)
-- education (array of strings)
-- certifications (array of strings)
-- languages (array of strings)
-- domains (array of strings — e.g. logistics, fintech, security)
-- work_authorization_notes (string)
-- location_notes (string)
-- coverage_notes (string, brief note on how complete the extraction is relative to the source text)
-
-Resume text:
-{text[:40000]}
-"""
+    prompt = build_profile_prompt(text, language_name)
     if call_json is not None:
-        data = call_json(provider, model, api_key, prompt)
+        raw = call_json(provider, model, api_key, prompt)
     else:
         if not api_key:
             raise AiUnavailableError("Configure a chave da API de IA antes de analisar o currículo.")
-        provider = provider.casefold().strip()
-        try:
-            if provider == "openai":
-                endpoint = "https://api.openai.com/v1/responses"
-                payload = json.dumps(
-                    {"model": model, "input": prompt, "text": {"format": {"type": "json_object"}}, "store": False, "max_output_tokens": 4500}
-                ).encode("utf-8")
-                headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-            elif provider == "gemini":
-                endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{quote_plus(model)}:generateContent?key={quote_plus(api_key)}"
-                payload = json.dumps(
-                    {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 4500, "responseMimeType": "application/json"}}
-                ).encode("utf-8")
-                headers = {"Content-Type": "application/json"}
-            else:
-                raise ValueError("Provedor de IA inválido.")
-            request = Request(endpoint, data=payload, headers=headers, method="POST")
-            with urlopen(request, timeout=120) as response:
-                result = json.loads(response.read().decode("utf-8"))
-        except HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")[:400]
-            quota = exc.code in {401, 403, 429} or "quota" in body.casefold() or "billing" in body.casefold()
-            _record_usage(provider, model, None, ok=False, quota_error=quota)
-            if quota:
-                raise AiUnavailableError(f"IA indisponível (HTTP {exc.code}).") from exc
-            raise RuntimeError(f"Falha ao analisar currículo (HTTP {exc.code}): {body}") from exc
-        except AiUnavailableError:
-            raise
-        except Exception as exc:
-            message = str(exc).casefold()
-            quota = "quota" in message or "insufficient" in message or "api key" in message
-            _record_usage(provider, model, None, ok=False, quota_error=quota)
-            if quota:
-                raise AiUnavailableError(f"IA indisponível: {exc}") from exc
-            raise
+        from integrations.ai_client import call_ai_json
 
-        _record_usage(provider, model, result if isinstance(result, dict) else None, ok=True, quota_error=False)
-
-        if provider == "openai":
-            raw = "\n".join(part.get("text", "") for item in result.get("output", []) for part in item.get("content", []) if part.get("type") == "output_text")
-        else:
-            raw = "\n".join(part.get("text", "") for item in result.get("candidates", []) for part in item.get("content", {}).get("parts", []))
-        data = json.loads(raw.strip())
-
-    if not isinstance(data, dict):
+        raw = call_ai_json(
+            prompt=prompt, schema=PROFILE_SCHEMA, provider=provider.casefold().strip(), model=model,
+            api_key=api_key, max_output_tokens=12000, thinking_budget=2048, timeout=180,
+        )
+    if not isinstance(raw, dict):
         raise RuntimeError("A análise do currículo não retornou JSON objeto.")
-    # Normalize experience objects to readable strings inside a copy used for dossier.
-    experience = data.get("experience") or []
-    if isinstance(experience, list):
-        normalized = []
-        for item in experience:
-            if isinstance(item, dict):
-                role = str(item.get("role") or "").strip()
-                employer = str(item.get("employer") or "").strip()
-                period = str(item.get("period") or "").strip()
-                resp = item.get("responsibilities") or []
-                highs = item.get("highlights") or []
-                bits = [b for b in (role, employer, period) if b]
-                head = " — ".join(bits) if bits else "Experiência"
-                details = []
-                if isinstance(resp, list):
-                    details.extend(str(x).strip() for x in resp if str(x).strip())
-                if isinstance(highs, list):
-                    details.extend(str(x).strip() for x in highs if str(x).strip())
-                normalized.append(head + ((": " + "; ".join(details)) if details else ""))
-            else:
-                normalized.append(str(item).strip())
-        data["experience"] = [x for x in normalized if x]
-    dossier = compose_analysis_dossier(data, language)
-    data["summary"] = dossier
-    if not str(data.get("headline") or "").strip():
-        data["headline"] = dossier.split("\n", 1)[0][:240]
-    return data
-
+    profile = ground_profile(raw, text)
+    if not profile["roles"] and not profile["skills"]:
+        raise RuntimeError("A análise não retornou fatos verificáveis no texto do PDF.")
+    analysis = legacy_analysis(profile, language)
+    analysis["summary"] = compose_analysis_dossier(analysis, language)
+    if not str(analysis.get("headline") or "").strip():
+        analysis["headline"] = analysis["summary"].split("\n", 1)[0][:240]
+    analysis["_profile"] = profile
+    return analysis
 
 
 def _upsert_resume(
@@ -374,12 +254,21 @@ def _upsert_resume(
     analysis_error: str,
     analysis_message: str,
     now_iso: str,
+    profile_json: str | None = None,
+    profile_version: str | None = None,
 ) -> None:
+    # None = preserva o perfil já gravado (upload pendente de nova análise).
+    existing_row = get_resume(db, language)
+    if profile_json is None:
+        profile_json = (existing_row["profile_json"] if existing_row else "") or ""
+    if profile_version is None:
+        profile_version = (existing_row["profile_version"] if existing_row else "") or ""
     db.execute(
         """INSERT INTO resumes(
              language,original_filename,stored_path,file_sha256,extracted_text,analysis_json,analysis_summary,
-             analyzed_at,provider,model,analysis_status,analysis_error,analysis_message,created_at,updated_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             analyzed_at,provider,model,analysis_status,analysis_error,analysis_message,created_at,updated_at,
+             profile_json,profile_version)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(language) DO UPDATE SET
              original_filename=excluded.original_filename,
              stored_path=excluded.stored_path,
@@ -393,6 +282,8 @@ def _upsert_resume(
              analysis_status=excluded.analysis_status,
              analysis_error=excluded.analysis_error,
              analysis_message=excluded.analysis_message,
+             profile_json=excluded.profile_json,
+             profile_version=excluded.profile_version,
              updated_at=excluded.updated_at
         """,
         (
@@ -411,6 +302,8 @@ def _upsert_resume(
             analysis_message[:500],
             now_iso,
             now_iso,
+            profile_json,
+            profile_version,
         ),
     )
 
@@ -507,6 +400,7 @@ def run_resume_analysis(
         from paths import RESUMES_DIR
         text = extract_pdf_text(BytesIO(read_pdf(db, row, RESUMES_DIR)))
     analysis = analyze_resume_text(text, language, provider=provider, model=model, api_key=api_key)
+    profile = analysis.pop("_profile", None)
     summary = str(analysis.get("summary") or "").strip()
     message = f"Currículo {language.upper()}: análise da IA concluída ({provider}/{model})."
     _upsert_resume(
@@ -525,6 +419,8 @@ def run_resume_analysis(
         analysis_error="",
         analysis_message=message,
         now_iso=now_iso,
+        profile_json=json.dumps(profile, ensure_ascii=False) if profile else "",
+        profile_version=str(profile.get("version", "")) if profile else "",
     )
     return message
 
@@ -538,8 +434,3 @@ def mark_resume_analysis_error(db: sqlite3.Connection, language: str, error: str
            WHERE language=?""",
         (error[:1000], f"Currículo {language.upper()}: falha na análise — {error}"[:500], now_iso, language),
     )
-
-
-# Compat: antigo nome usado em imports/testes.
-def store_resume_upload(*args, **kwargs):  # type: ignore[no-untyped-def]
-    raise RuntimeError("Use persist_resume_upload + fila de análise (run_resume_analysis).")

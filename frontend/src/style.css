@@ -1641,3 +1641,78 @@ button:hover:not(:disabled),.open-link:hover{
   transition:none
 }
 }
+
+
+.assessment h4{
+  margin:14px 0 6px;
+  color:#c8cec8;
+  font-size:11px;
+  letter-spacing:.08em;
+  text-transform:uppercase
+}
+.assessment-list,.assessment-blocks{
+  list-style:none;
+  margin:0;
+  padding:0;
+  display:grid;
+  gap:5px
+}
+.assessment-blocks li{
+  color:#ff9a92;
+  font-size:12px;
+  font-weight:700
+}
+.assessment-line{
+  display:flex;
+  gap:9px;
+  font-size:12px;
+  line-height:1.45;
+  color:#b5bdb6
+}
+.assessment-line em{
+  color:#8d9890;
+  font-style:normal
+}
+.assessment-mark{
+  flex:none;
+  width:18px;
+  text-align:center;
+  font-weight:800
+}
+.assessment-line.status-met .assessment-mark{color:#7ad19a}
+.assessment-line.status-transferable .assessment-mark{color:#79b8f0}
+.assessment-line.status-partial .assessment-mark{color:#e3c26b}
+.assessment-line.status-unmet .assessment-mark{color:#ff827a}
+.assessment-line.inflated .assessment-text{
+  text-decoration:line-through;
+  text-decoration-color:#59645d
+}
+.assessment-line.inflated em{
+  text-decoration:none;
+  display:inline-block
+}
+.track-badge{
+  margin-left:8px;
+  border:1px solid #46504b;
+  border-radius:20px;
+  padding:2px 8px;
+  font-size:10px;
+  font-weight:700;
+  color:#bdc8bf
+}
+.track-badge.transferable{
+  border-color:#3d6f94;
+  color:#79b8f0
+}
+.track-badge.inflated{
+  border-color:#8a6d2f;
+  color:#e3c26b
+}
+.filter-metrics{
+  margin:10px 0 0;
+  font-size:12px;
+  color:#9aa59d
+}
+.filter-metrics.warn{
+  color:#e3c26b
+}

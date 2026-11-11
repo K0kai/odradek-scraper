@@ -50,12 +50,18 @@ def register(api, core):
                 return error("Vaga já marcada como enviada.", 409)
             rules, resume = list_rules(db), get_resume(db, language)
             letter = db.execute("SELECT body FROM cover_letters WHERE job_id=?", (job_id,)).fetchone()
+            try:
+                decision = db.execute("SELECT assessment_json FROM ai_decisions WHERE job_id=? ORDER BY id DESC LIMIT 1", (job_id,)).fetchone()
+            except Exception:
+                decision = None
         resolved, facts = [], []
 
-        def append(identifier, aliases, value, source, kind="fact", scope="profile", source_only=False):
+        def append(identifier, aliases, value, source, kind="fact", scope="profile", source_only=False, extra=None):
             item = {"id": identifier, "aliases": aliases, "value": str(value), "source": source, "kind": kind, "language": language, "scope": scope}
             if source_only:
                 item["sourceOnly"] = True
+            if extra:
+                item.update(extra)
             item["version"] = digest(item)
             resolved.append(item)
             facts.append(dict(item))
@@ -76,18 +82,30 @@ def register(api, core):
             if len(name) > 1:
                 append("candidate:last_name", ["last name", "sobrenome"], " ".join(name[1:]), "candidate_name")
         # Uploaded resume text is evidence, never a direct autofill rule or an AI summary.
+        # Excerpts keep the PDF's own words, split by section/role; those that back this job's
+        # verified requirement matches come first.
         if resume and str(resume["extracted_text"] or "").strip():
-            text = str(resume["extracted_text"]).strip()
-            chunks, chunk = [], ""
-            for word in text.split():
-                if len(chunk) + len(word) + 1 > 900 and chunk:
-                    chunks.append(chunk)
-                    chunk = ""
-                chunk = (chunk + " " + word).strip()
-            if chunk:
-                chunks.append(chunk)
-            for index, chunk in enumerate(chunks):
-                append(f"resume:{language}:excerpt:{index}", [f"Trecho do currículo enviado ({language}) #{index + 1}"], chunk, "uploaded-resume", source_only=True)
+            from candidate.resume_profile import normalize_text, parse_profile, resume_excerpts
+            excerpts = resume_excerpts(str(resume["extracted_text"]).strip(), parse_profile(resume["profile_json"]), language=language)
+            backed = []
+            try:
+                audit = json.loads(decision["assessment_json"]) if decision and decision["assessment_json"] else {}
+                for entry in list(audit.get("requirements", [])) + list(audit.get("responsibilities", [])):
+                    quote = normalize_text(entry.get("resume_quote", ""))
+                    if quote and entry.get("status") in ("met", "transferable", "partial"):
+                        backed.append((quote, str(entry.get("text", ""))[:120]))
+            except (ValueError, TypeError, AttributeError):
+                backed = []
+            ranked = []
+            for index, excerpt in enumerate(excerpts):
+                norm = normalize_text(excerpt["text"])
+                matched = list(dict.fromkeys(text for quote, text in backed if quote in norm))[:3]
+                ranked.append((0 if matched else 1, index, excerpt, matched))
+            for number, (_, _, excerpt, matched) in enumerate(sorted(ranked, key=lambda r: (r[0], r[1]))):
+                extra = {"section": excerpt["section"], "sourceLanguage": language}
+                if matched:
+                    extra["matched_requirements"] = matched
+                append(f"resume:{language}:excerpt:{number}", [excerpt["label"]], excerpt["text"], "uploaded-resume", source_only=True, extra=extra)
         resume_version = digest(dict(resume)) if resume else None
         return {"contract_version": 2, "context_version": digest([facts, resume_version]), "job": dict(row), "rules": resolved, "profile": {"schema": 1, "version": digest([fact for fact in facts if fact["scope"] == "profile"]), "facts": facts}, "resume": bool(resume), "resume_meta": {"id": dict(resume).get("id"), "language": language, "version": resume_version} if resume else None, "language": language}
 

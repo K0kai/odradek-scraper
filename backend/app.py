@@ -29,7 +29,6 @@ from candidate.resume_pipeline import (
     AiUnavailableError,
     get_resume,
     mark_resume_analysis_error,
-    resume_match_snippets,
     resume_summaries,
     run_resume_analysis,
 )
@@ -89,7 +88,7 @@ def detect_language(text: str) -> tuple[str, float]:
         return ("pt", min(0.9, 0.55 + pt / (total + 2) * 0.4)) if pt > en else ("en", min(0.9, 0.55 + en / (total + 2) * 0.4))
 
 
-def ai_generate_letter(provider: str, model: str, language: str, job: dict, cfg: dict[str, str]) -> str:
+def ai_generate_letter(provider: str, model: str, language: str, job: dict, cfg: dict[str, str], bridges: list[str] | None = None) -> str:
     """Pede somente a carta; o modelo não recebe, cria ou altera o arquivo de currículo."""
     from candidate.experience_priority import EXPERIENCE_PRIORITY_RULE
 
@@ -98,6 +97,13 @@ def ai_generate_letter(provider: str, model: str, language: str, job: dict, cfg:
     facts_key = "candidate_facts_pt" if language == "pt" else "candidate_facts_en"
     facts = cfg.get(facts_key, "").strip()
     name = cfg.get("candidate_name", "").strip()
+    bridge_block = ""
+    if bridges:
+        bridge_block = (
+            "Verified links between the candidate's real experience and this job's requirements "
+            "(use them to connect transferable experience explicitly; do not go beyond them):\n"
+            + "\n".join(f"- {item}" for item in bridges[:8]) + "\n"
+        )
     prompt = f"""Write a concise, specific cover letter in {language_name} for this job application.
 Use only the candidate facts provided below. Never invent experience, qualifications, results, employers, dates, or skills. If facts are sparse, keep the letter brief and make no unsupported claims. Do not claim the candidate already applied. Return only the letter, with no subject line or commentary.
 
@@ -106,7 +112,7 @@ Use only the candidate facts provided below. Never invent experience, qualificat
 Candidate name: {name or '[candidate name]'}
 Candidate-provided facts:
 {facts or '[No candidate facts provided.]'}
-Resume analysis summary (authoritative; do not invent beyond this):
+{bridge_block}Resume analysis summary (authoritative; do not invent beyond this):
 {cfg.get("resume_summary_pt" if language == "pt" else "resume_summary_en", "") or "[No resume analysis provided.]"}
 
 Job title: {job['title']}
@@ -115,69 +121,17 @@ Location / eligibility: {job['location']}
 Job description:
 {re.sub(r'<[^>]+>', ' ', job['description'])[:10000]}
 """
-    if provider == "openai":
-        api_key = get_ai_key(provider)
-        endpoint = "https://api.openai.com/v1/responses"
-        payload = json.dumps({"model": model, "input": prompt, "store": False, "max_output_tokens": 700}).encode("utf-8")
-        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    elif provider == "gemini":
-        api_key = get_ai_key(provider)
-        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{quote_plus(model)}:generateContent?key={quote_plus(api_key)}"
-        payload = json.dumps({"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 700, "temperature": 0.4}}).encode("utf-8")
-        headers = {"Content-Type": "application/json"}
-    else:
+    if provider not in ("openai", "gemini"):
         raise ValueError("Provedor de IA deve ser Gemini ou OpenAI.")
-    if not api_key:
-        raise ValueError("Configure a chave da API na seção de IA.")
-    request = Request(endpoint, data=payload, headers=headers, method="POST")
-    try:
-        with urlopen(request, timeout=60) as response:
-            result = json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")[:300]
-        quota = exc.code in {401, 403, 429, 502, 503, 504} or "quota" in body.casefold()
-        _record_ai_usage(provider, model, None, ok=False, quota_error=quota)
-        if quota:
-            raise AiUnavailableError(f"IA indisponível ao gerar carta (HTTP {exc.code}).") from exc
-        raise RuntimeError(f"Falha ao chamar a API de IA (HTTP {exc.code}).") from exc
-    except Exception as exc:
-        msg = str(exc).casefold()
-        quota = any(t in msg for t in ("429", "quota", "unavailable", "timeout"))
-        _record_ai_usage(provider, model, None, ok=False, quota_error=quota)
-        if quota:
-            raise AiUnavailableError(f"IA indisponível ao gerar carta: {exc}") from exc
-        raise RuntimeError(f"Falha ao chamar a API de IA ({exc.__class__.__name__}).") from exc
-    _record_ai_usage(provider, model, result if isinstance(result, dict) else None, ok=True, quota_error=False)
-    if provider == "openai":
-        parts = [part.get("text", "") for item in result.get("output", []) for part in item.get("content", []) if part.get("type") == "output_text"]
-        letter = "\n".join(parts).strip()
-    else:
-        letter = "\n".join(part.get("text", "") for item in result.get("candidates", []) for part in item.get("content", {}).get("parts", [])).strip()
+    from integrations.ai_client import call_ai_text
+
+    letter = call_ai_text(
+        prompt=prompt, provider=provider, model=model, api_key=get_ai_key(provider),
+        max_output_tokens=1400, temperature=0.4,
+    )
     if not letter:
         raise RuntimeError("A API não retornou uma carta de apresentação.")
     return letter
-
-
-def _record_ai_usage(
-    provider: str,
-    model: str,
-    result: dict | None,
-    *,
-    ok: bool,
-    quota_error: bool,
-) -> None:
-    try:
-        from integrations.usage_tracker import try_record_ai_result
-
-        try_record_ai_result(
-            provider=provider,
-            model=model,
-            result=result,
-            ok=ok,
-            quota_error=quota_error,
-        )
-    except Exception:
-        pass
 
 
 _secrets = SecretStore(connect)
@@ -186,7 +140,7 @@ secret_set = _secrets.set
 get_ai_key = _secrets.get
 
 
-def create_cover_letter(job_id: int, resume_language: str | None = None) -> int:
+def create_cover_letter(job_id: int, resume_language: str | None = None, bridges: list[str] | None = None) -> int:
     cfg = settings()
     with connect() as db:
         job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -201,7 +155,7 @@ def create_cover_letter(job_id: int, resume_language: str | None = None) -> int:
     cfg["resume_summary_en"] = summaries.get("en", "")
     provider = cfg.get("ai_provider", "gemini").casefold()
     model = cfg.get("ai_model", "gemini-2.5-flash").strip()
-    letter = ai_generate_letter(provider, model, language, dict(job), cfg)
+    letter = ai_generate_letter(provider, model, language, dict(job), cfg, bridges)
     stamp = now_iso()
     with connect() as db:
         db.execute("""INSERT INTO cover_letters(job_id,language,provider,model,body,created_at,updated_at) VALUES(?,?,?,?,?,?,?)
@@ -211,14 +165,13 @@ def create_cover_letter(job_id: int, resume_language: str | None = None) -> int:
     return int(row["id"])
 
 
-DEFAULT_JOB_SELECTION_PROMPT = """You are a fair, practical job-fit evaluator. Assess whether this candidate has a credible path to succeed in this role.
+DEFAULT_JOB_SELECTION_PROMPT = """You are a fair, practical job-fit evaluator. Judge whether this candidate has a credible, evidence-backed path to succeed in this role.
 
-- Compare the role's core responsibilities and required skills with the candidate's actual resume evidence.
-- Give meaningful credit to transferable skills, adjacent experience, and demonstrated ability to learn.
+- Judge the role by its real day-to-day responsibilities, not by an inflated wish-list of requirements.
+- Give credit to transferable skills and adjacent experience only when the resume proves the underlying capability.
 - Treat missing secondary or preferred tools as a modest gap, not an automatic rejection.
+- Requirements that contradict the posting itself (e.g. an internship asking for many years of experience) should be disregarded.
 - Do not invent employers, degrees, skills, or experience absent from the candidate information.
-- Reject only for a genuine hard blocker or a fundamentally unrelated career path.
-- Base the score and recommendation on the optimism calibration supplied below.
 """
 
 
@@ -229,149 +182,69 @@ def effective_job_selection_prompt(cfg: dict[str, str] | None = None) -> str:
 
 
 def job_selection_optimism_instruction(value: object) -> tuple[int, str]:
+    """Normaliza o slider (0-100). Ele define a cobertura mínima dos obrigatórios core na triagem v2."""
+    from jobs.job_assessment import optimism_threshold
+
     try:
         optimism = max(0, min(100, int(float(str(value or "75")))))
     except (TypeError, ValueError):
         optimism = 75
-    if optimism <= 20:
-        guidance = "Be highly selective: recommend only clear, well-supported matches; score adjacent or stretch roles conservatively."
-    elif optimism <= 40:
-        guidance = "Be somewhat selective: prioritize strong matches, while allowing relevant transferable experience."
-    elif optimism <= 60:
-        guidance = "Use balanced judgment: count relevant overlap and transferable skills, but reflect meaningful gaps."
-    elif optimism <= 80:
-        guidance = "Lean optimistic: give strong credit to adjacent experience and transferable skills; keep plausible roles in consideration."
-    else:
-        guidance = "Be very inclusive: favor a credible path to success, avoid over-penalizing missing secondary skills, and keep stretch roles in consideration unless a hard blocker exists."
-    return optimism, guidance
+    return optimism, f"Exige {optimism_threshold(optimism):.0%} dos requisitos obrigatórios essenciais atendidos."
 
 
-def ai_assess_job(job: dict, cfg: dict[str, str]) -> dict:
-    """Classifica aderência usando a análise de currículo já salva (sem reenviar o PDF)."""
+def job_track(job: dict, cfg: dict[str, str]) -> str:
+    """'transferable' quando a vaga veio do filtro Secundário (ids 'sec-', e 'tr-' do formato antigo)."""
+    filter_id = str(job.get("search_filter_id") or "").strip()
+    return "transferable" if filter_id.startswith(("sec-", "tr-")) else "core"
+
+
+def _assessment_caller(provider: str, model: str, api_key: str):
+    from integrations.ai_client import call_ai_json
+
+    def call(prompt: str, schema: dict, *, max_output_tokens: int, thinking_budget: int | None = None) -> dict:
+        return call_ai_json(
+            prompt=prompt, schema=schema, provider=provider, model=model, api_key=api_key,
+            max_output_tokens=max_output_tokens, thinking_budget=thinking_budget,
+        )
+
+    return call
+
+
+def ai_assess_job(job: dict, cfg: dict[str, str], *, track: str = "core", call_json=None) -> dict:
+    """Triagem v2: requisitos × evidência verificada (ver jobs/job_assessment.py)."""
+    from candidate.resume_profile import merged_profile
+    from jobs.job_assessment import SCORING_VERSION, assess_job
+
     language = job.get("language", "unknown")
     if language not in ("pt", "en"):
         raise ValueError("Idioma incerto; a IA não vai escolher um currículo por suposição.")
-    facts = cfg.get("candidate_facts_pt" if language == "pt" else "candidate_facts_en", "").strip()
     with connect() as db:
         summaries = resume_summaries(db)
-        snippets = resume_match_snippets(db)
-    resume_summary_pt = summaries.get("pt", "").strip()
-    resume_summary_en = summaries.get("en", "").strip()
-    snippet_pt = snippets.get("pt", "").strip()
-    snippet_en = snippets.get("en", "").strip()
-    if language == "pt" and not resume_summary_pt and not resume_summary_en and not snippet_pt and not snippet_en:
+        bundle = merged_profile(db, prefer=language)
+    analyzed = {lang for lang, summary in summaries.items() if (summary or "").strip()}
+    if not analyzed:
         raise ValueError("Faça upload e análise de pelo menos um currículo antes da triagem automática.")
-    if language == "en" and not resume_summary_en and not resume_summary_pt and not snippet_en and not snippet_pt:
-        raise ValueError("Faça upload e análise de pelo menos um currículo antes da triagem automática.")
-
-    optimism, optimism_guidance = job_selection_optimism_instruction(cfg.get("job_selection_optimism"))
-    prompt = f"""{effective_job_selection_prompt(cfg)}
-
-OPTIMISM CALIBRATION: {optimism}/100. {optimism_guidance}
-Keep the score consistent with this calibration. Set should_apply=true when the role meets the configured standard and has no hard blocker. Identify whether the job description asks for a cover letter.
-
-Return ONLY JSON with keys:
-match_score (integer 0-100),
-should_apply (boolean),
-cover_letter_required (boolean),
-reason (short string in {('Portuguese' if language == 'pt' else 'English')}),
-recommended_resume_language (either "en" or "pt").
-
-Candidate facts: {facts or '[none provided]'}
-Resume profile snippet (PT): {snippet_pt or '[none provided]'}
-Resume profile snippet (EN): {snippet_en or '[none provided]'}
-Resume summary (PT): {(resume_summary_pt[:2500] if resume_summary_pt else '[none provided]')}
-Resume summary (EN): {(resume_summary_en[:2500] if resume_summary_en else '[none provided]')}
-Job title: {job['title']}
-Company: {job['company']}
-Location/eligibility: {job['location']}
-Description: {re.sub(r'<[^>]+>', ' ', job['description'])[:10000]}"""
+    if bundle is None:
+        raise AiUnavailableError("O perfil verificado do currículo ainda não foi gerado; a triagem tentará de novo após a reanálise.")
+    profile, resume_norm = bundle
 
     provider = cfg.get("ai_provider", "gemini").casefold()
     model = cfg.get("ai_model", "gemini-2.5-flash").strip()
-    api_key = get_ai_key(provider)
-    if not api_key:
-        raise AiUnavailableError("Configure a chave da API de IA para ativar o julgamento automático.")
-    try:
-        if provider == "openai":
-            endpoint = "https://api.openai.com/v1/responses"
-            payload = json.dumps(
-                {
-                    "model": model,
-                    "input": prompt,
-                    "text": {"format": {"type": "json_object"}},
-                    "store": False,
-                    "max_output_tokens": 400,
-                    "temperature": 0.7,
-                }
-            ).encode("utf-8")
-            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        elif provider == "gemini":
-            endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{quote_plus(model)}:generateContent?key={quote_plus(api_key)}"
-            payload = json.dumps(
-                {
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {
-                        "maxOutputTokens": 400,
-                        "temperature": 0.7,
-                        "responseMimeType": "application/json",
-                    },
-                }
-            ).encode("utf-8")
-            headers = {"Content-Type": "application/json"}
-        else:
-            raise ValueError("Provedor de IA inválido.")
-        request = Request(endpoint, data=payload, headers=headers, method="POST")
-        with urlopen(request, timeout=60) as response:
-            result = json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        from integrations.ai_client import ai_http_error_detail
-
-        detail = ai_http_error_detail(exc, provider=provider, model=model, operation="Triagem da vaga", api_key=api_key)
-        quota = exc.code in {401, 403, 429, 502, 503, 504} or "quota" in detail.casefold()
-        _record_ai_usage(provider, model, None, ok=False, quota_error=quota)
-        log_event("error", "auto-apply", f"Vaga #{job.get('id', '?')}: {detail}")
-        if quota:
-            raise AiUnavailableError(detail) from exc
-        raise RuntimeError(detail) from exc
-    _record_ai_usage(provider, model, result if isinstance(result, dict) else None, ok=True, quota_error=False)
-    if provider == "openai":
-        raw = "\n".join(part.get("text", "") for item in result.get("output", []) for part in item.get("content", []) if part.get("type") == "output_text")
-    else:
-        raw = "\n".join(part.get("text", "") for item in result.get("candidates", []) for part in item.get("content", {}).get("parts", []))
-    decision = json.loads(raw.strip())
-
-    recommended_language = decision.get("recommended_resume_language")
-    if recommended_language not in ("en", "pt"):
-        match_score = int(decision.get("match_score", 0))
-        if language == "en" and match_score >= 65 and resume_summary_en:
-            recommended_language = "en"
-        elif resume_summary_pt:
-            recommended_language = "pt"
-        elif resume_summary_en:
-            recommended_language = "en"
-        else:
-            recommended_language = language
-    if recommended_language == "pt" and not resume_summary_pt and resume_summary_en:
-        recommended_language = "en"
-    if recommended_language == "en" and not resume_summary_en and resume_summary_pt:
-        recommended_language = "pt"
-
-    score = max(0, min(100, int(decision.get("match_score", 0))))
-    should_apply = bool(decision.get("should_apply"))
-    # Soft floor: same-field optimistic calibration if the model still underrates.
-    if should_apply and score < 50:
-        score = 50
-    elif score >= 50:
-        should_apply = True
+    if call_json is None:
+        api_key = get_ai_key(provider)
+        if not api_key:
+            raise AiUnavailableError("Configure a chave da API de IA para ativar o julgamento automático.")
+        call_json = _assessment_caller(provider, model, api_key)
+    result = assess_job(
+        job, cfg, profile=profile, resume_norm=resume_norm, call_json=call_json, language=language,
+        preferences=effective_job_selection_prompt(cfg), track=track,
+    )
+    # O currículo é escolhido pelo idioma da vaga (não pelo LLM); cai para o outro se ausente.
+    other = "en" if language == "pt" else "pt"
+    resume_language = language if language in analyzed else other
     return {
-        "match_score": score,
-        "should_apply": should_apply,
-        "letter_required": bool(decision.get("cover_letter_required")),
-        "reason": str(decision.get("reason", ""))[:1000],
-        "provider": provider,
-        "model": model,
-        "resume_language": recommended_language,
+        **result, "provider": provider, "model": model, "resume_language": resume_language,
+        "scoring_version": SCORING_VERSION,
     }
 
 
@@ -412,7 +285,7 @@ def process_auto_job(job_id: int) -> str:
     title = job.get("title", "")
     log_event("info", "auto-apply", f"Triagem da vaga #{job_id}: {title}")
     try:
-        decision = ai_assess_job(job, cfg)
+        decision = ai_assess_job(job, cfg, track=job_track(job, cfg))
     except AiUnavailableError:
         # Propagates to the job queue for retry/backoff.
         raise
@@ -422,24 +295,26 @@ def process_auto_job(job_id: int) -> str:
         log_event("warning", "auto-apply", f"Vaga #{job_id}: {exc}")
         return f"vaga {job_id}: {exc}"
 
-    minimum = max(0, min(100, int(cfg.get("minimum_match_score", "80") or 80)))
-    qualifies = decision["should_apply"] and decision["match_score"] >= minimum
+    # A aprovação já aplica o mínimo da trilha (core/transferível), bloqueios e revisão cética.
+    qualifies = bool(decision["should_apply"])
     resume_language = decision["resume_language"]
     with connect() as db:
         db.execute(
-            """INSERT INTO ai_decisions(job_id,decided_at,match_score,should_apply,letter_required,reason,resume_language,apply_channel,apply_result)
-               VALUES(?,?,?,?,?,?,?,?,?)""",
-            (job_id, now_iso(), decision["match_score"], int(qualifies), int(decision["letter_required"]), decision["reason"], resume_language, "", ""),
+            """INSERT INTO ai_decisions(job_id,decided_at,match_score,should_apply,letter_required,reason,resume_language,apply_channel,apply_result,
+                                        assessment_json,scoring_version,provider,model)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (job_id, now_iso(), decision["match_score"], int(qualifies), int(decision["letter_required"]), decision["reason"], resume_language, "", "",
+             json.dumps(decision["assessment"], ensure_ascii=False), decision["scoring_version"], decision["provider"], decision["model"]),
         )
     log_event(
         "info",
         "auto-apply",
-        f"Vaga #{job_id}: score {decision['match_score']}/100, should_apply={decision['should_apply']}, CV={resume_language}. {decision['reason']}",
+        f"Vaga #{job_id}: score {decision['match_score']}/100, aprovada={qualifies}, trilha={decision['track']}, CV={resume_language}. {decision['reason']}",
     )
     if not qualifies:
         with connect() as db:
             db.execute("UPDATE jobs SET status='ignored', notes=? WHERE id=?", (f"IA: score {decision['match_score']}/100. {decision['reason']}", job_id))
-        log_event("info", "auto-apply", f"Vaga #{job_id} ignorada (score abaixo do mínimo ou should_apply=false).")
+        log_event("info", "auto-apply", f"Vaga #{job_id} ignorada (bloqueio, cobertura ou score abaixo do mínimo).")
         return f"IA descartou vaga {job_id} ({decision['match_score']}/100)"
 
     with connect() as db:
@@ -450,7 +325,7 @@ def process_auto_job(job_id: int) -> str:
         return f"vaga {job_id}: currículo {resume_language} ausente"
 
     try:
-        cover_id = create_cover_letter(job_id, resume_language=resume_language)
+        cover_id = create_cover_letter(job_id, resume_language=resume_language, bridges=decision.get("bridges"))
     except AiUnavailableError:
         raise
     except Exception as exc:
@@ -876,71 +751,101 @@ def _substitute_apify_value(value: object, ctx: dict[str, str]) -> object:
 
 # LinkedIn Jobs search: f_E = experience, f_WT = workplace type, f_TPR = time posted.
 LINKEDIN_EXPERIENCE_CODES = {1, 2, 3, 4, 5, 6}
-LINKEDIN_WORKPLACE_CODES = {1, 2, 3}  # 1 on-site, 2 remote, 3 hybrid
 #: Past 24 hours — máxima prioridade (vagas do mesmo dia).
 LINKEDIN_TPR_DAY = "r86400"
 #: Past week — teto duro de 7 dias (nunca buscar mais antigo que isso).
 LINKEDIN_TPR_WEEK = "r604800"
 LINKEDIN_MAX_AGE_DAYS = 7
-#: Quantos keywords a IA pode gravar / usar nas URLs (antes era 4–5 e estreita demais).
-LINKEDIN_FILTER_MAX_KEYWORDS = 12
-LINKEDIN_FILTER_MAX_COUNT = 12
+#: Cada filtro tem o cargo e, no máximo, UMA variante equivalente dele (ex.: versão PT/EN).
+LINKEDIN_FILTER_MAX_KEYWORDS = 2
 LINKEDIN_SEARCH_MAX_URLS = 8
 
-# Placeholders obrigatórios no texto editável: {pref_keywords} {facts_pt} {facts_en} {resume_pt} {resume_en}
-DEFAULT_LINKEDIN_FILTER_PROMPT = """You design LinkedIn Jobs search filters for Apify (curious_coder linkedin-jobs-scraper).
-The scraper takes LinkedIn search URLs. Cover the BREADTH of THIS candidate's real skills and roles — do NOT collapse to only 4–5 trendy skills.
+# Placeholders do texto editável: {pref_keywords} {facts_pt} {facts_en} {profile} {area_hint} {main_filter}
+# (e {resume_pt}/{resume_en}, legado)
+DEFAULT_LINKEDIN_FILTER_PROMPT = """You design the ONE main LinkedIn Jobs search filter for this candidate (Apify, curious_coder linkedin-jobs-scraper).
+The main area is IT and programming: the area where the candidate has the most verified experience, the one that defines their career. Return EXACTLY ONE filter, as sharp as possible: the single job title that best captures what is most career-defining for this candidate, grounded ONLY in the verified profile below.
 
 LinkedIn experience codes (f_E): 1 Internship, 2 Entry, 3 Associate, 4 Mid-Senior, 5 Director, 6 Executive.
-LinkedIn workplace codes (f_WT): 1 On-site, 2 Remote, 3 Hybrid.
 
-GEO / WORKPLACE RULES (mandatory — override panel location preferences):
-- Do NOT prioritize Brazil, Brasil, or Brazilian cities as the main search target.
-- Remote (f_WT=2) is the PRIMARY target: the candidate accepts remote work from ANYWHERE worldwide.
-- For remote searches, prefer location strings like "Remote", "Worldwide", "United States", "Europe", or leave broad global remote — NOT "Brazil" as the default.
-- Hybrid (f_WT=3) is allowed ONLY when paired with location "Belo Horizonte" (or "Belo Horizonte, Minas Gerais" / "Belo Horizonte, Brazil").
-- Do NOT use f_WT=1 (On-site) unless the resume explicitly requires it (default: omit on-site).
-- Typical good combo: workplace_types [2, 3] with locations including "Remote" and "Belo Horizonte" (hybrid applies to BH only in intent).
-- Never make "Brazil" the only or primary location.
+KEYWORD RULES (mandatory):
+- `keywords` holds 1 or 2 phrases that all name the SAME role: the title plus at most ONE equivalent variant of that same title (for example its Portuguese/English version or its most common synonym). Never a second, different role. Never a bare skill ("Python", "SQL") and never an intersection of unrelated skills.
+- Pick the role with the most dated months and/or the current role. Add ONE central stack qualifier (e.g. "Backend Developer Python") only when that skill has 12+ months of use or is used in the current role.
+- EVERY phrase must list `evidence_ids`, and at least one must be a ROLE id ([R1]) or one of its responsibilities ([R1.2]). Phrases that do not are discarded by the program.
+- `anchor_role_ids`: the role ids that prove this career line.
+- Do NOT invent employers, titles or skills. No fixed seniority-to-code mapping and no universal years cutoff: choose `experience_levels` from the computed months of the anchor roles and explain the level and the evidence in `reason` (Portuguese).
+- Location and work model are NOT yours to choose (the program derives them); do not mention them.
 
-KEYWORD BREADTH (mandatory):
-- Produce 6–12 distinct job-search phrases spread across DIFFERENT skills, stacks, domains, and role titles from the resume. Organize them into 4–8 separate filters, each with only 1–3 related phrases. Each filter is sent as its own Apify run, so cover different role/skill combinations without duplicating them.
-- One solid skill match is enough to justify a keyword. Do NOT require the intersection of many skills; e.g. include separate phrases for Python, React, SQL, DevOps, etc. when present on the resume.
-- Prefer English for global remote reach; PT only if clearly Brazil-hybrid BH search.
-- Market demand may influence ORDER, but NEVER drop a real resume skill just because it is less trendy.
-- Do NOT invent employers or skills; only use the resume summaries and facts.
-
-Other rules:
-- Assess the candidate's realistic seniority separately for each skill/domain, using actual responsibilities, dated professional roles, and project evidence. Do not equate the number of skills with seniority.
-- If resume translations disagree, reconcile their claims against the underlying experience rather than automatically choosing a label.
-- Choose experience codes and any seniority qualifiers independently for each filter. Do not use a fixed seniority-to-code mapping, mandatory qualifier list, or universal years-of-experience cutoff.
-- Refine searches enough to avoid flooding results with roles beyond the candidate's demonstrated scope, while preserving plausible adjacent opportunities and the breadth of supported skills.
-- Avoid full job titles and intersections of unrelated skills. Explain the chosen level, supporting candidate evidence, and relevant uncertainty in each reason.
-- RECENCY (mandatory — the URL builder enforces this; mention it in reason):
-  * Only consider jobs from the last 7 days (LinkedIn f_TPR=r604800).
-  * Strongly prioritize jobs posted today / last 24 hours (f_TPR=r86400) over older ones in the week.
-- OPEN JOBS ONLY (intent): design searches for roles that still accept applications. Prefer fresher postings; never aim for filled/closed/expired listings.
-- Return ONLY JSON with key filters, an array of 4–8 objects. Each object has:
-  name (short unique label in Portuguese),
-  keywords (1–3 related search phrases),
-  locations (string array),
-  experience_levels (integer array of f_E codes),
-  workplace_types (integer array of f_WT codes),
-  reason (short string in Portuguese explaining the role/skills covered + remote global + hybrid BH + recency).
-
-Panel keyword preferences (roles/skills only — ignore geo bias here): {pref_keywords}
+Panel keyword preferences (roles/skills context only): {pref_keywords}
 Candidate facts PT: {facts_pt}
 Candidate facts EN: {facts_en}
-Resume summary PT: {resume_pt}
-Resume summary EN: {resume_en}
+
+VERIFIED CANDIDATE PROFILE (PT and EN resumes merged; evidence ids in brackets):
+{profile}
 """
+
+DEFAULT_TRANSFERABLE_PROMPT = """You design the ONE secondary (backup) LinkedIn Jobs search filter for this candidate.
+Goal: ONE role, in a sector and function that are historically LESS exposed to economic downturns, where this candidate's VERIFIED capabilities transfer, especially the combination of IT/programming skills with administrative/operational experience.
+
+LinkedIn experience codes (f_E): 1 Internship, 2 Entry, 3 Associate, 4 Mid-Senior, 5 Director, 6 Executive.
+
+How to choose (use the profile's TRANSFERABLE CAPABILITIES, roles and skills as evidence):
+- Think function x sector. Functions where IT plus an administrative background is a differentiator: IT support/helpdesk, systems/ERP-oriented administrative analyst, process/automation analyst, data/BI assistant, back-office with systems, implementation or support of business software. Sectors that tend to hold up in downturns: healthcare, public sector and outsourced public services, education, utilities/energy, logistics/supply chain, insurance, accounting/tax, back-office of financial services. These lists are only illustrative: choose what THIS profile evidences and justify the choice.
+- The candidate's hint for the backup area (a direction, not an order; ignore it if the profile gives no evidence for it): {area_hint}
+- The MAIN filter already covers: {main_filter}. Choose a DIFFERENT role family; do not repeat its titles.
+- `keywords` holds 1 or 2 phrases that all name the SAME role (the title plus at most one equivalent variant), optionally with a sector qualifier. Never a bare skill.
+- EVERY phrase must list `evidence_ids`, and at least one must be a TRANSFERABLE capability ([T1]) or a role/responsibility ([R1], [R1.2]). Phrases without valid ids are discarded.
+- `anchor_role_ids`: the roles whose experience transfers.
+- Fill `sector` (the target sector) and `resilience_reason` (why this sector/function is comparatively resilient AND which profile evidence transfers). Stay qualitative; no statistics you cannot support.
+- Choose experience codes realistic for moving into a new function (often Entry/Associate), justified by the profile. Explain in `reason` (Portuguese).
+- Location and work model are NOT yours to choose; do not mention them.
+
+Panel keyword preferences (context only): {pref_keywords}
+Candidate facts PT: {facts_pt}
+Candidate facts EN: {facts_en}
+
+VERIFIED CANDIDATE PROFILE (PT and EN resumes merged; evidence ids in brackets):
+{profile}
+"""
+
+FILTER_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "filter": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "keywords": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"phrase": {"type": "string"}, "evidence_ids": {"type": "array", "items": {"type": "string"}}},
+                    },
+                },
+                "anchor_role_ids": {"type": "array", "items": {"type": "string"}},
+                "experience_levels": {"type": "array", "items": {"type": "integer"}},
+                "reason": {"type": "string"},
+                "sector": {"type": "string"},
+                "resilience_reason": {"type": "string"},
+            },
+        },
+    },
+}
+
+_TECH_SKILL_CATEGORIES = {"language", "framework", "tool", "cloud", "db"}
 
 
 def effective_linkedin_filter_prompt(cfg: dict[str, str] | None = None) -> str:
-    """Prompt efetivo: custom do painel, senão o default amplo."""
+    """Prompt efetivo do filtro principal: custom do painel, senão o default."""
     cfg = cfg or {}
     custom = str(cfg.get("linkedin_filter_prompt") or "").strip()
     return custom if custom else DEFAULT_LINKEDIN_FILTER_PROMPT
+
+
+def effective_transferable_prompt(cfg: dict[str, str] | None = None) -> str:
+    """Prompt efetivo do filtro secundário."""
+    cfg = cfg or {}
+    custom = str(cfg.get("transferable_prompt") or "").strip()
+    return custom if custom else DEFAULT_TRANSFERABLE_PROMPT
 
 
 def render_linkedin_filter_prompt(
@@ -949,399 +854,339 @@ def render_linkedin_filter_prompt(
     pref_keywords: str,
     facts_pt: str,
     facts_en: str,
-    resume_pt: str,
-    resume_en: str,
+    resume_pt: str = "",
+    resume_en: str = "",
+    profile: str = "",
+    area_hint: str = "",
+    main_filter: str = "",
 ) -> str:
-    """Substitui placeholders sem .format() (o template pode ter chaves JSON)."""
+    """Substitui placeholders sem .format() (o template pode ter chaves JSON).
+
+    Prompts personalizados antigos ({resume_pt}/{resume_en}) continuam válidos: ambos recebem o
+    perfil verificado fundido. Sem nenhum desses placeholders, o perfil é anexado ao final.
+    """
     pairs = {
         "pref_keywords": pref_keywords or "[none]",
         "facts_pt": facts_pt or "[none]",
         "facts_en": facts_en or "[none]",
-        "resume_pt": resume_pt or "[none]",
-        "resume_en": resume_en or "[none]",
+        "resume_pt": resume_pt or profile or "[none]",
+        "resume_en": resume_en or ("(PT and EN resumes are merged in the PT block above)" if (resume_pt or profile) else "[none]"),
+        "profile": profile or "[none]",
+        "area_hint": area_hint or "[none: choose from the profile]",
+        "main_filter": main_filter or "[not generated yet]",
     }
     out = template or DEFAULT_LINKEDIN_FILTER_PROMPT
+    carries_profile = any("{" + key + "}" in out for key in ("profile", "resume_pt", "resume_en"))
     for key, value in pairs.items():
         out = out.replace("{" + key + "}", value)
+    if not carries_profile and profile:
+        out += f"\n\nVERIFIED CANDIDATE PROFILE (evidence ids in brackets):\n{profile}\n"
     return out
 
 
-def _resume_filter_fingerprint(cfg: dict[str, str] | None = None) -> str:
-    cfg = cfg or settings()
-    prompt = effective_linkedin_filter_prompt(cfg)
-    with connect() as db:
-        summaries = resume_summaries(db)
-        rows = db.execute(
-            "SELECT language, analyzed_at, file_sha256 FROM resumes ORDER BY language"
-        ).fetchall()
-    blob = json.dumps(
-        {
-            "summaries": summaries,
-            "prompt": prompt,
-            "preferred_keywords": cfg.get("keywords", ""),
-            "candidate_facts_pt": cfg.get("candidate_facts_pt", ""),
-            "candidate_facts_en": cfg.get("candidate_facts_en", ""),
-            "meta": [
-                {
-                    "language": r["language"],
-                    "analyzed_at": r["analyzed_at"],
-                    "sha": r["file_sha256"],
-                }
-                for r in rows
-            ],
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-    )
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:24]
+# ---------------------------------------------------------------------------
+# Dois filtros: Principal (TI/programação) e Secundário (área de reserva)
+# ---------------------------------------------------------------------------
+FILTER_SLOT_PREFIX = {"main": "main-", "secondary": "sec-"}
+FILTER_SLOT_KEY = {"main": "linkedin_main_filter_json", "secondary": "linkedin_secondary_filter_json"}
 
 
-def _fallback_linkedin_filters(cfg: dict[str, str]) -> list[dict]:
-    keywords = terms(cfg.get("keywords", "")) or ["software engineer"]
-    groups = [keywords[i : i + 2] for i in range(0, min(len(keywords), 12), 2)] or [["software engineer"]]
-    return [
-        {
-            "id": f"fallback-{i + 1}",
-            "name": f"Busca {i + 1}: {', '.join(group[:2])}",
-            "enabled": True,
-            "keywords": group,
-            "locations": ["Remote", "Belo Horizonte"],
-            "experience_levels": [],
-            "workplace_types": [2, 3],
-            "reason": "Filtro alternativo baseado nas preferências, remoto global e híbrido em Belo Horizonte.",
-            "source": "fallback",
-        }
-        for i, group in enumerate(groups[:LINKEDIN_FILTER_MAX_COUNT])
-    ]
+def _filter_levels(raw: object) -> list[int]:
+    levels: list[int] = []
+    for item in raw if isinstance(raw, list) else []:
+        try:
+            code = int(item)
+        except (TypeError, ValueError):
+            continue
+        if code in LINKEDIN_EXPERIENCE_CODES and code not in levels:
+            levels.append(code)
+    return levels
 
 
-def _fallback_linkedin_filter(cfg: dict[str, str]) -> dict:
-    return _fallback_linkedin_filters(cfg)[0]
-
-
-def _normalize_linkedin_filter(raw: dict, cfg: dict[str, str]) -> dict:
-    fallback = _fallback_linkedin_filter(cfg)
-    keywords = raw.get("keywords") if isinstance(raw.get("keywords"), list) else []
-    keywords = [str(k).strip() for k in keywords if str(k).strip()][:LINKEDIN_FILTER_MAX_KEYWORDS]
+def _normalize_filter(raw: object, slot: str) -> dict | None:
+    """Um filtro: 1-2 frases do MESMO cargo, níveis de experiência e metadados verificados."""
+    if not isinstance(raw, dict):
+        return None
+    keywords: list[str] = []
+    for entry in raw.get("keywords") if isinstance(raw.get("keywords"), list) else []:
+        phrase = entry.get("phrase") if isinstance(entry, dict) else entry
+        phrase = str(phrase or "").strip()[:120]
+        if phrase and phrase.casefold() not in {k.casefold() for k in keywords}:
+            keywords.append(phrase)
+    keywords = keywords[:LINKEDIN_FILTER_MAX_KEYWORDS]
     if not keywords:
-        keywords = list(fallback["keywords"])
-    locations = raw.get("locations") if isinstance(raw.get("locations"), list) else []
-    locations = [str(x).strip() for x in locations if str(x).strip()][:4]
-    if not locations:
-        locations = list(fallback["locations"])
-    experience_raw = raw.get("experience_levels")
-    experience = []
-    for item in (experience_raw if isinstance(experience_raw, list) else fallback["experience_levels"]):
-        try:
-            code = int(item)
-        except (TypeError, ValueError):
-            continue
-        if code in LINKEDIN_EXPERIENCE_CODES and code not in experience:
-            experience.append(code)
-    workplace_raw = raw.get("workplace_types")
-    workplace = []
-    for item in (workplace_raw if isinstance(workplace_raw, list) else fallback["workplace_types"]):
-        try:
-            code = int(item)
-        except (TypeError, ValueError):
-            continue
-        if code in LINKEDIN_WORKPLACE_CODES and code not in workplace:
-            workplace.append(code)
-    reason = str(raw.get("reason") or "").strip()[:400]
-    out = {
+        return None
+    levels = _filter_levels(raw.get("experience_levels"))
+    signature = json.dumps({"keywords": keywords, "levels": levels}, ensure_ascii=False, sort_keys=True)
+    out: dict = {
+        "id": FILTER_SLOT_PREFIX[slot] + hashlib.sha256(signature.encode("utf-8")).hexdigest()[:10],
+        "name": str(raw.get("name") or "").strip()[:80] or keywords[0],
+        "slot": slot,
+        "enabled": True if slot == "main" else bool(raw.get("enabled", True)),
         "keywords": keywords,
-        "locations": locations,
-        "experience_levels": experience,
-        "workplace_types": workplace,
-        "reason": reason or fallback["reason"],
-        "source": str(raw.get("source") or "ai"),
+        "experience_levels": levels,
+        "reason": str(raw.get("reason") or "").strip()[:400],
+        "source": str(raw.get("source") or "manual")[:20],
     }
-    name = str(raw.get("name") or "").strip()[:80]
-    if name:
-        out["name"] = name
+    if slot == "secondary":
+        out["track"] = "transferable"
+        for key in ("sector", "resilience_reason"):
+            if str(raw.get(key) or "").strip():
+                out[key] = str(raw[key]).strip()[:400]
+    evidence = raw.get("evidence")
+    if isinstance(evidence, dict):
+        out["evidence"] = {
+            phrase: [str(i)[:12] for i in evidence[phrase]][:4]
+            for phrase in keywords if isinstance(evidence.get(phrase), list)
+        }
+    anchors = []
+    for item in raw.get("anchor_roles") if isinstance(raw.get("anchor_roles"), list) else []:
+        if isinstance(item, dict) and str(item.get("id") or "").strip():
+            try:
+                months = int(item.get("months") or 0)
+            except (TypeError, ValueError):
+                months = 0
+            anchors.append({"id": str(item["id"])[:12], "title": str(item.get("title") or "")[:160],
+                            "employer": str(item.get("employer") or "")[:160], "months": months})
+    if anchors:
+        out["anchor_roles"] = anchors[:6]
+    try:
+        out["career_months"] = max(0, int(raw.get("career_months") or 0))
+    except (TypeError, ValueError):
+        pass
+    if raw.get("generated_at"):
+        out["generated_at"] = str(raw["generated_at"])[:40]
     return out
 
 
-def _normalize_linkedin_filters(
-    raw: object,
-    cfg: dict[str, str],
-    *,
-    fallback_if_empty: bool = True,
-) -> list[dict]:
-    if isinstance(raw, dict):
-        candidates = raw.get("filters") if isinstance(raw.get("filters"), list) else [raw]
-    elif isinstance(raw, list):
-        candidates = raw
-    else:
-        candidates = []
-    filters: list[dict] = []
-    seen: set[str] = set()
-    for index, item in enumerate(candidates[:LINKEDIN_FILTER_MAX_COUNT]):
-        if not isinstance(item, dict):
-            continue
-        normalized = _normalize_linkedin_filter(item, cfg)
-        signature = json.dumps(
-            {key: normalized[key] for key in ("keywords", "locations", "experience_levels", "workplace_types")},
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        if signature in seen:
-            continue
-        seen.add(signature)
-        stable_id = hashlib.sha256(f"{index}:{signature}".encode("utf-8")).hexdigest()[:12]
-        name = normalized.get("name") or f"Busca {index + 1}"
-        filters.append({
-            **normalized,
-            "id": str(item.get("id") or f"li-{stable_id}")[:64],
-            "name": name,
-            "enabled": bool(item.get("enabled", True)),
-        })
-    return filters or (_fallback_linkedin_filters(cfg) if fallback_if_empty else [])
-
-
-def _validate_linkedin_filter_form(raw: str, cfg: dict[str, str]) -> str:
+def _validate_filter_form(raw: str, slot: str) -> str:
+    """Valida o JSON salvo pelo painel: vazio (sem filtro) ou UM objeto com 1-2 frases."""
+    text = (raw or "").strip()
+    if not text:
+        return ""
     try:
-        submitted = json.loads(raw or "[]")
+        data = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"JSON dos filtros LinkedIn inválido: {exc}") from exc
-    if not isinstance(submitted, list) or len(submitted) > LINKEDIN_FILTER_MAX_COUNT:
-        raise ValueError(f"Use uma lista com até {LINKEDIN_FILTER_MAX_COUNT} filtros LinkedIn.")
-    for index, item in enumerate(submitted, start=1):
-        if not isinstance(item, dict):
-            raise ValueError(f"Filtro #{index} inválido.")
-        if not str(item.get("name") or "").strip():
-            raise ValueError(f"Dê um nome ao filtro #{index}.")
-        keywords = item.get("keywords")
-        if not isinstance(keywords, list) or not any(str(x).strip() for x in keywords):
-            raise ValueError(f"Adicione ao menos uma keyword ao filtro #{index}.")
-        if len(keywords) > LINKEDIN_FILTER_MAX_KEYWORDS:
-            raise ValueError(f"Use até {LINKEDIN_FILTER_MAX_KEYWORDS} keywords no filtro #{index}; divida as demais em outro filtro.")
-        locations = item.get("locations")
-        if isinstance(locations, list) and len(locations) > 4:
-            raise ValueError(f"Use até 4 locais no filtro #{index}; divida os demais em outro filtro.")
-    filters = _normalize_linkedin_filters(submitted, cfg, fallback_if_empty=False)
-    return json.dumps(filters, ensure_ascii=False)
+        raise ValueError(f"JSON do filtro inválido: {exc}") from exc
+    if isinstance(data, list):
+        raise ValueError("Use um único filtro (objeto), não uma lista.")
+    if not isinstance(data, dict):
+        raise ValueError("Filtro inválido.")
+    if not str(data.get("name") or "").strip():
+        raise ValueError("Dê um nome ao filtro.")
+    keywords = data.get("keywords")
+    distinct = {
+        str(entry.get("phrase") if isinstance(entry, dict) else entry or "").strip().casefold()
+        for entry in (keywords if isinstance(keywords, list) else [])
+    } - {""}
+    if not distinct:
+        raise ValueError("Adicione ao menos uma keyword ao filtro.")
+    if len(distinct) > LINKEDIN_FILTER_MAX_KEYWORDS:
+        raise ValueError(
+            f"Use no máximo {LINKEDIN_FILTER_MAX_KEYWORDS} frases por filtro: o cargo e uma variante equivalente dele."
+        )
+    return json.dumps(_normalize_filter(data, slot), ensure_ascii=False)
 
 
-def ai_generate_linkedin_search_filters(cfg: dict[str, str]) -> list[dict]:
-    """Pede à IA um conjunto de filtros LinkedIn independentes com base no currículo."""
+def _load_filter(cfg: dict[str, str], slot: str) -> dict | None:
+    raw = (cfg.get(FILTER_SLOT_KEY[slot]) or "").strip()
+    if not raw:
+        return None
+    try:
+        item = _normalize_filter(json.loads(raw), slot)
+    except (ValueError, TypeError):
+        item = None
+    if item is None:
+        log_event("warning", "apify", f"Filtro {'principal' if slot == 'main' else 'secundário'} salvo é inválido; ignorado.")
+    return item
+
+
+def get_main_filter(cfg: dict[str, str]) -> dict | None:
+    """Filtro Principal salvo (nunca gerado automaticamente: só por ação explícita)."""
+    return _load_filter(cfg, "main")
+
+
+def get_secondary_filter(cfg: dict[str, str]) -> dict | None:
+    """Filtro Secundário salvo (nunca gerado automaticamente)."""
+    return _load_filter(cfg, "secondary")
+
+
+def _verify_filter(raw: dict, profile: dict, slot: str, avoid: tuple[str, ...] = ()) -> dict:
+    """Confere o filtro proposto pela IA contra o perfil verificado; levanta ValueError se nada sobrar."""
+    from candidate.resume_profile import evidence_index, months_for_roles, normalize_text
+
+    index = evidence_index(profile)
+    derived = profile.get("derived", {})
+    roles = {role["id"]: role for role in profile.get("roles", [])}
+    current = set(derived.get("current_role_ids", []))
+    skill_stats = derived.get("skills", {})
+    avoid_keys = {item.casefold() for item in avoid}
+    wanted_kinds = {"role", "responsibility"} if slot == "main" else {"transferable", "role", "responsibility"}
+
+    def weak_skill(phrase: str) -> str:
+        norm = f" {normalize_text(phrase)} "
+        for skill in profile.get("skills", []):
+            if skill.get("category") not in _TECH_SKILL_CATEGORIES:
+                continue
+            name = normalize_text(skill.get("name", ""))
+            if not name or f" {name} " not in norm:
+                continue
+            stat = skill_stats.get(skill["id"], {})
+            if stat.get("months", 0) < 12 and not (set(stat.get("role_ids", [])) & current):
+                return skill["name"]
+        return ""
+
+    kept: list[str] = []
+    evidence: dict[str, list[str]] = {}
+    anchor_ids: list[str] = []
+    for entry in raw.get("keywords") or []:
+        phrase = str((entry.get("phrase") if isinstance(entry, dict) else entry) or "").strip()
+        ids = [i for i in ((entry.get("evidence_ids") if isinstance(entry, dict) else None) or []) if isinstance(i, str) and i in index]
+        reason = ""
+        if not phrase:
+            continue
+        if not ids:
+            reason = "sem evidência válida no perfil"
+        elif phrase.casefold() in avoid_keys:
+            reason = "repete o filtro principal"
+        elif not {index[i]["kind"] for i in ids} & wanted_kinds:
+            reason = "não cita um cargo do currículo" if slot == "main" else "não cita capacidade transferível nem cargo"
+        elif (skill := weak_skill(phrase)):
+            reason = f"qualificador '{skill}' sem 12 meses de uso comprovado"
+        if reason:
+            log_event("info", "apify", f"Keyword descartada ({reason}): {phrase}")
+            continue
+        if phrase.casefold() in {k.casefold() for k in kept}:
+            continue
+        kept.append(phrase)
+        evidence[phrase] = ids[:4]
+        for i in ids:
+            if index[i]["kind"] in ("role", "responsibility"):
+                anchor_ids.append(i.split(".")[0])
+        if len(kept) == LINKEDIN_FILTER_MAX_KEYWORDS:
+            break
+    if not kept:
+        raise ValueError(
+            "A IA não retornou uma frase com evidência válida no currículo "
+            + ("(o filtro principal precisa citar um cargo seu)." if slot == "main" else "(capacidade transferível ou cargo).")
+        )
+    for i in raw.get("anchor_role_ids") or []:
+        if i in roles:
+            anchor_ids.append(i)
+    anchor_ids = [i for n, i in enumerate(anchor_ids) if i in roles and i not in anchor_ids[:n]]
+    role_months = derived.get("role_months", {})
+    out = {
+        "name": raw.get("name"), "keywords": kept, "experience_levels": raw.get("experience_levels"),
+        "reason": raw.get("reason"), "evidence": evidence, "source": "ai", "generated_at": now_iso(),
+        "anchor_roles": [
+            {"id": i, "title": roles[i].get("title", ""), "employer": roles[i].get("employer", ""), "months": role_months.get(i, 0)}
+            for i in anchor_ids
+        ],
+        "career_months": months_for_roles(profile, anchor_ids),
+        "enabled": True,
+    }
+    if slot == "secondary":
+        out["sector"], out["resilience_reason"] = raw.get("sector"), raw.get("resilience_reason")
+    return out
+
+
+def _generate_filter(cfg: dict[str, str], slot: str) -> dict:
+    """Gera UM filtro (principal ou secundário) a partir do perfil verificado do currículo."""
+    from candidate.resume_profile import compact_profile_text, merged_profile
+    from integrations.ai_client import call_ai_json
+
     with connect() as db:
-        summaries = resume_summaries(db)
-    resume_pt = (summaries.get("pt") or "").strip()
-    resume_en = (summaries.get("en") or "").strip()
-    if not resume_pt and not resume_en:
-        raise ValueError("Analise um currículo antes de gerar o filtro LinkedIn/Apify.")
-
-    facts_pt = (cfg.get("candidate_facts_pt") or "").strip()
-    facts_en = (cfg.get("candidate_facts_en") or "").strip()
-    pref_keywords = cfg.get("keywords", "")
+        bundle = merged_profile(db, prefer="pt")
+    if bundle is None:
+        raise ValueError(
+            "Analise um currículo antes de gerar o filtro LinkedIn/Apify "
+            "(se já analisou, aguarde a reanálise do perfil verificado na fila)."
+        )
+    profile, _ = bundle
     provider = cfg.get("ai_provider", "gemini").casefold()
     model = cfg.get("ai_model", "gemini-2.5-flash").strip()
     api_key = get_ai_key(provider)
     if not api_key:
         raise AiUnavailableError("Configure a chave da API de IA para gerar o filtro LinkedIn.")
 
+    secondary = slot == "secondary"
+    main = get_main_filter(cfg) if secondary else None
     prompt = render_linkedin_filter_prompt(
-        effective_linkedin_filter_prompt(cfg),
-        pref_keywords=pref_keywords,
-        facts_pt=facts_pt,
-        facts_en=facts_en,
-        resume_pt=resume_pt[:6000],
-        resume_en=resume_en[:6000],
+        effective_transferable_prompt(cfg) if secondary else effective_linkedin_filter_prompt(cfg),
+        pref_keywords=cfg.get("keywords", ""),
+        facts_pt=(cfg.get("candidate_facts_pt") or "").strip(),
+        facts_en=(cfg.get("candidate_facts_en") or "").strip(),
+        profile=compact_profile_text(profile, max_chars=7000),
+        area_hint=(cfg.get("secondary_area_hint") or "").strip(),
+        main_filter=" / ".join(main["keywords"]) if main else "",
     )
     prompt += (
-        "\n\nMANDATORY OUTPUT OVERRIDE: Return JSON exactly as "
-        '{"filters":[{"name":"...","keywords":["..."],"locations":["..."],'
-        '"experience_levels":[],"workplace_types":[],"reason":"..."}]}. '
-        "Create multiple independent filters (ideally 4–8), with only 1–3 related keywords per filter. "
-        "The empty arrays illustrate the schema only; populate them from the candidate context "
-        "and the search instructions above."
+        "\n\nOUTPUT: JSON {\"filter\": {...}} with EXACTLY ONE filter: name (short, Portuguese), "
+        "keywords (1-2 objects {\"phrase\", \"evidence_ids\"} naming the SAME role), anchor_role_ids, "
+        "experience_levels, reason (Portuguese), sector and resilience_reason (empty strings for the main filter)."
     )
-    try:
-        if provider == "openai":
-            endpoint = "https://api.openai.com/v1/responses"
-            payload = json.dumps(
-                {
-                    "model": model,
-                    "input": prompt,
-                    "text": {"format": {"type": "json_object"}},
-                    "store": False,
-                    "max_output_tokens": 1800,
-                }
-            ).encode("utf-8")
-            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        elif provider == "gemini":
-            endpoint = (
-                f"https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{quote_plus(model)}:generateContent?key={quote_plus(api_key)}"
-            )
-            payload = json.dumps(
-                {
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {"maxOutputTokens": 1800, "responseMimeType": "application/json"},
-                }
-            ).encode("utf-8")
-            headers = {"Content-Type": "application/json"}
-        else:
-            raise ValueError("Provedor de IA inválido.")
-        request = Request(endpoint, data=payload, headers=headers, method="POST")
-        with urlopen(request, timeout=60) as response:
-            result = json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")[:300]
-        quota = exc.code in {401, 403, 429} or "quota" in body.casefold()
-        _record_ai_usage(provider, model, None, ok=False, quota_error=quota)
-        if quota:
-            raise AiUnavailableError(f"IA indisponível ao gerar filtro LinkedIn (HTTP {exc.code}).") from exc
-        raise
-    except URLError as exc:
-        _record_ai_usage(provider, model, None, ok=False, quota_error=True)
-        raise AiUnavailableError(f"IA indisponível ao gerar filtro LinkedIn: {exc}") from exc
+    decision = call_ai_json(
+        prompt=prompt, schema=FILTER_SCHEMA, provider=provider, model=model, api_key=api_key,
+        max_output_tokens=3000, thinking_budget=1024,
+    )
+    raw = decision.get("filter") if isinstance(decision.get("filter"), dict) else {}
+    verified = _verify_filter(raw, profile, slot, avoid=tuple(main["keywords"]) if main else ())
+    result = _normalize_filter(verified, slot)
+    if result is None:
+        raise ValueError("A IA não retornou um filtro utilizável.")
+    return result
 
-    _record_ai_usage(provider, model, result if isinstance(result, dict) else None, ok=True, quota_error=False)
-    if provider == "openai":
-        raw_text = "\n".join(
-            part.get("text", "")
-            for item in result.get("output", [])
-            for part in item.get("content", [])
-            if part.get("type") == "output_text"
-        )
-    else:
-        raw_text = "\n".join(
-            part.get("text", "")
-            for item in result.get("candidates", [])
-            for part in item.get("content", {}).get("parts", [])
-        )
-    decision = json.loads(raw_text.strip())
-    if not isinstance(decision, dict):
-        raise ValueError("Resposta da IA para filtro LinkedIn inválida.")
-    raw_filters = decision.get("filters") if isinstance(decision.get("filters"), list) else [decision]
-    expanded_filters: list[dict] = []
-    for index, item in enumerate(raw_filters):
-        if not isinstance(item, dict):
+
+def ai_generate_main_filter(cfg: dict[str, str]) -> dict:
+    """Filtro Principal (TI/programação) a partir do perfil verificado."""
+    return _generate_filter(cfg, "main")
+
+
+def ai_generate_secondary_filter(cfg: dict[str, str]) -> dict:
+    """Filtro Secundário (área de reserva resiliente), com a dica opcional do painel."""
+    return _generate_filter(cfg, "secondary")
+
+
+def linkedin_search_scope(cfg: dict[str, str]) -> list[dict]:
+    """Pares (local, modelo) das buscas, derivados do Perfil; a IA não escolhe local nem modelo.
+
+    Com a elegibilidade geográfica ligada: remoto mundial, remoto no seu país e qualquer modelo
+    na sua cidade. Desligada: só mundial e país, sem filtro de modelo.
+    """
+    from jobs.form_rules import infer_candidate_country
+    from jobs.job_assessment import geo_enabled
+
+    enabled = geo_enabled(cfg)
+    remote = "2" if enabled else ""
+    country = infer_candidate_country(cfg).strip()
+    city = (cfg.get("candidate_city") or "").strip()
+    pairs: list[tuple[str, str]] = [("Worldwide", remote)]
+    if country and country.casefold() != "worldwide":
+        pairs.append((country, remote))
+    if enabled and city:
+        pairs.append((city, ""))
+    scope: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for location, f_wt in pairs:
+        key = (location.casefold(), f_wt)
+        if key in seen:
             continue
-        item_keywords = item.get("keywords") if isinstance(item.get("keywords"), list) else []
-        groups = [item_keywords[i : i + 3] for i in range(0, len(item_keywords), 3)]
-        if len(groups) > 1:
-            for part, group in enumerate(groups, start=1):
-                expanded_filters.append({
-                    **item,
-                    "name": f"{item.get('name') or f'Busca {index + 1}'} {part}",
-                    "keywords": group,
-                })
-        else:
-            expanded_filters.append(item)
-    if not expanded_filters:
-        raise ValueError("A IA não retornou nenhum filtro LinkedIn válido.")
-    filters = _normalize_linkedin_filters(expanded_filters, cfg)
-    for index, item in enumerate(filters, start=1):
-        item["source"] = "ai"
-        item["id"] = str(item.get("id") or f"ai-{index}")
-    return filters
+        seen.add(key)
+        scope.append({"location": location, "f_wt": f_wt,
+                      "label": ("Remoto — " if f_wt == "2" else "Qualquer modelo — ") + location})
+    return scope
 
 
-def get_linkedin_search_filters(cfg: dict[str, str], *, force_refresh: bool = False) -> list[dict]:
-    """Preserva a coleção salva; só substitui mediante regeneração explícita."""
-    cached_raw = (cfg.get("apify_linkedin_filters_json") or "").strip()
-    if not force_refresh and cached_raw:
-        try:
-            cached = json.loads(cached_raw)
-            if not isinstance(cached, (list, dict)):
-                raise ValueError("Coleção de filtros inválida")
-            filters = _normalize_linkedin_filters(
-                cached, cfg, fallback_if_empty=False
-            )
-            return filters
-        except (ValueError, TypeError):
-            log_event("warning", "apify", "Coleção LinkedIn salva inválida; tentando gerar filtros.")
-
-    legacy_filter: dict | None = None
-    if not cached_raw:
-        try:
-            old = json.loads((cfg.get("apify_linkedin_filter_json") or "").strip() or "null")
-            if isinstance(old, dict):
-                legacy_filter = old
-        except json.JSONDecodeError:
-            pass
-    if legacy_filter and not force_refresh:
-        return _normalize_linkedin_filters([legacy_filter], cfg)
-    fingerprint = _resume_filter_fingerprint(cfg)
-    try:
-        generated = ai_generate_linkedin_search_filters(cfg)
-    except (AiUnavailableError, ValueError, json.JSONDecodeError) as exc:
-        log_event("warning", "apify", f"Filtros LinkedIn via IA indisponíveis ({exc}); usando fallback.")
-        if legacy_filter:
-            generated = _normalize_linkedin_filters([legacy_filter], cfg)
-            generated[0]["source"] = "legacy"
-        else:
-            generated = _fallback_linkedin_filters(cfg)
-
-    old_enabled: dict[str, bool] = {}
-    if cached_raw:
-        try:
-            old_enabled = {
-                str(item.get("name") or "").strip().casefold(): bool(item.get("enabled", True))
-                for item in _normalize_linkedin_filters(json.loads(cached_raw), cfg)
-            }
-        except json.JSONDecodeError:
-            pass
-    if old_enabled:
-        for item in generated:
-            if item["name"].casefold() in old_enabled:
-                item["enabled"] = old_enabled[item["name"].casefold()]
-    payload = _normalize_linkedin_filters(generated, cfg)
-    set_setting("apify_linkedin_filters_json", json.dumps(payload, ensure_ascii=False))
-    set_setting("apify_linkedin_filter_hash", fingerprint)
-    log_event(
-        "info",
-        "apify",
-        f"{len(payload)} filtros LinkedIn disponíveis; "
-        f"{sum(1 for item in payload if item['enabled'])} ativos.",
-    )
-    return payload
-
-
-def get_linkedin_search_filter(cfg: dict[str, str], *, force_refresh: bool = False) -> dict:
-    """Compatibilidade dos placeholders customizados: usa o primeiro filtro ativo."""
-    filters = get_linkedin_search_filters(cfg, force_refresh=force_refresh)
-    return next((item for item in filters if item.get("enabled")), filters[0] if filters else _fallback_linkedin_filter(cfg))
-
-
-def build_linkedin_search_urls(filter_data: dict) -> list[str]:
-    """Cobre todas as combinações, primeiro 24 horas e depois até 7 dias.
+def build_linkedin_search_urls(filter_data: dict, scope: list[dict]) -> list[str]:
+    """Cobre todas as combinações keyword × escopo, primeiro 24 horas e depois até 7 dias.
 
     O limite por execução é aplicado em lotes, nunca descartando URLs aqui.
     """
-    keywords = [str(k) for k in (filter_data.get("keywords") or []) if str(k).strip()]
-    locations = [str(x) for x in (filter_data.get("locations") or []) if str(x).strip()][:4]
-    if not keywords:
-        keywords = ["software engineer"]
-    if not locations:
-        locations = ["Remote", "Belo Horizonte"]
+    keywords = [str(k) for k in (filter_data.get("keywords") or []) if str(k).strip()][:LINKEDIN_FILTER_MAX_KEYWORDS]
+    if not keywords or not scope:
+        return []
     experience = [int(x) for x in (filter_data.get("experience_levels") or []) if int(x) in LINKEDIN_EXPERIENCE_CODES]
-    workplace = [int(x) for x in (filter_data.get("workplace_types") or []) if int(x) in LINKEDIN_WORKPLACE_CODES]
     f_e = "%2C".join(str(x) for x in experience) if experience else ""
-
-    def _is_bh(loc: str) -> bool:
-        low = loc.casefold()
-        return "belo horizonte" in low or low in {"bh", "bh, mg", "bh - mg"}
-
-    # Pares intencionais: remote → qualquer lugar remoto; hybrid → só BH.
-    pairs: list[tuple[str, str]] = []
-    if 2 in workplace:
-        remote_locs = [loc for loc in locations if not _is_bh(loc) and loc.casefold() not in {"brazil", "brasil"}] or ["Remote"]
-        for loc in remote_locs:
-            pairs.append((loc, "2"))
-    if 3 in workplace:
-        bh_locs = [loc for loc in locations if _is_bh(loc)] or ["Belo Horizonte"]
-        for loc in bh_locs[:1]:
-            pairs.append((loc, "3"))
-    if 1 in workplace and not pairs:
-        pairs.append((locations[0], "1"))
-    if not workplace:
-        pairs = [(loc, "") for loc in locations]
-    elif not pairs:
-        pairs = [("Remote", "2"), ("Belo Horizonte", "3")]
 
     def _url(keyword: str, location: str, f_wt: str, tpr: str) -> str:
         url = (
@@ -1358,32 +1203,52 @@ def build_linkedin_search_urls(filter_data: dict) -> list[str]:
     day_urls: list[str] = []
     week_urls: list[str] = []
     for keyword in keywords:
-        for location, f_wt in pairs:
-            day_urls.append(_url(keyword, location, f_wt, LINKEDIN_TPR_DAY))
-            week_urls.append(_url(keyword, location, f_wt, LINKEDIN_TPR_WEEK))
-
+        for item in scope:
+            day_urls.append(_url(keyword, item["location"], item["f_wt"], LINKEDIN_TPR_DAY))
+            week_urls.append(_url(keyword, item["location"], item["f_wt"], LINKEDIN_TPR_WEEK))
     return list(dict.fromkeys(day_urls + week_urls))
 
 
-def plan_apify_runs(actors: list[dict], filters: list[dict]) -> list[tuple[dict, dict | None, list[str] | None]]:
-    """Distribui todas as URLs em lotes; todos os filtros do dia vêm primeiro."""
+def split_apify_count(base: int, filters: list[dict], main_share: int) -> list[int]:
+    """Principal sozinho: tudo. Principal + Secundário: fatia configurável (mínimo de 1 vaga cada)."""
+    base = max(1, int(base))
+    if len(filters) < 2:
+        return [base] * len(filters)
+    share = max(50, min(95, int(main_share)))
+    main = max(1, int(base * share / 100 + 0.5))
+    return [main, max(1, base - main)]
+
+
+def plan_apify_runs(
+    actors: list[dict],
+    main: dict | None,
+    secondary: dict | None = None,
+    *,
+    scope: list[dict],
+    main_share: int = 70,
+) -> list[tuple[dict, dict | None, list[str] | None]]:
+    """Divide a quantidade entre Principal e Secundário e prioriza os lotes do dia."""
     planned: list[tuple[dict, dict | None, list[str] | None]] = []
-    active_filters = [item for item in filters if item.get("enabled", True)]
+    active = [item for item in (main, secondary) if item and item.get("enabled", True)]
     for actor in actors:
         if not actor.get("enabled", True):
             continue
         if actor.get("input_mode") != "linkedin_search":
             planned.append((actor, None, None))
             continue
-        searches = [(item, build_linkedin_search_urls(item)) for item in active_filters]
+        if not active:
+            continue
+        counts = split_apify_count(int(actor.get("count") or 25), active, main_share)
+        searches = [(item, build_linkedin_search_urls(item, scope), count) for item, count in zip(active, counts)]
         for tpr in (LINKEDIN_TPR_DAY, LINKEDIN_TPR_WEEK):
-            for item, urls in searches:
+            for item, urls, count in searches:
                 phase_urls = [url for url in urls if f"f_TPR={tpr}" in url]
                 for offset in range(0, len(phase_urls), LINKEDIN_SEARCH_MAX_URLS):
                     batch = phase_urls[offset:offset + LINKEDIN_SEARCH_MAX_URLS]
                     label = str(actor.get("label") or actor["id"])
                     phase = "24h" if tpr == LINKEDIN_TPR_DAY else "7d"
-                    run_actor = {**actor, "label": f"{label}: {item['name']} ({phase}, lote {offset // LINKEDIN_SEARCH_MAX_URLS + 1})"}
+                    run_actor = {**actor, "count": count,
+                                 "label": f"{label}: {item['name']} ({phase}, lote {offset // LINKEDIN_SEARCH_MAX_URLS + 1})"}
                     planned.append((run_actor, item, batch))
     return planned
 
@@ -1400,8 +1265,10 @@ def build_apify_run_input(
     count = int(actor.get("count") or 25)
     mode = str(actor.get("input_mode") or "linkedin_search")
     if mode == "linkedin_search":
-        filter_data = linkedin_filter or get_linkedin_search_filter(cfg)
-        urls = linkedin_urls if linkedin_urls is not None else build_linkedin_search_urls(filter_data)
+        filter_data = linkedin_filter or get_main_filter(cfg)
+        if filter_data is None:
+            raise ValueError("Gere o filtro Principal no painel antes de coletar no LinkedIn.")
+        urls = linkedin_urls if linkedin_urls is not None else build_linkedin_search_urls(filter_data, linkedin_search_scope(cfg))
         return {"urls": urls, "count": count, "scrapeCompany": False}
 
     template = actor.get("input_template")
@@ -1630,7 +1497,7 @@ def run_apify_actor(
     actor_id = normalize_apify_actor_id(str(actor["id"]))
     label = str(actor.get("label") or actor_id)
     run_input = build_apify_run_input(actor, cfg, linkedin_filter=linkedin_filter, linkedin_urls=linkedin_urls)
-    log_event("info", "apify", f"Iniciando actor {label} ({actor_id}).")
+    log_event("info", "apify", f"Iniciando actor {label} ({actor_id}); quantidade solicitada: {run_input.get('count', 'definida pelo template')}.")
     started = fetch_json(
         f"{APIFY_API}/actors/{quote_plus(actor_id)}/runs",
         data=json.dumps(run_input).encode("utf-8"),
@@ -1685,18 +1552,30 @@ def iter_apify_jobs():
     actors = [actor for actor in load_apify_actors(cfg) if actor.get("enabled", True)]
     if not actors:
         raise ValueError("Nenhum actor Apify habilitado em apify_actors_json.")
-    linkedin_filters: list[dict] = []
+    main_filter: dict | None = None
+    secondary_filter: dict | None = None
+    scope: list[dict] = []
+    try:
+        main_share = int(cfg.get("linkedin_main_share") or 70)
+    except ValueError:
+        main_share = 70
     if any(actor.get("input_mode") == "linkedin_search" for actor in actors):
-        linkedin_filters = [
-            item for item in get_linkedin_search_filters(cfg) if item.get("enabled", True)
-        ]
-        if not linkedin_filters:
-            log_event("info", "apify", "Todos os filtros LinkedIn estão desativados; nenhum run LinkedIn será iniciado.")
+        main_filter = get_main_filter(cfg)
+        if main_filter is None:
+            log_event("warning", "apify", "Sem filtro Principal: nenhum run LinkedIn será iniciado. Gere o filtro Principal no painel.")
+        else:
+            secondary = get_secondary_filter(cfg)
+            secondary_filter = secondary if secondary and secondary.get("enabled", True) else None
+            scope = linkedin_search_scope(cfg)
+            if not any(item["location"] == (cfg.get("candidate_city") or "").strip() for item in scope) and str(cfg.get("geo_eligibility_enabled", "1")) != "0":
+                log_event("warning", "apify", "Cidade de residência não configurada no Perfil: a busca na sua cidade (híbrido/presencial) foi pulada.")
+            log_event("info", "apify", "Escopo das buscas: " + "; ".join(item["label"] for item in scope) + ".")
 
     results: list[dict] = []
     errors: list[str] = []
-    planned = plan_apify_runs(actors, linkedin_filters)
-    log_event("info", "apify", f"Coleta planejada: {len(linkedin_filters)} filtro(s) LinkedIn ativo(s), {len(planned)} execução(ões) Apify.")
+    planned = plan_apify_runs(actors, main_filter, secondary_filter, scope=scope, main_share=main_share)
+    active_count = sum(1 for item in (main_filter, secondary_filter) if item)
+    log_event("info", "apify", f"Coleta planejada: Principal{' + Secundário' if secondary_filter else ''} ({active_count} filtro(s)), {len(planned)} execução(ões) Apify.")
     attempted = 0
     for run_actor, linkedin_filter, linkedin_urls in planned:
         if collector.stop_event.is_set():
@@ -1744,14 +1623,19 @@ def fetch_apify() -> list[dict]:
 PROVIDERS = {"remotive": fetch_remotive, "remoteok": fetch_remoteok, "adzuna": fetch_adzuna, "apify": iter_apify_jobs}
 
 
-def matches_collection_preferences(job: dict, keyword_terms: list[str], location_terms: list[str]) -> bool:
+def matches_collection_preferences(job: dict, keyword_terms: list[str]) -> bool:
     """Filtros LinkedIn específicos substituem as preferências gerais da coleta."""
     if job.get("_linkedin_filter_id"):
         return True
-    searchable = " ".join((job["title"], job["company"], job["location"], re.sub("<[^>]+>", " ", job["description"]))).casefold()
-    if keyword_terms and not any(term in searchable for term in keyword_terms):
-        return False
-    if location_terms and not any(term in searchable for term in location_terms):
+    from jobs.job_assessment import clean_job_html
+
+    searchable = " ".join((job["title"], job["company"], job["location"], clean_job_html(job["description"]))).casefold()
+
+    def has_term(term: str) -> bool:
+        # Termo inteiro: "qa" não casa com "aqua", "java" não casa com "javascript".
+        return bool(term) and re.search(r"(?<![^\W_])" + re.escape(term) + r"(?![^\W_])", searchable) is not None
+
+    if keyword_terms and not any(has_term(term) for term in keyword_terms):
         return False
     return True
 
@@ -1839,7 +1723,6 @@ class Collector:
             run_id = row["id"]
         cfg = settings()
         keyword_terms = terms(cfg.get("keywords", ""))
-        location_terms = terms(cfg.get("locations", ""))
         sources = [value.strip().casefold() for value in cfg.get("sources", "").split(",") if value.strip()]
         found = 0
         limit_reached = False
@@ -1864,14 +1747,14 @@ class Collector:
                     if self.max_apply and found >= self.max_apply:
                         limit_reached = True
                         break
-                    if not matches_collection_preferences(job, keyword_terms, location_terms):
+                    if not matches_collection_preferences(job, keyword_terms):
                         continue
                     if not job["url"] or not job["title"]:
                         continue
                     language, language_confidence = detect_language(job["title"] + "\n" + re.sub(r"<[^>]+>", " ", job["description"]))
                     with connect() as db:
-                        cursor = db.execute("""INSERT INTO jobs(source,source_id,title,company,location,description,url,posted_at,first_seen_at,fingerprint,language,language_confidence)
-                          VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(fingerprint) DO NOTHING""", (job["source"], job["source_id"], job["title"], job["company"], job["location"], job["description"], job["url"], job["posted_at"],  now_iso(), fingerprint(job), language, language_confidence))
+                        cursor = db.execute("""INSERT INTO jobs(source,source_id,title,company,location,description,url,posted_at,first_seen_at,fingerprint,language,language_confidence,search_filter_id)
+                          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(fingerprint) DO NOTHING""", (job["source"], job["source_id"], job["title"], job["company"], job["location"], job["description"], job["url"], job["posted_at"],  now_iso(), fingerprint(job), language, language_confidence, str(job.get("_linkedin_filter_id") or "")))
                         inserted = max(cursor.rowcount, 0)
                     found += inserted
                     if inserted:
@@ -1914,8 +1797,29 @@ def _boot_logging() -> None:
     log_event("info", "app", "Painel de logs ativo.")
 
 
+def enqueue_missing_resume_profiles() -> list[str]:
+    """Currículos analisados antes do perfil verificado (v2) são reanalisados em segundo plano."""
+    from candidate.resume_profile import PROFILE_VERSION
+
+    with connect() as db:
+        rows = db.execute(
+            "SELECT language, profile_version FROM resumes WHERE analysis_status IN ('ok','reused') "
+            "AND analysis_summary != ''"
+        ).fetchall()
+    pending = [row["language"] for row in rows if (row["profile_version"] or "") != PROFILE_VERSION]
+    for language in pending:
+        queue.enqueue(KIND_RESUME, {"language": language, "force": True, "requested_at": now_iso()}, dedupe_key=f"resume:{language}")
+    if pending:
+        log_event("info", "resume", f"Perfil verificado ausente em {', '.join(x.upper() for x in pending)}; reanálise enfileirada.")
+    return pending
+
+
 def _boot_queue() -> None:
     queue.start()
+    try:
+        enqueue_missing_resume_profiles()
+    except Exception:
+        LOG.exception("Falha ao enfileirar reanálise de perfil do currículo")
 
 
 if __name__ == "__main__":

@@ -68,7 +68,7 @@ def is_retryable_error(exc: BaseException) -> bool:
     name = exc.__class__.__name__.casefold()
     if "nonretryable" in name:
         return False
-    if "aiunavailable" in name:
+    if "aiunavailable" in name or "airesponse" in name:
         return True
     if "operationalerror" in name and "locked" in str(exc).casefold():
         return True

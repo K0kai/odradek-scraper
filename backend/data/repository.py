@@ -90,17 +90,23 @@ DEFAULT_SETTINGS = {
     "resume_en_path": "",
     "auto_apply": "0",
     "browser_engine": "pydoll",
-    "minimum_match_score": "65",
+    "minimum_match_score": "70",
     "job_selection_optimism": "75",
+    # Dois filtros: Principal (TI/programação) e Secundário (área de reserva resiliente).
+    # Cada slot guarda UM objeto JSON (ou vazio). Sem listas de filtros.
+    "linkedin_main_filter_json": "",
+    "linkedin_secondary_filter_json": "",
+    "linkedin_main_share": "70",
+    "secondary_area_hint": "",
+    "geo_eligibility_enabled": "1",
+    "transferable_minimum_score": "60",
+    "transferable_prompt": "",
     "job_selection_prompt": "",
     "maximum_applications_per_run": "5",
     "adzuna_countries": "br,us,gb,ca",
     "apify_monthly_credit_limit_usd": "5",
     "apify_job_count": "25",
     "apify_actors_json": "[{\"id\": \"curious_coder~linkedin-jobs-scraper\", \"label\": \"LinkedIn Jobs\", \"enabled\": true, \"input_mode\": \"linkedin_search\", \"count\": 25}]",
-    "apify_linkedin_filter_json": "",
-    "apify_linkedin_filter_hash": "",
-    "apify_linkedin_filters_json": "",
     # Vazio = DEFAULT_LINKEDIN_FILTER_PROMPT (editável em Busca & coleta)
     "linkedin_filter_prompt": "",
     "ai_usage_json": "",
@@ -124,6 +130,40 @@ DEFAULT_SETTINGS = {
     "candidate_pcd": "no",
     "candidate_diversity_note": "",
 }
+
+
+# (tabela, coluna, definição) — aplicadas de forma idempotente em SQLite e Postgres.
+NEW_COLUMNS = (
+    ("resumes", "profile_json", "TEXT NOT NULL DEFAULT ''"),
+    ("resumes", "profile_version", "TEXT NOT NULL DEFAULT ''"),
+    ("ai_decisions", "assessment_json", "TEXT NOT NULL DEFAULT ''"),
+    ("ai_decisions", "scoring_version", "TEXT NOT NULL DEFAULT ''"),
+    ("ai_decisions", "provider", "TEXT NOT NULL DEFAULT ''"),
+    ("ai_decisions", "model", "TEXT NOT NULL DEFAULT ''"),
+    ("jobs", "search_filter_id", "TEXT NOT NULL DEFAULT ''"),
+)
+
+
+def ensure_new_columns(db, *, postgres: bool) -> None:
+    for table, column, definition in NEW_COLUMNS:
+        if postgres:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {definition}")
+        else:
+            existing = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+            if column not in existing:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def migrate_scoring_v2_defaults(db) -> None:
+    """Uma vez: o mínimo padrão antigo (65) sobe para 70 na triagem v2 (verificada)."""
+    marker = db.execute("SELECT value FROM settings WHERE key='scoring_v2_migrated'").fetchone()
+    if marker and marker["value"] == "1":
+        return
+    db.execute("UPDATE settings SET value='70' WHERE key='minimum_match_score' AND value IN ('65','80')")
+    db.execute(
+        "INSERT INTO settings(key,value) VALUES('scoring_v2_migrated','1') "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+    )
 
 
 def connect() -> sqlite3.Connection:
@@ -167,17 +207,8 @@ def initialize() -> None:
                 "CREATE INDEX IF NOT EXISTS jobs_status_seen_idx "
                 "ON jobs(status, first_seen_at DESC)"
             )
-            db.execute(
-                "UPDATE settings SET value='65' WHERE key='minimum_match_score' AND value='80'"
-            )
-            db.execute(
-                "UPDATE settings SET value='' WHERE key='apify_linkedin_filter_hash' "
-                "AND COALESCE((SELECT value FROM settings WHERE key='apify_linkedin_geo_v2'), '') <> '1'"
-            )
-            db.execute(
-                "INSERT INTO settings(key,value) VALUES('apify_linkedin_geo_v2','1') "
-                "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value"
-            )
+            ensure_new_columns(db, postgres=True)
+            migrate_scoring_v2_defaults(db)
             ensure_log_table(db)
         return
 
@@ -288,20 +319,8 @@ def initialize() -> None:
                 "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING",
                 (key, value),
             )
-        # Default antigo (80) era rígido demais com a triagem generosa.
-        db.execute(
-            "UPDATE settings SET value='65' WHERE key='minimum_match_score' AND value='80'"
-        )
-        # Uma vez: regenerar filtro LinkedIn com geo remote global + híbrido BH.
-        row = db.execute(
-            "SELECT value FROM settings WHERE key='apify_linkedin_geo_v2'"
-        ).fetchone()
-        if not row or row["value"] != "1":
-            db.execute("UPDATE settings SET value='' WHERE key='apify_linkedin_filter_hash'")
-            db.execute(
-                "INSERT INTO settings(key,value) VALUES('apify_linkedin_geo_v2','1') "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
-            )
+        ensure_new_columns(db, postgres=False)
+        migrate_scoring_v2_defaults(db)
         ensure_log_table(db)
 
 

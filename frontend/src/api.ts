@@ -5,6 +5,40 @@ export type Collector = {
   last_found: number
 }
 
+export type AssessmentItem = {
+  id: string
+  text: string
+  kind: string
+  status: 'met' | 'transferable' | 'partial' | 'unmet' | 'unknown'
+  realism: string
+  realism_reason: string
+  bridge: string
+  resume_quote: string
+  job_quote: string
+}
+
+export type Assessment = {
+  track: 'core' | 'transferable'
+  inflated_posting: boolean
+  must_cov: number
+  threshold: number
+  blocks: string[]
+  requirements: AssessmentItem[]
+  responsibilities: AssessmentItem[]
+  objections: { severity: string; reason: string }[]
+}
+
+export type FilterMetric = {
+  collected: number
+  last_7d: number
+  last_30d: number
+  triaged: number
+  approved: number
+  ignored_by_user: number
+  approval_rate: number | null
+  low_precision: boolean
+}
+
 export type Job = {
   id: number
   title: string
@@ -20,6 +54,7 @@ export type Job = {
   match_score: number | null
   has_cover_letter: boolean
   cover_letter: string
+  assessment?: Assessment | null
 }
 
 export type Run = {
@@ -204,9 +239,13 @@ export const api = {
   saveSettings: (group: SettingsGroup, values: Record<string, string>) => request<{ notice: string; values: Record<string, string> }>(`/api/settings/${group}`, {
     method: 'POST', body: JSON.stringify(values),
   }),
-  generateLinkedInFilters: (values: Record<string, string>) => request<{ notice: string; values: Record<string, string> }>('/api/linkedin-filters/generate', {
+  generateMainFilter: (values: Record<string, string>) => request<{ notice: string; values: Record<string, string> }>('/api/linkedin-filters/generate', {
     method: 'POST', body: JSON.stringify(values),
   }),
+  generateSecondaryFilter: (values: Record<string, string>) => request<{ notice: string; values: Record<string, string> }>('/api/linkedin-filters/generate-secondary', {
+    method: 'POST', body: JSON.stringify(values),
+  }),
+  filterMetrics: () => request<{ metrics: Record<string, FilterMetric> }>('/api/linkedin-filters/metrics'),
   formRules: () => request<{ items: FormRule[] }>('/api/form-rules'),
   saveFormRules: (items: FormRule[]) => request<{ notice: string }>('/api/form-rules', { method: 'POST', body: JSON.stringify({ items }) }),
   testSmtp: () => request<{ notice: string }>('/api/smtp/test', { method: 'POST' }),

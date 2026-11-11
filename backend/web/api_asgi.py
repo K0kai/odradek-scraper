@@ -448,18 +448,39 @@ def save_settings(group: str, body: dict = Body(...)):
 
 
 @api.post("/api/linkedin-filters/generate")
-def generate_linkedin_filters(body: dict = Body(...)):
+def generate_main_filter(body: dict = Body(...)):
     if any(not isinstance(value, str) or len(value) > 30000 for value in body.values()):
         return _error("Valor inválido para a configuração de busca")
     form = {key: value for key, value in body.items() if key in panel_settings.SETTINGS_API_GROUPS["search"]}
     try:
-        generated = panel_settings.generate_linkedin_filters(form)
+        generated = panel_settings.generate_main_filter(form)
     except ValueError as exc:
         return _error(str(exc))
     except Exception as exc:
-        log_event("warning", "apify", f"Falha ao gerar filtros LinkedIn: {exc}")
-        return _error("Não foi possível gerar filtros com IA.", 503)
-    return {"ok": True, "notice": f"A IA gerou {len(generated)} filtros LinkedIn.",
+        log_event("warning", "apify", f"Falha ao gerar o filtro Principal: {exc}")
+        return _error("Não foi possível gerar o filtro Principal com IA.", 503)
+    return {"ok": True, "notice": f"A IA gerou o filtro Principal: {' / '.join(generated['keywords'])}.",
+            "values": panel_settings.settings_api_payload("search")["values"]}
+
+
+@api.get("/api/linkedin-filters/metrics")
+def linkedin_filter_metrics():
+    return panel_queries.filter_metrics_api_payload()
+
+
+@api.post("/api/linkedin-filters/generate-secondary")
+def generate_secondary_filter(body: dict = Body(...)):
+    if any(not isinstance(value, str) or len(value) > 30000 for value in body.values()):
+        return _error("Valor inválido para a configuração de busca")
+    form = {key: value for key, value in body.items() if key in panel_settings.SETTINGS_API_GROUPS["search"]}
+    try:
+        generated = panel_settings.generate_secondary_filter(form)
+    except ValueError as exc:
+        return _error(str(exc))
+    except Exception as exc:
+        log_event("warning", "apify", f"Falha ao gerar o filtro Secundário: {exc}")
+        return _error("Não foi possível gerar o filtro Secundário com IA.", 503)
+    return {"ok": True, "notice": f"A IA gerou o filtro Secundário: {' / '.join(generated['keywords'])}.",
             "values": panel_settings.settings_api_payload("search")["values"]}
 
 
@@ -538,10 +559,13 @@ def _reanalyze_resume(language: str) -> str:
         row = get_resume(db, language)
         if not row:
             raise ValueError(f"Não há currículo {language.upper()} salvo.")
-        if not (row["extracted_text"] or "").strip() and not (
-            row["stored_path"] and os.path.exists(row["stored_path"])
-        ):
-            raise ValueError(f"Currículo {language.upper()} sem arquivo/texto para reanalisar.")
+        if not (row["extracted_text"] or "").strip():
+            from candidate.resume_storage import read_pdf
+
+            try:
+                read_pdf(db, row, core.RESUMES_DIR)
+            except Exception as exc:
+                raise ValueError(f"Currículo {language.upper()} sem arquivo/texto para reanalisar.") from exc
         db.execute(
             """UPDATE resumes SET analysis_status='pending', analysis_error='',
                analysis_message=?, updated_at=? WHERE language=?""",

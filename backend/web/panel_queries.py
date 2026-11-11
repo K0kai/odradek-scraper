@@ -1,5 +1,7 @@
 """Read models returned to the web panel."""
+import json
 import re
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 from app import STATUSES, collector, connect, load_apify_quota_snapshot, queue, settings
@@ -11,14 +13,45 @@ from candidate.resume_pipeline import get_resume
 JOB_SELECT = (
     "SELECT jobs.id, jobs.title, jobs.company, jobs.location, jobs.source, jobs.url, "
     "jobs.posted_at, jobs.first_seen_at, jobs.status, jobs.description, jobs.notes, "
-    "cover_letters.body AS cover_letter, " + _worth_match_expr() + " AS match_score "
+    "cover_letters.body AS cover_letter, " + _worth_match_expr() + " AS match_score, "
+    "(SELECT assessment_json FROM ai_decisions WHERE ai_decisions.job_id = jobs.id ORDER BY id DESC LIMIT 1) AS assessment_json "
     "FROM jobs LEFT JOIN cover_letters ON cover_letters.job_id=jobs.id "
 )
+
+
+def _compact_assessment(raw: object) -> dict | None:
+    """Versão enxuta da auditoria da triagem v2 para o card (checklist, bloqueios, ignorados)."""
+    try:
+        audit = json.loads(raw) if isinstance(raw, str) and raw.strip() else None
+    except ValueError:
+        return None
+    if not isinstance(audit, dict) or not audit.get("requirements") and not audit.get("responsibilities"):
+        return None
+    decision = audit.get("decision") or {}
+
+    def item(entry: dict) -> dict:
+        return {key: str(entry.get(key) or "")[:240] for key in (
+            "id", "text", "kind", "status", "realism", "realism_reason", "bridge", "resume_quote", "job_quote")}
+
+    return {
+        "track": audit.get("track") or decision.get("track") or "core",
+        "inflated_posting": bool(audit.get("inflated_posting")),
+        "must_cov": round(float(decision.get("must_cov") or 0), 3),
+        "threshold": round(float(decision.get("threshold") or 0), 3),
+        "blocks": [str(b)[:200] for b in decision.get("blocks", [])][:8],
+        "requirements": [item(e) for e in audit.get("requirements", [])][:30],
+        "responsibilities": [item(e) for e in audit.get("responsibilities", [])][:12],
+        "objections": [
+            {"severity": str(o.get("severity", "")), "reason": str(o.get("reason") or o.get("job_quote") or "")[:200]}
+            for o in audit.get("objections", [])
+        ][:6],
+    }
 
 
 def _job_api_record(row) -> dict:
     """Keep the browser contract independent from database row implementations."""
     data = dict(row)
+    data["assessment"] = _compact_assessment(data.pop("assessment_json", None))
     data["description"] = re.sub(r"<[^>]+>", " ", data.get("description") or "")[:1800]
     data["match_score"] = int(data["match_score"]) if data.get("match_score") is not None else None
     data["cover_letter"] = data.get("cover_letter") or ""
@@ -34,7 +67,7 @@ def dashboard_api_payload() -> dict:
         counts = {row["status"]: row["n"] for row in db.execute("SELECT status, COUNT(*) n FROM jobs GROUP BY status")}
         rows = db.execute(JOB_SELECT + "ORDER BY jobs.first_seen_at DESC LIMIT 20").fetchall()
         runs = [dict(row) for row in db.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 8")]
-    return {"counts": counts, "jobs": [{**_job_api_record(row), "description": "", "notes": ""} for row in rows], "runs": runs,
+    return {"counts": counts, "jobs": [{**_job_api_record(row), "description": "", "notes": "", "assessment": None} for row in rows], "runs": runs,
             "collector": collector.snapshot(), "status_labels": STATUSES}
 
 
@@ -119,3 +152,34 @@ def resumes_api_payload() -> dict:
             "model": row["model"],
         }
     return result
+
+
+def filter_metrics_api_payload() -> dict:
+    """Rendimento por filtro de busca: quantas vagas trouxe e quantas a triagem aprovou."""
+    now = datetime.now(timezone.utc)
+    since7 = (now - timedelta(days=7)).isoformat(timespec="seconds")
+    since30 = (now - timedelta(days=30)).isoformat(timespec="seconds")
+    with connect() as db:
+        rows = db.execute(
+            """SELECT j.search_filter_id AS filter_id, COUNT(*) AS collected,
+                      SUM(CASE WHEN j.first_seen_at >= ? THEN 1 ELSE 0 END) AS last_7d,
+                      SUM(CASE WHEN j.first_seen_at >= ? THEN 1 ELSE 0 END) AS last_30d,
+                      SUM(CASE WHEN d.id IS NOT NULL THEN 1 ELSE 0 END) AS triaged,
+                      SUM(CASE WHEN d.should_apply = 1 THEN 1 ELSE 0 END) AS approved,
+                      SUM(CASE WHEN d.should_apply = 1 AND j.status = 'ignored' THEN 1 ELSE 0 END) AS ignored_by_user
+               FROM jobs j
+               LEFT JOIN ai_decisions d ON d.id = (SELECT MAX(x.id) FROM ai_decisions x WHERE x.job_id = j.id)
+               WHERE j.search_filter_id <> ''
+               GROUP BY j.search_filter_id""",
+            (since7, since30),
+        ).fetchall()
+    metrics = {}
+    for row in rows:
+        values = {key: int(row[key] or 0) for key in ("collected", "last_7d", "last_30d", "triaged", "approved", "ignored_by_user")}
+        rate = values["approved"] / values["triaged"] if values["triaged"] else None
+        metrics[row["filter_id"]] = {
+            **values, "approval_rate": rate,
+            # Só um aviso: o painel nunca desativa filtros sozinho.
+            "low_precision": values["triaged"] >= 20 and rate is not None and rate < 0.1,
+        }
+    return {"metrics": metrics}
