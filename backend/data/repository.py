@@ -99,6 +99,13 @@ DEFAULT_SETTINGS = {
     "linkedin_main_share": "70",
     "secondary_area_hint": "",
     "geo_eligibility_enabled": "1",
+    # Portfólio público (schema 2 de /ai/profile.json) como segunda fonte do perfil; vazio = desligado.
+    "portfolio_profile_url": "",
+    "portfolio_version": "",
+    "portfolio_profile_json": "",
+    "portfolio_text": "",
+    "portfolio_synced_at": "",
+    "portfolio_error": "",
     "transferable_minimum_score": "60",
     "transferable_prompt": "",
     "job_selection_prompt": "",

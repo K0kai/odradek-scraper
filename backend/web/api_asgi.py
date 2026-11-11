@@ -447,6 +447,24 @@ def save_settings(group: str, body: dict = Body(...)):
     return {"ok": True, "notice": notice, "values": panel_settings.settings_api_payload(group)["values"]}
 
 
+@api.get("/api/profile/portfolio")
+def portfolio_status():
+    from candidate.portfolio_source import portfolio_status as status
+
+    with core.connect() as db:
+        return status(db)
+
+
+@api.post("/api/profile/portfolio/sync")
+def portfolio_sync():
+    from candidate.portfolio_source import portfolio_status as status
+
+    result = core.sync_portfolio_now(force=True)
+    with core.connect() as db:
+        current = status(db)
+    return {"ok": result["status"] in {"updated", "unchanged"}, "result": result, "notice": result["message"], "status": current}
+
+
 @api.post("/api/linkedin-filters/generate")
 def generate_main_filter(body: dict = Body(...)):
     if any(not isinstance(value, str) or len(value) > 30000 for value in body.values()):

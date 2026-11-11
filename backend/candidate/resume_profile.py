@@ -281,6 +281,11 @@ def _index_to_ym(index: int) -> str:
     return f"{index // 12:04d}-{index % 12 + 1:02d}"
 
 
+def _compact(value: object) -> str:
+    """Chave de comparação de nomes de skill sem espaços: 'Node.js' e 'nodejs' coincidem."""
+    return normalize_text(str(value or "")).replace(" ", "")
+
+
 def compute_derived(profile: dict, *, today: date | None = None) -> dict:
     today = today or date.today()
     intervals: dict[str, tuple[int, int]] = {}
@@ -296,6 +301,16 @@ def compute_derived(profile: dict, *, today: date | None = None) -> dict:
         )
         role_norm[role["id"]] = NormalizedText.of(blob)
     skills: dict[str, dict] = {}
+    # Projetos pessoais (portfólio) dão evidência de uso da skill, mas ficam fora de months/total_months.
+    project_intervals = {}
+    for project in profile.get("projects", []):
+        interval = _interval(project, today) if project.get("start") else None
+        if interval:
+            project_intervals[project["id"]] = interval
+    project_stacks = {
+        p["id"]: {_compact(s) for s in p.get("stack", [])}
+        for p in profile.get("projects", []) if p["id"] in project_intervals
+    }
     for skill in profile.get("skills", []):
         canonical = skill.get("canonical") or normalize_text(skill.get("name", ""))
         used = [
@@ -308,11 +323,17 @@ def compute_derived(profile: dict, *, today: date | None = None) -> dict:
         ]
         months = union_months([intervals[i] for i in used])
         last = max((intervals[i][1] - 1 for i in used), default=None)
+        keys = {_compact(canonical), _compact(skill.get("name", ""))} - {""}
+        project_used = [pid for pid, stack in project_stacks.items() if keys & stack]
+        project_last = max((project_intervals[i][1] - 1 for i in project_used), default=None)
         skills[skill["id"]] = {
             "canonical": canonical,
             "months": months,
             "last_used": _index_to_ym(last) if last is not None else "",
             "role_ids": used,
+            "project_months": union_months([project_intervals[i] for i in project_used]),
+            "project_ids": project_used,
+            "project_last_used": _index_to_ym(project_last) if project_last is not None else "",
         }
     return {
         "total_months": union_months(list(intervals.values())),
@@ -445,6 +466,46 @@ def _role_key(role: dict) -> str:
     return f"{normalize_text(role.get('employer', '')) or normalize_text(role.get('title', ''))}|{role.get('start', '')}"
 
 
+def _item_marker(item: dict) -> str:
+    return _compact(item.get("canonical") or item.get("text") or item.get("language") or item.get("capability", ""))
+
+
+def _find_role(roles: list[dict], role: dict) -> dict | None:
+    """Mesmo cargo vindo de outra fonte: mesmo empregador+início, ou mesmo início com empregador/título contido."""
+    for existing in roles:
+        if _role_key(existing) == _role_key(role):
+            return existing
+    start = role.get("start", "")
+    employer, title = normalize_text(role.get("employer", "")), normalize_text(role.get("title", ""))
+    if not start:
+        return None
+    for existing in roles:
+        if existing.get("start") != start:
+            continue
+        other_employer = normalize_text(existing.get("employer", ""))
+        if employer and other_employer and (employer in other_employer or other_employer in employer):
+            return existing
+        if title and title == normalize_text(existing.get("title", "")):
+            return existing
+    return None
+
+
+def _enrich_project(projects: list[dict], incoming: dict) -> bool:
+    """Projeto datado do portfólio que já aparece no texto de um projeto do PDF: enriquece o existente."""
+    title = normalize_text(incoming.get("title", ""))
+    if len(title) < 4:
+        return False
+    for existing in projects:
+        if existing.get("title") == incoming.get("title") and existing.get("start"):
+            return True  # já fundido
+        if f" {title} " in f" {normalize_text(existing.get('text', ''))} ":
+            for key in ("title", "slug", "headline", "start", "end", "stack", "source", "url"):
+                if incoming.get(key):
+                    existing[key] = json.loads(json.dumps(incoming[key]))
+            return True
+    return False
+
+
 def merge_profiles(profiles: list[dict], *, today: date | None = None) -> dict | None:
     """Une perfis (PT/EN) sem duplicar: o primeiro da lista é o preferencial."""
     profiles = [p for p in profiles if p and p.get("roles") is not None]
@@ -453,14 +514,11 @@ def merge_profiles(profiles: list[dict], *, today: date | None = None) -> dict |
     if len(profiles) == 1:
         return profiles[0]
     base = json.loads(json.dumps(profiles[0]))
-    seen_roles = {_role_key(r): r for r in base["roles"]}
     for other in profiles[1:]:
         for role in other["roles"]:
-            existing = seen_roles.get(_role_key(role))
+            existing = _find_role(base["roles"], role)
             if existing is None:
-                clone = json.loads(json.dumps(role))
-                base["roles"].append(clone)
-                seen_roles[_role_key(clone)] = clone
+                base["roles"].append(json.loads(json.dumps(role)))
                 continue
             known = {normalize_text(r["text"]) for r in existing["responsibilities"]}
             for resp in role["responsibilities"]:
@@ -470,9 +528,11 @@ def merge_profiles(profiles: list[dict], *, today: date | None = None) -> dict |
                 if normalize_text(skill) not in {normalize_text(s) for s in existing["skills_used"]}:
                     existing["skills_used"].append(skill)
         for key in ("skills", "education", "certifications", "projects", "achievements", "languages", "transferable_skills"):
-            known_items = {normalize_text(i.get("canonical") or i.get("text") or i.get("language") or i.get("capability", "")) for i in base[key]}
+            known_items = {_item_marker(i) for i in base[key]}
             for item in other.get(key, []):
-                marker = normalize_text(item.get("canonical") or item.get("text") or item.get("language") or item.get("capability", ""))
+                marker = _item_marker(item)
+                if key == "projects" and _enrich_project(base[key], item):
+                    continue
                 if marker and marker not in known_items:
                     base[key].append(json.loads(json.dumps(item)))
                     known_items.add(marker)
@@ -511,6 +571,13 @@ def compact_profile_text(profile: dict, *, max_chars: int = 6000) -> str:
     lines = [f"TOTAL PROFESSIONAL EXPERIENCE (computed from dated roles): {format_months(derived.get('total_months', 0))}"]
     if profile.get("seniority"):
         lines.append(f"SELF-DESCRIBED LEVEL: {profile['seniority']}")
+    # Idiomas, local e autorização são curtos e decisivos: ficam no topo, longe do corte por max_chars.
+    if profile.get("languages"):
+        lines.append("LANGUAGES: " + "; ".join(f"[{i['id']}] {i['language']} {i['level']}".strip() for i in profile["languages"]))
+    if profile.get("location_notes"):
+        lines.append(f"LOCATION: {profile['location_notes']}")
+    if profile.get("work_authorization_notes"):
+        lines.append(f"WORK AUTHORIZATION: {profile['work_authorization_notes']}")
     lines.append("ROLES")
     for role in profile.get("roles", []):
         months = derived.get("role_months", {}).get(role["id"])
@@ -519,10 +586,19 @@ def compact_profile_text(profile: dict, *, max_chars: int = 6000) -> str:
         for resp in role.get("responsibilities", [])[:8]:
             lines.append(f"  [{resp['id']}] {resp['text'][:220]}")
     lines.append("SKILLS (id name: months used, last used)")
+    undated: list[str] = []
     for skill in profile.get("skills", []):
         stat = skill_stats.get(skill["id"], {})
-        usage = f"{format_months(stat['months'])}, last {stat['last_used']}" if stat.get("months") else "no dated usage"
+        if not stat.get("months") and not stat.get("project_months"):
+            undated.append(f"[{skill['id']}] {skill['name']}")  # sem datas: uma linha só, para não gastar o prompt
+            continue
+        usage = f"{format_months(stat['months'])}, last {stat['last_used']}" if stat.get("months") else "no dated professional usage"
+        if stat.get("project_months"):
+            ids = ",".join(stat.get("project_ids", []))
+            usage += f"; portfolio projects {format_months(stat['project_months'])} ({ids}), last {stat['project_last_used']}"
         lines.append(f"[{skill['id']}] {skill['name']}: {usage}")
+    if undated:
+        lines.append("LISTED SKILLS, NO DATED USAGE: " + ", ".join(undated))
     if profile.get("transferable_skills"):
         lines.append("TRANSFERABLE CAPABILITIES")
         for item in profile["transferable_skills"]:
@@ -530,14 +606,13 @@ def compact_profile_text(profile: dict, *, max_chars: int = 6000) -> str:
     for key, label in (("education", "EDUCATION"), ("certifications", "CERTIFICATIONS"), ("projects", "PROJECTS"), ("achievements", "ACHIEVEMENTS")):
         if profile.get(key):
             lines.append(label)
-            lines.extend(f"[{item['id']}] {item['text'][:200]}" for item in profile[key])
-    if profile.get("languages"):
-        lines.append("LANGUAGES")
-        lines.extend(f"[{i['id']}] {i['language']} {i['level']}".strip() for i in profile["languages"])
-    if profile.get("location_notes"):
-        lines.append(f"LOCATION: {profile['location_notes']}")
-    if profile.get("work_authorization_notes"):
-        lines.append(f"WORK AUTHORIZATION: {profile['work_authorization_notes']}")
+            for item in profile[key]:
+                if key == "projects" and item.get("start"):
+                    span = f"{item['start']} → {item.get('end') or '?'}"
+                    stack = ", ".join(item.get("stack", [])[:8])
+                    lines.append(f"[{item['id']}] {item.get('title') or 'Project'} ({span}; {stack}) — {(item.get('headline') or item['text'])[:200]}")
+                else:
+                    lines.append(f"[{item['id']}] {item['text'][:200]}")
     return "\n".join(lines)[:max_chars]
 
 
@@ -555,6 +630,10 @@ def evidence_index(profile: dict) -> dict[str, dict]:
     for key in ("education", "certifications", "projects", "achievements"):
         for item in profile.get(key, []):
             index[item["id"]] = {"kind": key, "text": item["text"], "quotes": [item["quote"]]}
+    for section in ("roles", "skills", "projects", "education"):
+        for item in profile.get(section, []):
+            if item.get("source") and item["id"] in index:
+                index[item["id"]].update(source=item["source"], url=item.get("url", ""))
     for item in profile.get("languages", []):
         index[item["id"]] = {"kind": "language", "text": f"{item['language']} {item['level']}", "quotes": [item["quote"]]}
     return index
@@ -615,6 +694,8 @@ def parse_profile(raw: str | None) -> dict | None:
 
 def merged_profile(db, *, prefer: str = "pt") -> tuple[dict, NormalizedText] | None:
     """Perfil fundido PT+EN e o texto normalizado (de ambos) para checar citações."""
+    from candidate.portfolio_source import load_portfolio  # import tardio: portfolio_source importa este módulo
+
     rows = db.execute("SELECT language, profile_json, extracted_text FROM resumes").fetchall()
     ordered = sorted(rows, key=lambda r: 0 if r["language"] == prefer else 1)
     profiles, texts = [], []
@@ -623,9 +704,16 @@ def merged_profile(db, *, prefer: str = "pt") -> tuple[dict, NormalizedText] | N
         if profile:
             profiles.append(profile)
             texts.append(row["extracted_text"] or "")
+    portfolio = load_portfolio(db, prefer)  # por último: o PDF tem precedência na fusão
+    if portfolio:
+        profiles.append(portfolio[0])
+        texts.append(portfolio[1])
     merged = merge_profiles(profiles)
     if not merged:
         return None
+    if "derived" not in merged:  # só portfólio: nada passou por ground_profile
+        merged["derived"] = compute_derived(merged)
+        merged["coverage"] = {"kept": 0, "dropped": {}, "ungrounded": 0}
     return merged, NormalizedText.of("\n".join(texts))
 
 

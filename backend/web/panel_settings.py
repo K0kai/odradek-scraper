@@ -1,6 +1,7 @@
 """Panel settings, SMTP check and LinkedIn filter persistence."""
 import json
 import math
+from urllib.parse import urlparse
 
 from app import (
     DEFAULT_JOB_SELECTION_PROMPT, DEFAULT_LINKEDIN_FILTER_PROMPT, DEFAULT_TRANSFERABLE_PROMPT,
@@ -44,7 +45,7 @@ SETTINGS_API_GROUPS = {
                 "candidate_country", "candidate_current_company", "candidate_cpf", "salary_expectation_brl",
                 "salary_expectation_usd", "salary_currency_preference", "salary_pj_multiplier",
                 "candidate_contract_type", "candidate_gender", "candidate_race", "candidate_lgbtq",
-                "candidate_pcd", "candidate_diversity_note"),
+                "candidate_pcd", "candidate_diversity_note", "portfolio_profile_url"),
     "ai": ("ai_provider", "ai_model", "candidate_facts_pt", "candidate_facts_en",
            "job_selection_optimism", "job_selection_prompt"),
     "automation": ("auto_apply", "minimum_match_score", "queue_max_workers", "queue_max_attempts",
@@ -122,6 +123,10 @@ def save_settings_api_group(group: str, incoming: dict) -> str:
         if incoming.get("smtp_password"):
             secret_set("smtp_password", str(incoming["smtp_password"]))
         return "SMTP salvo."
+    if group == "profile" and form.get("portfolio_profile_url", "").strip():
+        form["portfolio_profile_url"] = form["portfolio_profile_url"].strip()
+        if urlparse(form["portfolio_profile_url"]).scheme not in ("http", "https"):
+            raise ValueError("URL do portfólio inválida: use http(s)://...")
     save_settings(form)
     return "Perfil salvo." if group == "profile" else "Automação salva."
 

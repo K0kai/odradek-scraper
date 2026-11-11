@@ -151,6 +151,10 @@ export type ResumeRecord = {
   model: string
 }
 export type ResumesData = { pt: ResumeRecord | null; en: ResumeRecord | null }
+export type PortfolioStatus = {
+  url: string; version: string; synced_at: string; error: string
+  counts: { roles: number; projects: number; skills: number; education: number; languages: number }
+}
 export type CopilotAsk = {
   id: number
   job_id: number
@@ -228,6 +232,8 @@ export const api = {
   reanalyzeResume: (language: 'pt' | 'en') => postForm<{ ok: boolean; notice: string }>(
     '/api/resumes/reanalyze', { language },
   ),
+  portfolio: () => request<PortfolioStatus>('/api/profile/portfolio'),
+  syncPortfolio: () => request<{ ok: boolean; notice: string; status: PortfolioStatus }>('/api/profile/portfolio/sync', { method: 'POST' }),
   pendingAsk: () => request<{ ask: CopilotAsk | null }>('/api/copilot-asks/pending'),
   answerAsk: (id: number, answer: string, file: File | null) => postUpload<{ ok: boolean; notice: string }>(
     '/api/copilot-asks/answer', { id: String(id), answer }, file,

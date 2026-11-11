@@ -178,6 +178,7 @@ QUOTES: every `job_quote`, `realism_basis_quote`, `level_quote`, `*_quote` must 
    - met: the profile directly shows it. transferable: not done exactly, but the profile shows an equivalent capability (explain in `bridge`, one sentence). partial: related but incomplete. unmet: no evidence. unknown: cannot tell.
    - `evidence_ids`: ids from the profile ([R1], [R1.2], [S3], [T1]...). `resume_quote`: verbatim from that evidence. met/transferable/partial WITHOUT valid evidence ids will be downgraded to unmet.
    - Credit transferable capabilities generously but only when truly equivalent and evidenced (e.g. internal user support -> helpdesk, spreadsheet reporting -> data analysis).
+   - Portfolio projects ([P*] items, or a skill line saying "portfolio projects") are real evidence the candidate can use that skill: they may support met/partial for a SKILL requirement. They do NOT count as professional experience: never use them to satisfy "X years of experience" requirements.
 5. stated: min_years (number, 0 if none) with quote; workplace (remote/hybrid/onsite) with `workplace_quote`, or "unspecified" when the posting does not say; job_country and job_city where the job is based, each with a quote from the JOB TEXT or the Location line (empty when not stated); foreign_eligibility for the candidate living in {where or 'an unknown location'}: open_to_candidate ONLY when the posting explicitly says people there (or anyone/worldwide/"work from anywhere"/the candidate's region) can apply, restricted when it limits applicants to places that exclude the candidate, otherwise unstated; always with `eligibility_quote`. Do not guess any of these. authorization = candidate_lacks ONLY if the posting requires work authorization the candidate does not have per the profile, with quote; required_languages (languages the posting requires for the job, with quotes).
 6. role_family_fit: same (same occupation family as candidate's roles), adjacent (neighbouring family, skills clearly overlap), different. Be honest; adjacent/different is acceptable when transferable capabilities exist.
 7. cover_letter_required: true only if the posting explicitly asks for a cover letter.
@@ -188,7 +189,7 @@ CANDIDATE PREFERENCES (judgement guidance, never overrides the rules above):
 CANDIDATE FACTS: {facts or '[none]'}
 
 CANDIDATE PROFILE (evidence ids in brackets):
-{compact_profile_text(profile, max_chars=6500)}
+{compact_profile_text(profile, max_chars=9500)}
 
 JOB
 Title: {job.get('title', '')}
@@ -211,7 +212,7 @@ SCREENING RESULT
 {chr(10).join(lines)}
 
 CANDIDATE PROFILE
-{compact_profile_text(profile, max_chars=4500)}
+{compact_profile_text(profile, max_chars=6000)}
 
 JOB TEXT
 {job_text[:12000]}

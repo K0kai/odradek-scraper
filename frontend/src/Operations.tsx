@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { api, type LogItem, type QueueData, type QueueItem, type ResumeRecord, type ResumesData, type UsageData } from './api'
+import { api, type LogItem, type PortfolioStatus, type QueueData, type QueueItem, type ResumeRecord, type ResumesData, type UsageData } from './api'
 import { formatDate } from './format'
 
 const kinds: Record<string, string> = {
@@ -163,12 +163,31 @@ function ResumeCard({ language, record, refresh, notify }: {
   </article>
 }
 
+function PortfolioCard({ notify }: { notify: (message: string, error?: boolean) => void }) {
+  const [status, setStatus] = useState<PortfolioStatus | null>(null)
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+  const refresh = usePolling(api.portfolio, setStatus, setError, 30000)
+  async function sync() {
+    setBusy(true)
+    try { const result = await api.syncPortfolio(); setStatus(result.status); notify(result.notice, !result.ok) }
+    catch (err) { notify((err as Error).message, true) }
+    finally { setBusy(false) }
+  }
+  const counts = status?.counts
+  return <article className="resume-card"><div className="resume-head"><div><p className="eyebrow">FONTE EXTRA</p><h3>Portfólio online</h3></div><span className="status-pill">{!status ? '…' : !status.url ? 'Desligado' : status.error ? 'Com erro' : status.version ? 'Sincronizado' : 'Pendente'}</span></div>
+    {error && <p className="inline-message">{error} <button className="secondary" onClick={refresh}>Tentar novamente</button></p>}
+    {status && (status.url ? <div className="resume-info"><strong>{status.url}</strong>{status.version && counts && <span>{counts.roles} cargo(s) · {counts.projects} projeto(s) · {counts.skills} skill(s) · {counts.education} formação(ões)</span>}<span>Última sincronização: {formatDate(status.synced_at, true)}</span>{status.error && <p className="inline-message">{status.error}</p>}</div> : <p className="section-description">Informe a URL do portfólio em Configurações › Perfil para usar projetos e cargos atuais como evidência na triagem.</p>)}
+    <div className="job-actions"><button disabled={busy || !status?.url} onClick={sync}>Sincronizar portfólio</button></div>
+  </article>
+}
+
 export function ResumesView({ notify }: { notify: (message: string, error?: boolean) => void }) {
   const [data, setData] = useState<ResumesData | null>(null)
   const [error, setError] = useState('')
   const refresh = usePolling(api.resumes, setData, setError, 10000)
   return <section className="section"><div className="section-head"><div><p className="eyebrow">PERFIL PROFISSIONAL</p><h2>Currículos</h2></div><button className="secondary" onClick={refresh}>Atualizar</button></div>
     {error && <p className="banner error" role="alert">{error} <button onClick={refresh}>Tentar novamente</button></p>}
-    {!data ? <p className="empty">Carregando currículos…</p> : <div className="resume-grid"><ResumeCard language="pt" record={data.pt} refresh={refresh} notify={notify} /><ResumeCard language="en" record={data.en} refresh={refresh} notify={notify} /></div>}
+    {!data ? <p className="empty">Carregando currículos…</p> : <div className="resume-grid"><ResumeCard language="pt" record={data.pt} refresh={refresh} notify={notify} /><ResumeCard language="en" record={data.en} refresh={refresh} notify={notify} /><PortfolioCard notify={notify} /></div>}
   </section>
 }

@@ -467,11 +467,29 @@ def _claim_daily_worth_check(today: str) -> bool:
         return cur.rowcount == 1
 
 
+def sync_portfolio_now(*, force: bool = False) -> dict:
+    """Sincroniza o portfólio público (se houver URL). Nunca levanta; registra no log do painel."""
+    from candidate.portfolio_source import sync_portfolio
+
+    url = (settings().get("portfolio_profile_url") or "").strip()
+    with connect() as db:
+        result = sync_portfolio(db, url, force=force, now_iso=now_iso())
+    if result["status"] == "updated":
+        log_event("success", "portfolio", result["message"])
+    elif result["status"] == "error":
+        log_event("error", "portfolio", f"Falha ao sincronizar o portfólio: {result['message']}")
+    return result
+
+
 def _daily_worth_check_loop() -> None:
     """Queue one browser-free liveness pass per Brasília calendar day, after 03:00."""
+    portfolio_day = ""
     while True:
         try:
             today = datetime.now(BRASILIA).date().isoformat()
+            if today != portfolio_day:  # no boot e uma vez por dia; só reprocessa se a version do portfólio mudou
+                portfolio_day = today
+                sync_portfolio_now()
             if datetime.now(BRASILIA).hour >= 3 and _claim_daily_worth_check(today):
                 try:
                     with connect() as db:
@@ -1113,7 +1131,7 @@ def _generate_filter(cfg: dict[str, str], slot: str) -> dict:
         pref_keywords=cfg.get("keywords", ""),
         facts_pt=(cfg.get("candidate_facts_pt") or "").strip(),
         facts_en=(cfg.get("candidate_facts_en") or "").strip(),
-        profile=compact_profile_text(profile, max_chars=7000),
+        profile=compact_profile_text(profile, max_chars=9500),
         area_hint=(cfg.get("secondary_area_hint") or "").strip(),
         main_filter=" / ".join(main["keywords"]) if main else "",
     )
@@ -1718,6 +1736,10 @@ class Collector:
                 (started,),
             ).fetchone()
             run_id = row["id"]
+        try:
+            sync_portfolio_now()  # antes de ler settings: o snapshot novo vale já neste ciclo
+        except Exception as exc:
+            LOG.warning("Sync do portfólio falhou: %s", exc)
         cfg = settings()
         keyword_terms = terms(cfg.get("keywords", ""))
         sources = [value.strip().casefold() for value in cfg.get("sources", "").split(",") if value.strip()]

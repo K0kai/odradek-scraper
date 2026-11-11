@@ -45,6 +45,7 @@ const fields: Record<SettingsGroup, Field[]> = {
     { key: 'candidate_pcd', label: 'PCD', kind: 'select', options: [['not_informed', 'Prefiro não informar'], ['no', 'Não'], ['yes', 'Sim']] },
     { key: 'candidate_lgbtq', label: 'LGBTQ+', kind: 'select', options: [['not_informed', 'Prefiro não informar'], ['no', 'Hétero / cis'], ['gay', 'Gay'], ['lesbian', 'Lésbica'], ['bisexual', 'Bissexual'], ['pansexual', 'Pansexual'], ['asexual', 'Assexual'], ['other', 'Outra'], ['yes', 'Sim, genérico']] },
     { key: 'candidate_diversity_note', label: 'Nota de diversidade', kind: 'textarea', wide: true },
+    { key: 'portfolio_profile_url', label: 'URL do portfólio (/ai/profile.json, schema 2) — fonte extra de evidência', wide: true },
   ],
   ai: [
     { key: 'ai_provider', label: 'Provedor', kind: 'select', options: [['gemini', 'Gemini'], ['openai', 'OpenAI']] },
