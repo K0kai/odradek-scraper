@@ -1556,16 +1556,20 @@ button:hover:not(:disabled),.open-link:hover{
   align-items:center;
   justify-content:flex-end;
   gap:12px;
-  margin-top:18px;
-  padding:12px 0;
-  border-top:1px solid #303837;
-  background:#101213
+  margin:18px -25px -23px;
+  padding:14px 25px;
+  border-top:1px solid #2e3534;
+  border-radius:0 0 10px 10px;
+  background:#191d1e;
+  box-shadow:0 -10px 14px -10px rgba(0,0,0,.45)
 }
 .settings-bar .settings-state{
   margin-right:auto
 }
-@media(max-width:700px){
+@media(max-width:760px){
   .settings-bar{
+    margin:18px -17px -17px;
+    padding:12px 17px;
     flex-wrap:wrap
   }
 }
