@@ -83,6 +83,10 @@ export type JobList = {
   page_size: number
 }
 
+export type TriageTab = 'discarded' | 'pending'
+
+export type TriageList = JobList & { tab: TriageTab; counts: Record<TriageTab, number> }
+
 export type JobFilters = {
   status: string
   min_match: string
@@ -207,6 +211,10 @@ export const api = {
   session: () => request<{ auth_required: boolean; expires_at: number | null }>('/api/session'),
   dashboard: () => request<Dashboard>('/api/dashboard'),
   jobs: (filters: JobFilters) => request<JobList>(`/api/jobs?${new URLSearchParams(filters)}`),
+  triage: (tab: TriageTab, page: number) => request<TriageList>(`/api/triage?tab=${tab}&page=${page}`),
+  markReviewed: (ids: number[]) => request<{ count: number; notice: string }>('/api/triage/reviewed', {
+    method: 'POST', body: JSON.stringify({ ids }),
+  }),
   previewBulkIgnore: (filters: BulkIgnoreFilters) => request<{ count: number }>('/api/jobs/bulk-ignore/preview', {
     method: 'POST', body: JSON.stringify(filters),
   }),

@@ -9,6 +9,7 @@ import { formatDate } from './format'
 import { JobCard } from './JobCard'
 import { JobSort } from './JobSort'
 import { BulkIgnore } from './BulkIgnore'
+import { TriageView } from './Triage'
 import { isView, navigation, viewLabels, type View } from './views'
 
 function readLocation(): { view: View; filters: JobFilters } {
@@ -134,7 +135,7 @@ export function App() {
         <BulkIgnore onDone={reload} notify={notify} />
         {!jobs ? <p className="empty">Carregando vagas…</p> : jobs.items.length ? <div className="job-list">{jobs.items.map(job => <JobCard job={job} statusLabels={statusLabels} onChange={reload} key={job.id} />)}</div> : <p className="empty">Nenhuma vaga corresponde aos filtros. Ajuste o status, o match ou o período.</p>}
         {jobs && jobs.pages > 1 && <div className="pagination"><button className="secondary" disabled={jobs.page <= 1} onClick={() => setFilters(old => ({ ...old, page: String(jobs.page - 1) }))}>Anterior</button><span>Página {jobs.page} de {jobs.pages}</span><button className="secondary" disabled={jobs.page >= jobs.pages} onClick={() => setFilters(old => ({ ...old, page: String(jobs.page + 1) }))}>Próxima</button></div>}
-      </> : view === 'queue' ? <QueueView notify={notify} /> : view === 'logs' ? <LogsView notify={notify} /> : view === 'usage' ? <UsageView notify={notify} /> : view === 'resumes' ? <ResumesView notify={notify} /> : view === 'assistant' ? <AssistantView notify={notify} /> : null}
+      </> : view === 'triage' ? <TriageView statusLabels={statusLabels} notify={notify} /> : view === 'queue' ? <QueueView notify={notify} /> : view === 'logs' ? <LogsView notify={notify} /> : view === 'usage' ? <UsageView notify={notify} /> : view === 'resumes' ? <ResumesView notify={notify} /> : view === 'assistant' ? <AssistantView notify={notify} /> : null}
       <div hidden={view !== 'settings'}><SettingsView notify={notify} /></div>
       <div hidden={view !== 'rules'}><RulesView notify={notify} /></div>
     </main>

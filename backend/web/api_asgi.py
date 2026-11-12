@@ -172,6 +172,20 @@ def jobs(page: int = 1, page_size: int = 15, status: str = "worth", min_match: i
         return JSONResponse({"error": "Parâmetros de filtro inválidos"}, status_code=400)
 
 
+@api.get("/api/triage")
+def triage(tab: str = "discarded", page: int = 1, page_size: int = 15) -> dict:
+    return panel_queries.triage_api_payload(tab=tab, page=page, page_size=page_size)
+
+
+@api.post("/api/triage/reviewed")
+def triage_reviewed(body: dict = Body(...)):
+    ids = body.get("ids")
+    if not isinstance(ids, list) or not 1 <= len(ids) <= 100 or any(type(item) is not int for item in ids):
+        return _error("Informe de 1 a 100 vagas.")
+    count = panel_queries.mark_jobs_reviewed(ids)
+    return {"ok": True, "count": count, "notice": f"{count} vaga(s) marcada(s) como conferida(s)."}
+
+
 @api.post("/api/qpid/jobs/bulk-ignore/preview")
 @api.post("/api/jobs/bulk-ignore/preview")
 def bulk_ignore_preview(body: dict = Body(...)):

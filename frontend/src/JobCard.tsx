@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, type ReactNode } from 'react'
 import { api, type Assessment, type AssessmentItem, type Job } from './api'
 import { formatDate } from './format'
 
@@ -30,10 +30,11 @@ function AssessmentView({ assessment }: { assessment: Assessment }) {
   </details>
 }
 
-export function JobCard({ job, statusLabels, onChange }: {
+export function JobCard({ job, statusLabels, onChange, actions }: {
   job: Job
   statusLabels: Record<string, string>
   onChange: () => void
+  actions?: ReactNode
 }) {
   const [notes, setNotes] = useState(job.notes || '')
   const [busy, setBusy] = useState(false)
@@ -85,6 +86,7 @@ export function JobCard({ job, statusLabels, onChange }: {
       {job.status !== 'applied' && <button className="secondary" disabled={busy} onClick={() => changeStatus('applied')}>Marcar aplicada</button>}
       {job.status !== 'saved' && <button className="secondary" disabled={busy} onClick={() => changeStatus('saved')}>Salvar</button>}
       {job.status !== 'ignored' && <button className="secondary" disabled={busy} onClick={() => changeStatus('ignored')}>Ignorar</button>}
+      {actions}
     </div>
     {message && <p className="inline-message" role="status">{message}</p>}
   </article>

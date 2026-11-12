@@ -1721,3 +1721,7 @@ button:hover:not(:disabled),.open-link:hover{
 .range-field input[type=range]{width:100%;padding:0;accent-color:var(--accent,#79b8f0)}
 .range-field output{font-weight:600;white-space:nowrap}
 .range-field small{grid-column:1 / -1;opacity:.7;font-weight:400}
+
+.triage-item{display:grid;gap:6px}
+.triage-reason{margin:0;font-size:.9em;opacity:.85;line-height:1.4}
+.pager{display:flex;gap:12px;align-items:center;justify-content:center;margin-top:16px}

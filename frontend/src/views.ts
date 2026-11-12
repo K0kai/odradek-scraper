@@ -1,6 +1,7 @@
 export const viewLabels = {
   overview: 'Visão geral',
   jobs: 'Vagas para revisar',
+  triage: 'Não selecionadas',
   queue: 'Filas de IA',
   assistant: 'Assistente',
   logs: 'Logs',

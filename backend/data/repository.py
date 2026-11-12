@@ -150,6 +150,7 @@ NEW_COLUMNS = (
     ("ai_decisions", "provider", "TEXT NOT NULL DEFAULT ''"),
     ("ai_decisions", "model", "TEXT NOT NULL DEFAULT ''"),
     ("jobs", "search_filter_id", "TEXT NOT NULL DEFAULT ''"),
+    ("jobs", "reviewed_at", "TEXT NOT NULL DEFAULT ''"),  # quando o usuário conferiu uma vaga descartada pela IA
 )
 
 
@@ -171,6 +172,42 @@ def migrate_scoring_v2_defaults(db) -> None:
     db.execute("UPDATE settings SET value='70' WHERE key='minimum_match_score' AND value IN ('65','80')")
     db.execute(
         "INSERT INTO settings(key,value) VALUES('scoring_v2_migrated','1') "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+    )
+
+
+def migrate_discard_excluded_region_jobs(db) -> None:
+    """Uma vez: vagas antigas da Índia (golpe/vaga fantasma) saem de todas as listas.
+
+    Candidaturas feitas e vagas salvas pelo usuário ficam como estão. Vagas já ignoradas só ganham a marca de
+    conferida; as demais (novas, em triagem, preparadas, bloqueadas, para revisar) viram ignoradas com o motivo.
+    O marcador evita desfazer uma vaga que o usuário mover para revisar depois.
+    """
+    marker = db.execute("SELECT value FROM settings WHERE key='india_jobs_discarded_v1'").fetchone()
+    if marker and marker["value"] == "1":
+        return
+    from datetime import datetime, timezone
+
+    from jobs.region_filter import excluded_region_reason
+
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    rows = db.execute(
+        "SELECT id, status, location, title, description FROM jobs WHERE status NOT IN ('applied','saved')"
+    ).fetchall()
+    for row in rows:
+        job = dict(row)
+        reason = excluded_region_reason(job)
+        if not reason:
+            continue
+        if job["status"] == "ignored":
+            db.execute("UPDATE jobs SET reviewed_at=? WHERE id=?", (now, job["id"]))
+        else:
+            db.execute(
+                "UPDATE jobs SET status='ignored', reviewed_at=?, notes=? WHERE id=?",
+                (now, f"Região excluída: {reason}.", job["id"]),
+            )
+    db.execute(
+        "INSERT INTO settings(key,value) VALUES('india_jobs_discarded_v1','1') "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
     )
 
@@ -262,6 +299,7 @@ def initialize() -> None:
             migrate_scoring_v2_defaults(db)
             migrate_filter_prompts(db)
             migrate_selection_prompt(db)
+            migrate_discard_excluded_region_jobs(db)
             ensure_log_table(db)
         return
 
@@ -376,6 +414,7 @@ def initialize() -> None:
         migrate_scoring_v2_defaults(db)
         migrate_filter_prompts(db)
         migrate_selection_prompt(db)
+        migrate_discard_excluded_region_jobs(db)
         ensure_log_table(db)
 
 

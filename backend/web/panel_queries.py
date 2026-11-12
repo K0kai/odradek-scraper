@@ -105,6 +105,53 @@ def jobs_api_payload(*, page: int = 1, page_size: int = 15, status: str = "worth
             "min_match": min_match, "sort": sort, "date_from": date_from, "date_to": date_to}}
 
 
+# Abas da view "Não selecionadas": (filtro SQL, ordem).
+TRIAGE_TABS = {
+    # Descartadas pela IA e ainda não conferidas: a decisão mais recente reprovou a vaga. Vagas ignoradas à mão
+    # (decisão aprovada ou sem decisão, como as da Índia) não entram.
+    "discarded": (
+        "jobs.status = 'ignored' AND COALESCE(jobs.reviewed_at, '') = '' AND "
+        "(SELECT should_apply FROM ai_decisions WHERE ai_decisions.job_id = jobs.id ORDER BY id DESC LIMIT 1) = 0",
+        "COALESCE(" + _worth_match_expr() + ", 0) DESC, jobs.id DESC",
+    ),
+    # Ainda sem decisão da IA: coletadas ou na fila de triagem.
+    "pending": ("jobs.status IN ('new', 'review')", "jobs.first_seen_at DESC, jobs.id DESC"),
+}
+
+
+def triage_api_payload(*, tab: str = "discarded", page: int = 1, page_size: int = 15) -> dict:
+    tab = tab if tab in TRIAGE_TABS else "discarded"
+    page = max(1, page)
+    page_size = max(5, min(50, page_size))
+    where, order = TRIAGE_TABS[tab]
+    with connect() as db:
+        counts = {key: int(db.execute(f"SELECT COUNT(*) n FROM jobs WHERE {cond}").fetchone()["n"])
+                  for key, (cond, _) in TRIAGE_TABS.items()}
+        total = counts[tab]
+        pages = max(1, (total + page_size - 1) // page_size)
+        page = min(page, pages)
+        rows = db.execute(JOB_SELECT + f"WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
+                          [page_size, (page - 1) * page_size]).fetchall()
+    return {"tab": tab, "items": [_job_api_record(row) for row in rows], "total": total, "page": page,
+            "pages": pages, "page_size": page_size, "counts": counts}
+
+
+def mark_jobs_reviewed(ids: list[int]) -> int:
+    """Marca vagas descartadas pela IA como conferidas (saem da aba). Só mexe em vagas ignoradas."""
+    from app import now_iso
+
+    ids = [int(item) for item in dict.fromkeys(ids)]
+    if not ids:
+        return 0
+    marks = ",".join("?" * len(ids))
+    with connect() as db:
+        cursor = db.execute(
+            f"UPDATE jobs SET reviewed_at=? WHERE id IN ({marks}) AND status='ignored' AND COALESCE(reviewed_at, '')=''",
+            [now_iso(), *ids],
+        )
+        return max(cursor.rowcount, 0)
+
+
 def queue_api_payload() -> dict:
     items = []
     for row in queue.list_jobs(limit=100):
