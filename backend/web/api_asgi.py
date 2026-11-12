@@ -359,6 +359,23 @@ def autofill_rules():
     return {"fields": fields}
 
 
+@api.get("/api/autofill-resume", include_in_schema=False)
+def autofill_resume(language: str = Query("pt", pattern="^(pt|en)$")):
+    from candidate.resume_storage import read_pdf
+    from paths import RESUMES_DIR
+    with core.connect() as db:
+        resume = get_resume(db, language)
+        if not resume:
+            return JSONResponse({"error": "Currículo não cadastrado neste idioma."}, status_code=404)
+        try:
+            content = read_pdf(db, resume, RESUMES_DIR)
+        except (OSError, ValueError):
+            return JSONResponse({"error": "Arquivo de currículo indisponível."}, status_code=404)
+    return Response(content, media_type="application/pdf", headers={
+        "Content-Disposition": 'attachment; filename="curriculo.pdf"', "Cache-Control": "no-store",
+    })
+
+
 @api.post("/api/collector/{action}")
 def collector_action(action: str):
     return _collector_action(action)
