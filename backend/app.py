@@ -207,8 +207,10 @@ def _assessment_caller(provider: str, model: str, api_key: str):
         return call_ai_json(
             prompt=prompt, schema=schema, provider=provider, model=model, api_key=api_key,
             max_output_tokens=max_output_tokens, thinking_budget=thinking_budget,
+            on_model=lambda used: setattr(call, "last_model", used),
         )
 
+    call.last_model = model  # type: ignore[attr-defined]
     return call
 
 
@@ -244,6 +246,7 @@ def ai_assess_job(job: dict, cfg: dict[str, str], *, track: str = "core", call_j
     # O currículo é escolhido pelo idioma da vaga (não pelo LLM); cai para o outro se ausente.
     other = "en" if language == "pt" else "pt"
     resume_language = language if language in analyzed else other
+    model = getattr(call_json, "last_model", model)  # modelo que de fato respondeu (pode ser o fallback)
     return {
         **result, "provider": provider, "model": model, "resume_language": resume_language,
         "scoring_version": SCORING_VERSION,

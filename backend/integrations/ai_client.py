@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import re
+import threading
+import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
@@ -21,6 +24,69 @@ from urllib.request import Request, urlopen
 from candidate.resume_pipeline import AiResponseError, AiUnavailableError
 
 QUOTA_STATUSES = {401, 403, 429, 502, 503, 504}
+
+# Fallback de modelo, só Gemini e só modelos com camada gratuita (mesma chave, sem custo extra).
+# O 503 "high demand" e a quota (429) são POR MODELO: outro modelo costuma responder na hora.
+# AI_FALLBACK_MODELS (separado por vírgula) substitui a lista; vazio desliga o fallback.
+DEFAULT_FALLBACK_MODELS = ("gemini-2.5-flash", "gemini-2.5-flash-lite")
+OVERLOAD_STATUSES = {429, 500, 502, 503, 504}  # 401/403 = chave/permissão: trocar de modelo não ajuda
+PRIMARY_COOLDOWN_SECONDS = 90
+_cooldown_until: dict[tuple[str, str], float] = {}
+_cooldown_lock = threading.Lock()
+
+
+def fallback_models() -> list[str]:
+    raw = os.environ.get("AI_FALLBACK_MODELS")
+    if raw is None:
+        return list(DEFAULT_FALLBACK_MODELS)
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _cooling_down(provider: str, model: str) -> bool:
+    with _cooldown_lock:
+        return _cooldown_until.get((provider, model), 0.0) > time.monotonic()
+
+
+def _start_cooldown(provider: str, model: str) -> None:
+    with _cooldown_lock:
+        _cooldown_until[(provider, model)] = time.monotonic() + PRIMARY_COOLDOWN_SECONDS
+
+
+def model_chain(provider: str, model: str) -> list[str]:
+    """Modelo configurado primeiro; fallbacks gratuitos depois. Modelo em cooldown vai para o fim."""
+    provider = provider.casefold().strip()
+    if provider != "gemini":
+        return [model]
+    others = [m for m in fallback_models() if m.casefold() != model.casefold()]
+    chain = [model, *dict.fromkeys(others)]
+    if len(chain) > 1 and _cooling_down(provider, model):
+        chain = [*chain[1:], model]  # primário sobrecarregado há pouco: tenta por último
+    return chain
+
+
+def _should_fall_back(exc: Exception) -> bool:
+    """Sobrecarga/quota do modelo ou resposta inutilizável: outro modelo pode resolver."""
+    if isinstance(exc, AiResponseError):
+        return True
+    return getattr(exc, "http_status", None) in OVERLOAD_STATUSES
+
+
+def _with_fallback(provider: str, model: str, call, on_model=None):
+    """Executa call(modelo) pela cadeia; o último erro sobe se todos falharem."""
+    chain = model_chain(provider, model)
+    for index, candidate in enumerate(chain):
+        try:
+            result = call(candidate)
+        except AiUnavailableError as exc:
+            if not _should_fall_back(exc) or index == len(chain) - 1:
+                raise
+            if candidate == model and not isinstance(exc, AiResponseError):
+                _start_cooldown(provider.casefold().strip(), model)
+            continue
+        if on_model is not None:
+            on_model(candidate)
+        return result
+    raise AiUnavailableError("IA indisponível: nenhum modelo respondeu.")  # cadeia vazia: não ocorre
 
 
 def _detail_from_body(body: str, *, code: int, provider: str, model: str, operation: str, api_key: str) -> str:
@@ -132,7 +198,9 @@ def _request(
         _record(provider, model, None, ok=False, quota_error=quota)
         detail = _detail_from_body(body_text, code=exc.code, provider=provider, model=model, operation="Chamada de IA", api_key=api_key)
         if quota:
-            raise AiUnavailableError(f"IA indisponível: {detail}") from exc
+            unavailable = AiUnavailableError(f"IA indisponível: {detail}")
+            unavailable.http_status = exc.code  # type: ignore[attr-defined]
+            raise unavailable from exc
         err = RuntimeError(detail)
         err.http_status = exc.code  # type: ignore[attr-defined]
         raise err from exc
@@ -181,14 +249,15 @@ def call_ai_text(
     max_output_tokens: int = 450,
     temperature: float = 0.2,
     timeout: int = 60,
+    on_model=None,
 ) -> str:
-    """Chama o provedor configurado e devolve o texto puro da resposta."""
-    return _request(
-        prompt=prompt, provider=provider, model=model, api_key=api_key,
+    """Chama o provedor configurado e devolve o texto puro da resposta (com fallback de modelo)."""
+    return _with_fallback(provider, model, lambda m: _request(
+        prompt=prompt, provider=provider, model=m, api_key=api_key,
         max_output_tokens=max_output_tokens,
         temperature=temperature if provider.casefold().strip() == "gemini" else None,
         timeout=timeout,
-    ).text
+    ).text, on_model)
 
 
 _FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.I)
@@ -203,6 +272,26 @@ def _parse_json_object(text: str) -> dict:
 
 
 def call_ai_json(
+    *,
+    prompt: str,
+    schema: dict,
+    provider: str,
+    model: str,
+    api_key: str,
+    max_output_tokens: int = 4096,
+    temperature: float = 0.0,
+    thinking_budget: int | None = None,
+    timeout: int = 90,
+    on_model=None,
+) -> dict:
+    """call_ai_json com fallback de modelo gratuito; `on_model(nome)` recebe o modelo que respondeu."""
+    return _with_fallback(provider, model, lambda m: _call_ai_json_once(
+        prompt=prompt, schema=schema, provider=provider, model=m, api_key=api_key,
+        max_output_tokens=max_output_tokens, temperature=temperature, thinking_budget=thinking_budget, timeout=timeout,
+    ), on_model)
+
+
+def _call_ai_json_once(
     *,
     prompt: str,
     schema: dict,
