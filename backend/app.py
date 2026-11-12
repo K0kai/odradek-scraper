@@ -286,6 +286,12 @@ def process_auto_job(job_id: int) -> str:
     job = dict(job_row)
     title = job.get("title", "")
     log_event("info", "auto-apply", f"Triagem da vaga #{job_id}: {title}")
+    excluded = excluded_region_reason(job)
+    if excluded:  # sem chamar a IA: vagas da Índia já coletadas antes do filtro também saem da fila
+        with connect() as db:
+            db.execute("UPDATE jobs SET status='ignored', notes=? WHERE id=?", (f"Região excluída: {excluded}.", job_id))
+        log_event("info", "auto-apply", f"Vaga #{job_id} ignorada sem triagem: {excluded}.")
+        return f"vaga {job_id}: região excluída"
     try:
         decision = ai_assess_job(job, cfg, track=job_track(job, cfg))
     except AiUnavailableError:
@@ -1164,6 +1170,35 @@ def ai_generate_secondary_filter(cfg: dict[str, str]) -> dict:
     return _generate_filter(cfg, "secondary")
 
 
+# Vagas da Índia: a esmagadora maioria é golpe ou vaga fantasma. Nunca entram na coleta nem na triagem.
+_EXCLUDED_REGION_LOCATION = re.compile(
+    r"\b(?:india|bengaluru|bangalore|mumbai|navi mumbai|new delhi|delhi|hyderabad|chennai|pune|kolkata|noida|gurgaon|gurugram|"
+    r"ahmedabad|jaipur|kochi|coimbatore|indore|chandigarh|lucknow|thiruvananthapuram|karnataka|maharashtra|telangana|"
+    r"tamil nadu|uttar pradesh|haryana|gujarat|kerala)\b"
+)
+_EXCLUDED_REGION_TEXT = re.compile(r"\b(?:anywhere|across|within|all over|pan)[ -](?:in )?india\b|\bindian (?:citizens?|nationals?|residents?)\b|₹")
+
+
+def excluded_region_reason(job: dict) -> str:
+    """Motivo (não vazio) quando a vaga é da Índia: pelo local, ou por pistas explícitas no anúncio."""
+    from jobs.job_assessment import clean_job_html
+    from candidate.resume_profile import normalize_text
+
+    location = str(job.get("location") or "")
+    # Lista longa de países ("USA, UK, India, Australia, …") é vaga multirregião, não vaga da Índia.
+    if location.count(",") < 4 and _EXCLUDED_REGION_LOCATION.search(normalize_text(location)):
+        return f"local da vaga na Índia ({location[:60]})"
+    text = f"{job.get('title') or ''} {clean_job_html(str(job.get('description') or ''))}"
+    if _EXCLUDED_REGION_TEXT.search(text.casefold()):
+        return "anúncio restrito à Índia"
+    return ""
+
+
+def drop_excluded_region_jobs(batch: list[dict]) -> tuple[list[dict], int]:
+    kept = [job for job in batch if not excluded_region_reason(job)]
+    return kept, len(batch) - len(kept)
+
+
 def linkedin_search_scope(cfg: dict[str, str]) -> list[dict]:
     """Pares (local, modelo) das buscas, derivados do Perfil; a IA não escolhe local nem modelo.
 
@@ -1611,6 +1646,9 @@ def iter_apify_jobs():
         try:
             batch = run_apify_actor(token, run_actor, cfg, linkedin_filter=linkedin_filter, linkedin_urls=linkedin_urls)
             if linkedin_filter:
+                batch, dropped_india = drop_excluded_region_jobs(batch)
+                if dropped_india:
+                    log_event("info", "apify", f"{run_label}: {dropped_india} vaga(s) da Índia descartada(s) antes de entrar na coleta.")
                 batch = [{**job, "_linkedin_filter_id": linkedin_filter["id"]} for job in batch]
             results.extend(batch)
         except Exception as exc:

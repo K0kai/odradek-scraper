@@ -9,7 +9,7 @@ const statusMark: Record<AssessmentItem['status'], [string, string]> = {
 function AssessmentLine({ item }: { item: AssessmentItem }) {
   const [mark, label] = statusMark[item.status] || statusMark.unknown
   const inflated = item.realism === 'inflated'
-  const hover = [item.resume_quote && `Currículo: “${item.resume_quote}”`, item.bridge && `Ponte: ${item.bridge}`, `Vaga: “${item.job_quote}”`].filter(Boolean).join('\n')
+  const hover = [item.note && `Aviso: ${item.note}`, item.resume_quote && `Currículo: “${item.resume_quote}”`, item.bridge && `Ponte: ${item.bridge}`, `Vaga: “${item.job_quote}”`].filter(Boolean).join('\n')
   return <li className={`assessment-line status-${item.status}${inflated ? ' inflated' : ''}`} title={hover}>
     <span className="assessment-mark" aria-label={label}>{mark}</span>
     <span className="assessment-text">{item.text}{inflated && <em> — desconsiderado: {item.realism_reason || 'incoerente com o próprio anúncio'}</em>}{item.bridge && !inflated && <em> — {item.bridge}</em>}</span>

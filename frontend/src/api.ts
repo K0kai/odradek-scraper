@@ -15,6 +15,7 @@ export type AssessmentItem = {
   bridge: string
   resume_quote: string
   job_quote: string
+  note?: string
 }
 
 export type Assessment = {

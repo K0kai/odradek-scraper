@@ -176,7 +176,7 @@ QUOTES: every `job_quote`, `realism_basis_quote`, `level_quote`, `*_quote` must 
 3. REALISM: judge each requirement against the posting ITSELF. Mark `inflated` only when the posting contradicts or does not support it, and give `realism_basis_quote` = verbatim quote from the posting that shows the contradiction (e.g. an "Internship" title next to "5+ years", a junior role demanding architect-level skills, a requirement unrelated to any listed duty). Otherwise `core`. location/authorization/language/clearance requirements are never inflated.
 4. matches[]: one per requirement id (Q*) AND per responsibility id (J*). status:
    - met: the profile directly shows it. transferable: not done exactly, but the profile shows an equivalent capability (explain in `bridge`, one sentence). partial: related but incomplete. unmet: no evidence. unknown: cannot tell.
-   - `evidence_ids`: ids from the profile ([R1], [R1.2], [S3], [T1]...). `resume_quote`: verbatim from that evidence. met/transferable/partial WITHOUT valid evidence ids will be downgraded to unmet.
+   - `evidence_ids`: ids from the profile ([R1], [R1.2], [S3], [T1]...). `resume_quote`: a SHORT fragment copied verbatim from the cited evidence's own text (a role line, a responsibility, a project, a certification...). For a SKILL id ([S*]) quote ONLY the skill name (e.g. "PostgreSQL", "React"): NEVER the usage statistics after the colon ("5m, last 2026-11", "portfolio projects 3m (P1)") and never a paraphrase, because those are not in the resume. met/transferable/partial WITHOUT valid evidence ids will be downgraded to unmet; a quote that cannot be found downgrades met/transferable to partial.
    - Credit transferable capabilities generously but only when truly equivalent and evidenced (e.g. internal user support -> helpdesk, spreadsheet reporting -> data analysis).
    - Portfolio projects ([P*] items, or a skill line saying "portfolio projects") are real evidence the candidate can use that skill: they may support met/partial for a SKILL requirement. They do NOT count as professional experience: never use them to satisfy "X years of experience" requirements.
 5. stated: min_years (number, 0 if none) with quote; workplace (remote/hybrid/onsite) with `workplace_quote`, or "unspecified" when the posting does not say; job_country and job_city where the job is based, each with a quote from the JOB TEXT or the Location line (empty when not stated); foreign_eligibility for the candidate living in {where or 'an unknown location'}: open_to_candidate ONLY when the posting explicitly says people there (or anyone/worldwide/"work from anywhere"/the candidate's region) can apply, restricted when it limits applicants to places that exclude the candidate, otherwise unstated; always with `eligibility_quote`. Do not guess any of these. authorization = candidate_lacks ONLY if the posting requires work authorization the candidate does not have per the profile, with quote; required_languages (languages the posting requires for the job, with quotes).
@@ -221,6 +221,24 @@ JOB TEXT
 
 def _credit(status: str) -> float:
     return SCORING_V2["status_credit"].get(status, 0.0)
+
+
+def _quote_variants(quote: str) -> list[str]:
+    """A citação como veio e sem o rabo de estatísticas ("React: 5m, last 2026-11; portfolio projects…" → "React")."""
+    variants = [quote]
+    for sep in (":", ";", " — ", " - "):
+        head = quote.split(sep, 1)[0].strip()
+        if head and head != quote:
+            variants.append(head)
+    return variants
+
+
+def _quote_supported(quote: str, resume_norm: NormalizedText, evidence: list[str], index: dict) -> bool:
+    """Citação do currículo encontrada no texto do currículo/portfólio ou nas próprias evidências citadas."""
+    if not quote:
+        return False
+    blob = NormalizedText.of(" ".join(f"{index[e]['text']} {' '.join(index[e]['quotes'])}" for e in evidence))
+    return any(quote_in_text(v, resume_norm) or quote_in_text(v, blob) for v in _quote_variants(quote))
 
 
 def _verify(raw: dict, job_norm: NormalizedText, resume_norm: NormalizedText, profile: dict) -> dict:
@@ -285,14 +303,14 @@ def _verify(raw: dict, job_norm: NormalizedText, resume_norm: NormalizedText, pr
         note = ""
         if status in ("met", "transferable", "partial") and not evidence:
             status, note = "unmet", "sem evidência válida no perfil"
-        elif status in ("met", "transferable") and not (quote_in_text(quote, resume_norm) if quote else False):
-            # a citação do currículo pode estar nas próprias evidências citadas
-            evidence_blob = NormalizedText.of(" ".join(f"{index[e]['text']} {' '.join(index[e]['quotes'])}" for e in evidence))
-            if not (quote and quote_in_text(quote, evidence_blob)):
-                status, note = "unmet", "citação do currículo não verificada"
+        elif status in ("met", "transferable") and not _quote_supported(quote, resume_norm, evidence, index):
+            # A evidência citada existe no perfil verificado: só a transcrição do modelo falhou. Crédito parcial,
+            # nunca "não atendido" (que contradiria a ponte e a evidência).
+            status, note = "partial", "citação do currículo não verificada (evidência válida, crédito parcial)"
         elif status == "transferable" and not bridge:
             status, note = "partial", "sem ponte explicada"
         if note:
+            bridge = ""  # ponte de um item rebaixado contradiria a marca exibida
             dropped["matches_downgraded"] += 1
         matches[rid] = {"status": status, "evidence_ids": evidence[:6], "resume_quote": quote[:300], "bridge": bridge, "note": note}
     for rid in valid_ids:

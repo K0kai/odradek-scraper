@@ -31,7 +31,7 @@ def _compact_assessment(raw: object) -> dict | None:
 
     def item(entry: dict) -> dict:
         return {key: str(entry.get(key) or "")[:240] for key in (
-            "id", "text", "kind", "status", "realism", "realism_reason", "bridge", "resume_quote", "job_quote")}
+            "id", "text", "kind", "status", "realism", "realism_reason", "bridge", "resume_quote", "job_quote", "note")}
 
     return {
         "track": audit.get("track") or decision.get("track") or "core",

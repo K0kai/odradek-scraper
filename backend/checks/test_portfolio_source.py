@@ -207,7 +207,7 @@ class SyncTests(AppDbCase):
                             "resume_quote": "Painel full stack de vagas com triagem por IA", "bridge": ""}]}
         job_norm = NormalizedText.of(job_text)
         only_pdf = ja._verify(raw, job_norm, NormalizedText.of(RESUME), profile)
-        self.assertEqual(only_pdf["requirements"][0]["status"], "unmet")
+        self.assertEqual(only_pdf["requirements"][0]["status"], "partial")  # evidência válida, citação só no portfólio
         with_portfolio = ja._verify(raw, job_norm, merged_norm, profile)
         self.assertEqual(with_portfolio["requirements"][0]["status"], "met")
         self.assertTrue(pdf["roles"])

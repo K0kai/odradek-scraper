@@ -403,5 +403,32 @@ class TriageEndToEndTests(AppDbCase):
             self.assertEqual(db.execute("SELECT status FROM jobs WHERE id=1").fetchone()["status"], "worth")
 
 
+class IndiaExclusionTests(unittest.TestCase):
+    def test_location_in_india_is_excluded_by_country_city_or_state(self):
+        for location in ("India", "Bengaluru, Karnataka, India", "Hyderabad, Telangana", "Greater Pune Area", "Noida"):
+            self.assertTrue(app.excluded_region_reason({"location": location, "title": "Dev", "description": ""}), location)
+
+    def test_explicit_india_only_postings_are_excluded_even_with_a_vague_location(self):
+        job = {"location": "Remote", "title": "Intern", "description": "<p>100% Remote: Participate from anywhere in India.</p>"}
+        self.assertTrue(app.excluded_region_reason(job))
+        self.assertTrue(app.excluded_region_reason({"location": "Remote", "title": "Dev", "description": "Stipend: ₹10,000"}))
+
+    def test_other_places_and_lookalikes_are_not_excluded(self):
+        for location in ("Brazil", "Belo Horizonte, Minas Gerais, Brazil", "Indiana, United States", "Worldwide", "Remote"):
+            job = {"location": location, "title": "Dev", "description": "Work with the Indiana team and Indian cuisine lovers."}
+            self.assertEqual(app.excluded_region_reason(job), "", location)
+
+    def test_multi_country_location_lists_are_not_india_only_jobs(self):
+        job = {"location": "USA, UK, India, Australia, Ireland, New Zealand, Philippines, Pakistan, Singapore, Mexico",
+               "title": "AI Code Trainer", "description": ""}
+        self.assertEqual(app.excluded_region_reason(job), "")
+
+    def test_batch_filter_drops_only_indian_jobs_and_counts_them(self):
+        batch = [{"location": "India", "title": "a", "description": ""}, {"location": "Brazil", "title": "b", "description": ""}]
+        kept, dropped = app.drop_excluded_region_jobs(batch)
+        self.assertEqual([j["title"] for j in kept], ["b"])
+        self.assertEqual(dropped, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

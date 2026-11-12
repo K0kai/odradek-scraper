@@ -101,12 +101,22 @@ class AssessmentTests(unittest.TestCase):
         self.assertEqual([r["id"] for r in result["assessment"]["requirements"]], ["Q1", "Q2"])
         self.assertEqual(result["assessment"]["dropped"]["requirements"], 1)
 
-    def test_met_with_invented_resume_quote_becomes_unmet(self):
+    def test_met_with_unverifiable_resume_quote_keeps_valid_evidence_as_partial_and_explains(self):
         raw = base_raw()
-        raw["matches"][1] = match("Q2", "met", ("S1",), "Especialista certificado em Excel avançado")
+        raw["matches"][1] = match("Q2", "met", ("S1",), "Especialista certificado em Excel avançado", "tem Excel")
         result, _ = run(raw)
-        self.assertEqual(req(result, "Q2")["status"], "unmet")
-        self.assertFalse(result["should_apply"])
+        item = req(result, "Q2")
+        self.assertEqual(item["status"], "partial")
+        self.assertIn("citação do currículo não verificada", item["note"])
+        self.assertEqual(item["bridge"], "")  # a ponte de um item rebaixado não pode contradir a marca
+        self.assertFalse(result["should_apply"])  # 50% de crédito nos obrigatórios não passa do mínimo
+
+    def test_skill_usage_stats_line_is_verified_by_the_skill_name(self):
+        raw = base_raw()
+        raw["matches"][1] = match("Q2", "met", ("S1",), "FastAPI: 5m, last 2026-11; portfolio projects 3m (P1)")
+        result, _ = run(raw)
+        self.assertEqual(req(result, "Q2")["status"], "met")
+        self.assertEqual(result["assessment"]["dropped"]["matches_downgraded"], 0)
 
     def test_met_without_valid_evidence_id_becomes_unmet(self):
         raw = base_raw()
