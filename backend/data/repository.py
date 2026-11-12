@@ -129,9 +129,6 @@ DEFAULT_SETTINGS = {
     "queue_max_attempts": "40",
     "queue_ttl_hours": "24",
     "worth_reverify_last_daily": "",
-    # Som no painel quando o copiloto pede um dado (Web Audio)
-    "copilot_ask_sound": "1",
-    "copilot_ask_sound_volume": "0.55",
     # Perfil de diversidade (identidade NUNCA vem de IA; 'not_informed' = não informar)
     "candidate_gender": "not_informed",
     "candidate_race": "not_informed",

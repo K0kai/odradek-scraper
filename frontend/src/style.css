@@ -1461,6 +1461,115 @@ button:hover:not(:disabled),.open-link:hover{
   accent-color:#d5524c
 }
 
+.settings-cards{
+  display:grid;
+  gap:16px
+}
+.settings-card{
+  border:1px solid #303837;
+  border-radius:8px;
+  background:#151a1b;
+  padding:17px;
+  margin:0;
+  min-width:0
+}
+.settings-card>h3,.settings-advanced>summary{
+  margin:0 0 12px;
+  font-size:13px;
+  font-weight:700
+}
+.settings-advanced>summary{
+  margin:0;
+  cursor:pointer;
+  color:#b8c1b8
+}
+.settings-advanced[open]>summary{
+  margin-bottom:12px
+}
+.settings-card .section-description{
+  margin:0 0 12px
+}
+.settings-hint{
+  display:block;
+  margin-top:5px;
+  font-size:11px;
+  font-weight:400;
+  line-height:1.4;
+  color:#8d978c
+}
+.settings-grid label.settings-toggle{
+  display:flex;
+  align-items:flex-start;
+  gap:10px;
+  font-size:12px;
+  color:#d9dfd6
+}
+.settings-toggle input[type=checkbox]{
+  margin-top:2px
+}
+.settings-toggle span{
+  min-width:0
+}
+.source-field .field-label{
+  display:block;
+  color:#b8c1b8;
+  font-size:11px;
+  font-weight:700
+}
+.source-checks{
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px 18px;
+  margin-top:8px
+}
+.settings-grid .source-checks label{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  font-size:12px;
+  color:#d9dfd6
+}
+.secret-state{
+  margin-left:8px;
+  font-style:normal;
+  font-weight:400;
+  color:#9ba59a
+}
+.secret-state.ok{
+  color:#7fc79a
+}
+.settings-card-actions{
+  display:flex;
+  flex-wrap:wrap;
+  align-items:center;
+  gap:12px;
+  margin-top:14px
+}
+.settings-card-actions .settings-hint{
+  margin:0
+}
+.settings-bar{
+  position:sticky;
+  bottom:0;
+  z-index:5;
+  display:flex;
+  align-items:center;
+  justify-content:flex-end;
+  gap:12px;
+  margin-top:18px;
+  padding:12px 0;
+  border-top:1px solid #303837;
+  background:#101213
+}
+.settings-bar .settings-state{
+  margin-right:auto
+}
+@media(max-width:700px){
+  .settings-bar{
+    flex-wrap:wrap
+  }
+}
+
 .topbar-actions form{
   margin:0
 }

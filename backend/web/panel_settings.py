@@ -51,14 +51,28 @@ SETTINGS_API_GROUPS = {
     "ai": ("ai_provider", "ai_model", "candidate_facts_pt", "candidate_facts_en",
            "job_selection_optimism", "job_selection_prompt"),
     "automation": ("auto_apply", "minimum_match_score", "queue_max_workers", "queue_max_attempts",
-                   "queue_ttl_hours", "copilot_ask_sound", "copilot_ask_sound_volume", "transferable_minimum_score"),
+                   "queue_ttl_hours", "transferable_minimum_score"),
     "smtp": ("smtp_host", "smtp_port", "smtp_user", "smtp_from", "smtp_use_tls"),
 }
+
+
+def _secret_is_set(name: str) -> str:
+    try:
+        return "1" if secret_get(name) else "0"
+    except Exception:
+        return "0"
 
 
 def settings_api_payload(group: str) -> dict:
     cfg = settings()
     values = {key: cfg.get(key, "") for key in SETTINGS_API_GROUPS[group]}
+    # Somente leitura: informa se o segredo existe, nunca o valor.
+    if group == "ai":
+        values["api_key_set"] = _secret_is_set(cfg.get("ai_provider") or "gemini")
+        for key in ("adzuna_app_id", "adzuna_app_key", "apify_token"):
+            values[f"{key}_set"] = _secret_is_set(key)
+    elif group == "smtp":
+        values["smtp_password_set"] = _secret_is_set("smtp_password")
     if group == "search":
         values["linkedin_filter_prompt"] = effective_linkedin_filter_prompt(cfg)
         values["transferable_prompt"] = effective_transferable_prompt(cfg)
@@ -109,15 +123,8 @@ def save_settings_api_group(group: str, incoming: dict) -> str:
         for key, (lower, upper) in limits.items():
             if key in form and not (form[key].isdigit() and lower <= int(form[key]) <= upper):
                 raise ValueError(f"Valor inválido para {key}: use {lower} a {upper}")
-        for key in ("auto_apply", "copilot_ask_sound"):
-            if key in form:
-                form[key] = "1" if form[key] == "1" else "0"
-        if "copilot_ask_sound_volume" in form:
-            try:
-                volume = float(form["copilot_ask_sound_volume"])
-            except ValueError as exc:
-                raise ValueError("Volume inválido") from exc
-            form["copilot_ask_sound_volume"] = f"{max(0.0, min(1.0, volume)):.2f}"
+        if "auto_apply" in form:
+            form["auto_apply"] = "1" if form["auto_apply"] == "1" else "0"
     if group == "smtp":
         if "smtp_port" in form and not (form["smtp_port"].isdigit() and 1 <= int(form["smtp_port"]) <= 65535):
             raise ValueError("Porta SMTP inválida")
