@@ -97,6 +97,8 @@ DEFAULT_SETTINGS = {
     "linkedin_main_filter_json": "",
     "linkedin_secondary_filter_json": "",
     "linkedin_main_share": "70",
+    "linkedin_max_age_days": "7",
+    "linkedin_preferred_countries": "",
     "secondary_area_hint": "",
     "geo_eligibility_enabled": "1",
     # Portfólio público (schema 2 de /ai/profile.json) como segunda fonte do perfil; vazio = desligado.

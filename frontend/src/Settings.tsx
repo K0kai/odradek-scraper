@@ -5,9 +5,22 @@ import { SearchFilter } from './LinkedInFilters'
 type Field = {
   key: string
   label: string
-  kind?: 'text' | 'number' | 'textarea' | 'select' | 'checkbox' | 'password'
+  kind?: 'text' | 'number' | 'textarea' | 'select' | 'checkbox' | 'password' | 'range'
+  min?: number
+  max?: number
   options?: [string, string][]
   wide?: boolean
+}
+
+function ageLabel(days: number) { return days <= 1 ? 'até 24 horas' : `até ${days} dias` }
+
+function RangeField({ field, value, onChange }: { field: Field; value: string; onChange: (value: string) => void }) {
+  const days = Number(value) || (field.min ?? 1)
+  return <span className="range-field">
+    <input type="range" min={field.min} max={field.max} step={1} value={days} onChange={event => onChange(event.target.value)} aria-valuetext={ageLabel(days)} />
+    <output>{ageLabel(days)}</output>
+    <small>As vagas mais recentes são sempre buscadas primeiro; este valor só define até onde a busca alarga (24h, depois 7 dias, depois o limite escolhido).</small>
+  </span>
 }
 
 const yesNo: [string, string][] = [['1', 'Sim'], ['0', 'Não']]
@@ -21,6 +34,8 @@ const fields: Record<SettingsGroup, Field[]> = {
     { key: 'apify_job_count', label: 'Máximo de vagas por ciclo Apify', kind: 'number' },
     { key: 'apify_actors_json', label: 'Actors Apify (JSON)', kind: 'textarea', wide: true },
     { key: 'geo_eligibility_enabled', label: 'Elegibilidade geográfica: exterior só remoto e aberto a estrangeiros; híbrido/presencial só na minha cidade', kind: 'select', options: yesNo },
+    { key: 'linkedin_max_age_days', label: 'Idade máxima das vagas do LinkedIn', kind: 'range', min: 1, max: 30, wide: true },
+    { key: 'linkedin_preferred_countries', label: 'Países com viés (até 5, separados por vírgula, ex.: Brazil, Portugal): vagas deles são buscadas e triadas antes das de outros países; nenhum país é excluído', wide: true },
     { key: 'linkedin_main_share', label: 'Fatia do filtro Principal no count do Apify (%, 50 a 95)', kind: 'number' },
     { key: 'linkedin_filter_prompt', label: 'Filtro principal: instruções da IA', kind: 'textarea', wide: true },
     { key: 'linkedin_main_filter_json', label: 'Filtro principal — TI e programação (a área de maior experiência)', wide: true },
@@ -154,7 +169,7 @@ export function SettingsView({ notify }: { notify: (message: string, error?: boo
       <div className="settings-grid">{fields[group].map(field => field.key === 'linkedin_main_filter_json' || field.key === 'linkedin_secondary_filter_json'
         ? <div className="wide" key={field.key}><h3>{field.label}</h3>{field.key === 'linkedin_secondary_filter_json' && <p className="section-description">Opcional e só gerado pelo botão, nunca automaticamente: um cargo em área menos sensível a crise onde TI + experiência administrativa se aplicam. Vagas dele usam o score mínimo da área secundária e exigem cobertura das responsabilidades centrais.</p>}<SearchFilter slot={field.key === 'linkedin_main_filter_json' ? 'main' : 'secondary'} value={draft[field.key] || ''} onChange={value => change(field.key, value)} metrics={metrics} scope={scope} /></div>
         : <label className={field.wide ? 'wide' : ''} key={field.key}>{field.label}
-          {field.kind === 'textarea' ? <textarea rows={field.key.includes('prompt') || field.key.includes('json') ? 8 : 3} value={draft[field.key] || ''} onChange={event => change(field.key, event.target.value)} />
+          {field.kind === 'range' ? <RangeField field={field} value={draft[field.key] || String(field.min ?? 1)} onChange={value => change(field.key, value)} /> : field.kind === 'textarea' ? <textarea rows={field.key.includes('prompt') || field.key.includes('json') ? 8 : 3} value={draft[field.key] || ''} onChange={event => change(field.key, event.target.value)} />
             : field.kind === 'select' ? <select value={draft[field.key] || ''} onChange={event => change(field.key, event.target.value)}>{field.options?.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select>
               : <input type={field.kind === 'password' ? 'password' : field.kind === 'number' ? 'number' : 'text'} value={draft[field.key] || ''} onChange={event => change(field.key, event.target.value)} autoComplete={field.kind === 'password' ? 'new-password' : 'off'} />}
         </label>)}</div>

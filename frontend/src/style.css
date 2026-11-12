@@ -1716,3 +1716,8 @@ button:hover:not(:disabled),.open-link:hover{
 .filter-metrics.warn{
   color:#e3c26b
 }
+
+.range-field{display:grid;grid-template-columns:1fr auto;gap:6px 14px;align-items:center}
+.range-field input[type=range]{width:100%;padding:0;accent-color:var(--accent,#79b8f0)}
+.range-field output{font-weight:600;white-space:nowrap}
+.range-field small{grid-column:1 / -1;opacity:.7;font-weight:400}

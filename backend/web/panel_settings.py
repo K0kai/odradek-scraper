@@ -1,6 +1,7 @@
 """Panel settings, SMTP check and LinkedIn filter persistence."""
 import json
 import math
+import re
 from urllib.parse import urlparse
 
 from app import (
@@ -38,6 +39,7 @@ def send_smtp_test() -> tuple[bool, str]:
 SETTINGS_API_GROUPS = {
     "search": ("keywords", "locations", "sources", "adzuna_countries", "apify_monthly_credit_limit_usd",
                "apify_job_count", "apify_actors_json", "geo_eligibility_enabled", "linkedin_main_share",
+               "linkedin_max_age_days", "linkedin_preferred_countries",
                "linkedin_filter_prompt", "linkedin_main_filter_json",
                "transferable_prompt", "secondary_area_hint", "linkedin_secondary_filter_json"),
     "profile": ("candidate_name", "candidate_email", "candidate_phone", "candidate_linkedin",
@@ -146,6 +148,15 @@ def _validate_search_form(form: dict[str, str]) -> None:
         load_apify_actors({**settings(), **form})
     if "linkedin_main_share" in form and not (form["linkedin_main_share"].isdigit() and 50 <= int(form["linkedin_main_share"]) <= 95):
         raise ValueError("A fatia do filtro Principal deve ficar entre 50 e 95")
+    if "linkedin_max_age_days" in form and not (form["linkedin_max_age_days"].isdigit() and 1 <= int(form["linkedin_max_age_days"]) <= 30):
+        raise ValueError("A idade máxima das vagas deve ficar entre 1 e 30 dias")
+    if "linkedin_preferred_countries" in form:
+        names = [part.strip() for part in re.split(r"[,;\n]+", form["linkedin_preferred_countries"]) if part.strip()]
+        if len(names) > 5:
+            raise ValueError("Informe no máximo 5 países com viés")
+        if any(len(name) > 40 or not re.fullmatch(r"[^\W\d_][^\W\d_ .'-]*(?: [^\W\d_][^\W\d_ .'-]*)*", name) for name in names):
+            raise ValueError("Países com viés: use só nomes de países separados por vírgula (ex.: Brazil, Portugal)")
+        form["linkedin_preferred_countries"] = ", ".join(names)
     if "geo_eligibility_enabled" in form:
         form["geo_eligibility_enabled"] = "1" if form["geo_eligibility_enabled"] == "1" else "0"
     if "linkedin_filter_prompt" in form and form["linkedin_filter_prompt"].strip() == DEFAULT_LINKEDIN_FILTER_PROMPT.strip():

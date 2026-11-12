@@ -430,5 +430,137 @@ class IndiaExclusionTests(unittest.TestCase):
         self.assertEqual(dropped, 1)
 
 
+def hours_ago(hours):
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat(timespec="seconds")
+
+
+class PostedWindowTests(unittest.TestCase):
+    ACTOR = {"id": "li", "label": "LinkedIn", "enabled": True, "input_mode": "linkedin_search", "count": 25}
+    SCOPE = [{"location": "Brazil", "f_wt": "2"}, {"location": "Worldwide", "f_wt": "2"}]
+
+    def test_phases_always_start_at_24h_and_widen_up_to_the_slider_value(self):
+        self.assertEqual([app.linkedin_recency_phases(n) for n in (1, 3, 7, 10, 30)],
+                         [[1], [1, 3], [1, 7], [1, 7, 10], [1, 7, 30]])
+        self.assertEqual(app.linkedin_recency_phases(99), [1, 7, 30])  # nunca passa de 30 dias
+        self.assertEqual(app.linkedin_recency_phases(0), [1])
+
+    def test_setting_is_clamped_and_falls_back_to_the_old_seven_days(self):
+        read = lambda value: app.linkedin_max_age_days({"linkedin_max_age_days": value})
+        self.assertEqual([read("1"), read("30"), read("45"), read("0"), read("abc"), read("")], [1, 30, 30, 1, 7, 7])
+        self.assertEqual(app.linkedin_max_age_days({}), 7)
+
+    def test_urls_go_from_the_newest_window_to_the_widest_and_ask_for_most_recent_first(self):
+        urls = app.build_linkedin_search_urls(make_filter(), self.SCOPE, 30)
+        windows = [next(part for part in url.split("&") if part.startswith("f_TPR=")) for url in urls]
+        self.assertEqual(windows, ["f_TPR=r86400"] * 2 + ["f_TPR=r604800"] * 2 + ["f_TPR=r2592000"] * 2)
+        self.assertTrue(all("sortBy=DD" in url for url in urls))
+
+    def test_one_day_slider_searches_only_the_last_24_hours(self):
+        urls = app.build_linkedin_search_urls(make_filter(), self.SCOPE, 1)
+        self.assertTrue(urls and all("f_TPR=r86400" in url for url in urls))
+
+    def test_plan_runs_newest_window_first_whatever_the_slider(self):
+        for days in (1, 5, 14, 30):
+            planned = app.plan_apify_runs([self.ACTOR], make_filter(), scope=self.SCOPE, max_age_days=days)
+            labels = [actor["label"] for actor, _, _ in planned]
+            self.assertIn("24h", labels[0], days)
+            phases = [label.split("(")[1].split(",")[0] for label in labels]
+            order = [int(x[:-1]) if x.endswith("d") else 1 for x in phases]
+            self.assertEqual(order, sorted(order), days)
+
+    def test_collection_age_ceiling_follows_the_slider(self):
+        posted = hours_ago(24 * 10)
+        self.assertFalse(app._linkedin_within_max_age(posted, max_days=7))
+        self.assertTrue(app._linkedin_within_max_age(posted, max_days=30))
+        self.assertTrue(app._linkedin_within_max_age(hours_ago(2), max_days=1))
+        self.assertFalse(app._linkedin_within_max_age(hours_ago(30), max_days=1))
+
+
+class PreferredCountriesTests(unittest.TestCase):
+    CFG = {"candidate_city": "Belo Horizonte", "candidate_country": "Brazil"}
+
+    def scope(self, preferred):
+        return [(s["location"], s["f_wt"]) for s in app.linkedin_search_scope({**self.CFG, "linkedin_preferred_countries": preferred})]
+
+    def test_no_preferred_countries_keeps_the_original_scope_order(self):
+        self.assertEqual(self.scope(""), [("Worldwide", "2"), ("Brazil", "2"), ("Belo Horizonte", "")])
+
+    def test_preferred_countries_are_searched_before_worldwide(self):
+        self.assertEqual(self.scope("Portugal, Canada"),
+                         [("Portugal", "2"), ("Canada", "2"), ("Worldwide", "2"), ("Brazil", "2"), ("Belo Horizonte", "")])
+
+    def test_home_country_as_preferred_brings_the_home_city_right_after_it_without_duplicates(self):
+        self.assertEqual(self.scope("Brasil, Portugal"),
+                         [("Brasil", "2"), ("Portugal", "2"), ("Belo Horizonte", ""), ("Worldwide", "2")])
+
+    def test_list_is_trimmed_deduplicated_and_capped_at_five(self):
+        cfg = {"linkedin_preferred_countries": " Brazil ; brazil\nPortugal, Spain, Canada, Germany, Italy, France "}
+        self.assertEqual(app.linkedin_preferred_countries(cfg), ["Brazil", "Portugal", "Spain", "Canada", "Germany"])
+
+    def test_location_matching_understands_portuguese_and_english_names(self):
+        self.assertTrue(app.location_in_countries("Belo Horizonte, Minas Gerais, Brazil", ["Brasil"]))
+        self.assertTrue(app.location_in_countries("Lisboa, Portugal", ["portugal"]))
+        self.assertFalse(app.location_in_countries("Bengaluru, Karnataka, India", ["Brasil", "Portugal"]))
+        self.assertFalse(app.location_in_countries("", ["Brasil"]))
+
+    def test_order_is_preferred_country_first_then_most_recent_then_unknown_date(self):
+        jobs = [
+            {"id": 1, "location": "India", "posted_at": hours_ago(1)},
+            {"id": 2, "location": "Brazil", "posted_at": hours_ago(100)},
+            {"id": 3, "location": "Brazil", "posted_at": hours_ago(5)},
+            {"id": 4, "location": "Brazil", "posted_at": None},
+        ]
+        ranked = sorted(jobs, key=lambda job: app.recency_country_key(job, ["Brazil"]))
+        self.assertEqual([j["id"] for j in ranked], [3, 2, 4, 1])
+
+    def test_without_preferred_countries_only_recency_orders(self):
+        jobs = [{"id": 1, "location": "India", "posted_at": hours_ago(1)}, {"id": 2, "location": "Brazil", "posted_at": hours_ago(9)}]
+        ranked = sorted(jobs, key=lambda job: app.recency_country_key(job, []))
+        self.assertEqual([j["id"] for j in ranked], [1, 2])
+
+
+class SearchSettingsValidationTests(unittest.TestCase):
+    def validate(self, **form):
+        from web import panel_settings
+        panel_settings._validate_search_form(form)
+        return form
+
+    def test_slider_accepts_1_to_30_and_rejects_the_rest(self):
+        self.assertEqual(self.validate(linkedin_max_age_days="30")["linkedin_max_age_days"], "30")
+        for bad in ("0", "31", "-1", "abc", ""):
+            with self.assertRaises(ValueError, msg=bad):
+                self.validate(linkedin_max_age_days=bad)
+
+    def test_preferred_countries_are_normalized_and_validated(self):
+        self.assertEqual(self.validate(linkedin_preferred_countries=" Brazil ;Portugal\n")["linkedin_preferred_countries"], "Brazil, Portugal")
+        self.assertEqual(self.validate(linkedin_preferred_countries="")["linkedin_preferred_countries"], "")
+        for bad in ("A, B, C, D, E, F", "Brazil 123", "<script>"):
+            with self.assertRaises(ValueError, msg=bad):
+                self.validate(linkedin_preferred_countries=bad)
+
+
+class SettingsRoundTripAndQueueOrderTests(AppDbCase):
+    def test_slider_and_preferred_countries_are_saved_and_read_back(self):
+        from web import panel_settings
+        values = panel_settings.settings_api_payload("search")["values"]
+        self.assertEqual((values["linkedin_max_age_days"], values["linkedin_preferred_countries"]), ("7", ""))
+        panel_settings.save_settings_api_group("search", {"linkedin_max_age_days": "21", "linkedin_preferred_countries": "Brazil; Portugal"})
+        values = panel_settings.settings_api_payload("search")["values"]
+        self.assertEqual((values["linkedin_max_age_days"], values["linkedin_preferred_countries"]), ("21", "Brazil, Portugal"))
+        self.assertEqual(app.linkedin_max_age_days(app.settings()), 21)
+        self.assertEqual(app.linkedin_preferred_countries(app.settings()), ["Brazil", "Portugal"])
+
+    def test_triage_queue_takes_preferred_countries_first_then_the_most_recent(self):
+        for job_id, location, hours in ((1, "India", 1), (2, "Brazil", 100), (3, "Brazil", 5), (4, "Portugal", 50)):
+            self.seed_job(id=job_id, location=location, fingerprint=f"fp{job_id}", url=f"https://example.com/{job_id}",
+                          posted_at=hours_ago(hours), status="new")
+        app.set_setting("linkedin_preferred_countries", "Brazil")
+        queued = []
+        with patch.object(app.queue, "enqueue", side_effect=lambda kind, payload, **kw: queued.append(payload["job_id"])):
+            app.enqueue_new_jobs_for_triage(limit=3)
+        self.assertEqual(queued, [3, 2, 1])  # Brasil mais recente, Brasil antigo, e só então o resto mais recente
+
+
 if __name__ == "__main__":
     unittest.main()

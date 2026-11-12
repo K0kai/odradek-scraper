@@ -400,9 +400,12 @@ def enqueue_new_jobs_for_triage(limit: int | None = None) -> str:
     `limit` restringe quantas vagas são enfileiradas; as demais continuam 'new'."""
     cfg = settings()
     with connect() as db:
-        rows = db.execute("SELECT id FROM jobs WHERE status='new' ORDER BY id ASC").fetchall()
+        rows = db.execute("SELECT id, location, posted_at FROM jobs WHERE status='new'").fetchall()
     if not rows:
         return "nenhuma vaga nova para enfileirar"
+    preferred = linkedin_preferred_countries(cfg)
+    # Países com viés primeiro; depois as mais recentes; empate pelo id mais novo.
+    rows = sorted(rows, key=lambda row: (*recency_country_key(dict(row), preferred), -int(row["id"])))
     remaining = max(len(rows) - limit, 0) if limit is not None else 0
     if limit is not None:
         rows = rows[:limit]
@@ -784,7 +787,75 @@ LINKEDIN_EXPERIENCE_CODES = {1, 2, 3, 4, 5, 6}
 LINKEDIN_TPR_DAY = "r86400"
 #: Past week — teto duro de 7 dias (nunca buscar mais antigo que isso).
 LINKEDIN_TPR_WEEK = "r604800"
-LINKEDIN_MAX_AGE_DAYS = 7
+LINKEDIN_MAX_AGE_DAYS = 7  # padrão; o teto real vem de `linkedin_max_age_days` (1 a 30)
+LINKEDIN_MIN_AGE_DAYS_SETTING = 1
+LINKEDIN_MAX_AGE_DAYS_SETTING = 30
+
+
+def linkedin_max_age_days(cfg: dict[str, str] | None) -> int:
+    """Janela máxima de publicação (dias), do slider do painel: 1 (24h) a 30. Inválido volta ao padrão."""
+    try:
+        days = int(str((cfg or {}).get("linkedin_max_age_days") or LINKEDIN_MAX_AGE_DAYS))
+    except ValueError:
+        days = LINKEDIN_MAX_AGE_DAYS
+    return max(LINKEDIN_MIN_AGE_DAYS_SETTING, min(LINKEDIN_MAX_AGE_DAYS_SETTING, days))
+
+
+def linkedin_recency_phases(max_days: int) -> list[int]:
+    """Janelas em dias, SEMPRE da mais recente para a mais antiga: 24h, depois 7 dias, depois o teto.
+
+    O teto escolhido só decide até onde a busca alarga; as vagas mais novas são sempre buscadas primeiro.
+    """
+    max_days = max(LINKEDIN_MIN_AGE_DAYS_SETTING, min(LINKEDIN_MAX_AGE_DAYS_SETTING, int(max_days)))
+    return sorted({1, min(7, max_days), max_days})
+
+
+def linkedin_tpr(days: int) -> str:
+    return f"r{int(days) * 86400}"
+
+
+# Países com viés: vagas deles são buscadas e triadas ANTES das de outros países (não excluem nenhum).
+LINKEDIN_PREFERRED_COUNTRIES_MAX = 5
+_COUNTRY_SYNONYMS = (
+    {"brazil", "brasil"}, {"united states", "usa", "eua", "estados unidos"}, {"united kingdom", "uk", "reino unido"},
+    {"spain", "espanha", "espana"}, {"germany", "alemanha"}, {"canada"}, {"portugal"},
+)
+
+
+def linkedin_preferred_countries(cfg: dict[str, str] | None) -> list[str]:
+    """Países com viés do painel (vírgula/ponto e vírgula/linha), sem repetir, no máximo 5, na ordem dada."""
+    raw = str((cfg or {}).get("linkedin_preferred_countries") or "")
+    names: list[str] = []
+    for part in re.split(r"[,;\n]+", raw):
+        name = part.strip()
+        if name and name.casefold() not in {n.casefold() for n in names}:
+            names.append(name[:40])
+    return names[:LINKEDIN_PREFERRED_COUNTRIES_MAX]
+
+
+def _country_names(name: str) -> set[str]:
+    from candidate.resume_profile import normalize_text
+
+    key = normalize_text(name)
+    for group in _COUNTRY_SYNONYMS:
+        if key in group:
+            return set(group)
+    return {key} if key else set()
+
+
+def location_in_countries(location: object, countries: list[str]) -> bool:
+    """True se o texto do local cita algum dos países (com sinônimos PT/EN)."""
+    from candidate.resume_profile import normalize_text
+
+    haystack = f" {normalize_text(str(location or ''))} "
+    return any(f" {alias} " in haystack for name in countries for alias in _country_names(name))
+
+
+def recency_country_key(job: dict, preferred: list[str]) -> tuple[int, float]:
+    """Ordem de coleta/triagem: país com viés primeiro, depois o mais recente (data desconhecida por último)."""
+    age = _linkedin_posted_age_days(job.get("posted_at"))
+    in_preferred = bool(preferred) and location_in_countries(job.get("location"), preferred)
+    return (0 if in_preferred or not preferred else 1, age if age is not None else 9999.0)
 #: Cada filtro tem o cargo e, no máximo, UMA variante equivalente dele (ex.: versão PT/EN).
 LINKEDIN_FILTER_MAX_KEYWORDS = 2
 LINKEDIN_SEARCH_MAX_URLS = 8
@@ -1206,7 +1277,7 @@ def linkedin_search_scope(cfg: dict[str, str]) -> list[dict]:
     """Pares (local, modelo) das buscas, derivados do Perfil; a IA não escolhe local nem modelo.
 
     Com a elegibilidade geográfica ligada: remoto mundial, remoto no seu país e qualquer modelo
-    na sua cidade. Desligada: só mundial e país, sem filtro de modelo.
+    na sua cidade. Desligada: só mundial e país, sem filtro de modelo. Países com viés (painel) vêm primeiro.
     """
     from jobs.form_rules import infer_candidate_country
     from jobs.job_assessment import geo_enabled
@@ -1215,7 +1286,11 @@ def linkedin_search_scope(cfg: dict[str, str]) -> list[dict]:
     remote = "2" if enabled else ""
     country = infer_candidate_country(cfg).strip()
     city = (cfg.get("candidate_city") or "").strip()
-    pairs: list[tuple[str, str]] = [("Worldwide", remote)]
+    preferred = linkedin_preferred_countries(cfg)
+    pairs: list[tuple[str, str]] = [(name, remote) for name in preferred]  # países com viés antes de qualquer outro
+    if enabled and city and country and any(_country_names(country) & _country_names(name) for name in preferred):
+        pairs.append((city, ""))  # o país de casa tem viés: a sua cidade (qualquer modelo) vem logo depois
+    pairs.append(("Worldwide", remote))
     if country and country.casefold() != "worldwide":
         pairs.append((country, remote))
     if enabled and city:
@@ -1223,7 +1298,7 @@ def linkedin_search_scope(cfg: dict[str, str]) -> list[dict]:
     scope: list[dict] = []
     seen: set[tuple[str, str]] = set()
     for location, f_wt in pairs:
-        key = (location.casefold(), f_wt)
+        key = (min(_country_names(location) or {location.casefold()}), f_wt)  # "Brasil" e "Brazil" são a mesma busca
         if key in seen:
             continue
         seen.add(key)
@@ -1232,8 +1307,10 @@ def linkedin_search_scope(cfg: dict[str, str]) -> list[dict]:
     return scope
 
 
-def build_linkedin_search_urls(filter_data: dict, scope: list[dict]) -> list[str]:
-    """Cobre todas as combinações keyword × escopo, primeiro 24 horas e depois até 7 dias.
+def build_linkedin_search_urls(filter_data: dict, scope: list[dict], max_age_days: int = LINKEDIN_MAX_AGE_DAYS) -> list[str]:
+    """Cobre todas as combinações keyword × escopo, da janela mais recente (24h) até `max_age_days`.
+
+    Cada URL pede `sortBy=DD` (mais recentes primeiro), então mesmo a janela larga entrega o novo antes do velho.
 
     O limite por execução é aplicado em lotes, nunca descartando URLs aqui.
     """
@@ -1247,7 +1324,7 @@ def build_linkedin_search_urls(filter_data: dict, scope: list[dict]) -> list[str
         url = (
             f"https://www.linkedin.com/jobs/search/?keywords={quote_plus(keyword)}"
             f"&location={quote_plus(location)}&position=1&pageNum=0"
-            f"&f_TPR={tpr}"
+            f"&f_TPR={tpr}&sortBy=DD"
         )
         if f_e:
             url += f"&f_E={f_e}"
@@ -1255,13 +1332,12 @@ def build_linkedin_search_urls(filter_data: dict, scope: list[dict]) -> list[str
             url += f"&f_WT={f_wt}"
         return url
 
-    day_urls: list[str] = []
-    week_urls: list[str] = []
-    for keyword in keywords:
-        for item in scope:
-            day_urls.append(_url(keyword, item["location"], item["f_wt"], LINKEDIN_TPR_DAY))
-            week_urls.append(_url(keyword, item["location"], item["f_wt"], LINKEDIN_TPR_WEEK))
-    return list(dict.fromkeys(day_urls + week_urls))
+    ordered: list[str] = []
+    for days in linkedin_recency_phases(max_age_days):  # mais recente primeiro
+        for item in scope:  # dentro da janela, o escopo na ordem dada (países com viés primeiro)
+            for keyword in keywords:
+                ordered.append(_url(keyword, item["location"], item["f_wt"], linkedin_tpr(days)))
+    return list(dict.fromkeys(ordered))
 
 
 def split_apify_count(base: int, filters: list[dict], main_share: int) -> list[int]:
@@ -1281,6 +1357,7 @@ def plan_apify_runs(
     *,
     scope: list[dict],
     main_share: int = 70,
+    max_age_days: int = LINKEDIN_MAX_AGE_DAYS,
 ) -> list[tuple[dict, dict | None, list[str] | None]]:
     """Divide a quantidade entre Principal e Secundário e prioriza os lotes do dia."""
     planned: list[tuple[dict, dict | None, list[str] | None]] = []
@@ -1294,14 +1371,15 @@ def plan_apify_runs(
         if not active:
             continue
         counts = split_apify_count(int(actor.get("count") or 25), active, main_share)
-        searches = [(item, build_linkedin_search_urls(item, scope), count) for item, count in zip(active, counts)]
-        for tpr in (LINKEDIN_TPR_DAY, LINKEDIN_TPR_WEEK):
+        searches = [(item, build_linkedin_search_urls(item, scope, max_age_days), count) for item, count in zip(active, counts)]
+        for days in linkedin_recency_phases(max_age_days):  # janelas mais recentes sempre primeiro
+            tpr = linkedin_tpr(days)
             for item, urls, count in searches:
                 phase_urls = [url for url in urls if f"f_TPR={tpr}" in url]
                 for offset in range(0, len(phase_urls), LINKEDIN_SEARCH_MAX_URLS):
                     batch = phase_urls[offset:offset + LINKEDIN_SEARCH_MAX_URLS]
                     label = str(actor.get("label") or actor["id"])
-                    phase = "24h" if tpr == LINKEDIN_TPR_DAY else "7d"
+                    phase = "24h" if days == 1 else f"{days}d"
                     run_actor = {**actor, "count": count,
                                  "label": f"{label}: {item['name']} ({phase}, lote {offset // LINKEDIN_SEARCH_MAX_URLS + 1})"}
                     planned.append((run_actor, item, batch))
@@ -1323,7 +1401,8 @@ def build_apify_run_input(
         filter_data = linkedin_filter or get_main_filter(cfg)
         if filter_data is None:
             raise ValueError("Gere o filtro Principal no painel antes de coletar no LinkedIn.")
-        urls = linkedin_urls if linkedin_urls is not None else build_linkedin_search_urls(filter_data, linkedin_search_scope(cfg))
+        urls = linkedin_urls if linkedin_urls is not None else build_linkedin_search_urls(
+            filter_data, linkedin_search_scope(cfg), linkedin_max_age_days(cfg))
         return {"urls": urls, "count": count, "scrapeCompany": False}
 
     template = actor.get("input_template")
@@ -1450,7 +1529,9 @@ def _linkedin_within_max_age(posted_at: object, *, max_days: int = LINKEDIN_MAX_
     return age <= float(max_days)
 
 
-def normalize_apify_items(items: list, *, label: str) -> list[dict]:
+def normalize_apify_items(
+    items: list, *, label: str, max_age_days: int = LINKEDIN_MAX_AGE_DAYS, preferred_countries: list[str] | None = None,
+) -> list[dict]:
     """Normaliza itens Apify e descarta vagas já fechadas (filtro de coleta)."""
     from jobs.worth_reverify import apify_item_indicates_closed
 
@@ -1511,7 +1592,7 @@ def normalize_apify_items(items: list, *, label: str) -> list[dict]:
         if isinstance(posted_at, (int, float)) and posted_at > 10_000_000_000:
             # Indeed pubDate em milissegundos.
             posted_at = datetime.fromtimestamp(posted_at / 1000, tz=timezone.utc).isoformat(timespec="seconds")
-        if is_linkedin and not _linkedin_within_max_age(posted_at):
+        if is_linkedin and not _linkedin_within_max_age(posted_at, max_days=max_age_days):
             continue  # teto duro: >7 dias fora
         results.append(
             {
@@ -1532,12 +1613,9 @@ def normalize_apify_items(items: list, *, label: str) -> list[dict]:
             f"{label or 'Apify'}: {skipped_closed} vaga(s) descartada(s) no filtro (fechadas / sem candidaturas).",
         )
     if is_linkedin and results:
-        # Prioriza o mais recente (mesmo dia primeiro) na fila de inserção/triagem.
-        def _sort_key(job: dict) -> tuple:
-            age = _linkedin_posted_age_days(job.get("posted_at"))
-            return (age if age is not None else 3.5, str(job.get("title") or ""))
-
-        results.sort(key=_sort_key)
+        # Prioriza países com viés e, dentro deles, o mais recente (mesmo dia primeiro).
+        preferred = preferred_countries or []
+        results.sort(key=lambda job: (*recency_country_key(job, preferred), str(job.get("title") or "")))
     return results
 
 
@@ -1581,7 +1659,8 @@ def run_apify_actor(
     items = fetch_json(f"{APIFY_API}/datasets/{quote_plus(dataset_id)}/items?clean=1", headers=apify_headers(token), timeout=45)
     if not isinstance(items, list):
         items = []
-    normalized = normalize_apify_items(items, label=label)
+    normalized = normalize_apify_items(
+        items, label=label, max_age_days=linkedin_max_age_days(cfg), preferred_countries=linkedin_preferred_countries(cfg))
     log_event("success", "apify", f"Actor {label}: {len(normalized)} vaga(s) úteis.")
     return normalized
 
@@ -1625,10 +1704,15 @@ def iter_apify_jobs():
             if not any(item["location"] == (cfg.get("candidate_city") or "").strip() for item in scope) and str(cfg.get("geo_eligibility_enabled", "1")) != "0":
                 log_event("warning", "apify", "Cidade de residência não configurada no Perfil: a busca na sua cidade (híbrido/presencial) foi pulada.")
             log_event("info", "apify", "Escopo das buscas: " + "; ".join(item["label"] for item in scope) + ".")
+            if linkedin_preferred_countries(cfg):
+                log_event("info", "apify", "Países com viés (buscados primeiro): " + ", ".join(linkedin_preferred_countries(cfg)) + ".")
+            phases = linkedin_recency_phases(linkedin_max_age_days(cfg))
+            log_event("info", "apify", "Janela de publicação (mais recentes primeiro): " + " → ".join("24h" if d == 1 else f"{d} dias" for d in phases) + ".")
 
     results: list[dict] = []
     errors: list[str] = []
-    planned = plan_apify_runs(actors, main_filter, secondary_filter, scope=scope, main_share=main_share)
+    max_age_days = linkedin_max_age_days(cfg)
+    planned = plan_apify_runs(actors, main_filter, secondary_filter, scope=scope, main_share=main_share, max_age_days=max_age_days)
     active_count = sum(1 for item in (main_filter, secondary_filter) if item)
     log_event("info", "apify", f"Coleta planejada: Principal{' + Secundário' if secondary_filter else ''} ({active_count} filtro(s)), {len(planned)} execução(ões) Apify.")
     attempted = 0
