@@ -28,9 +28,13 @@ QUOTA_STATUSES = {401, 403, 429, 502, 503, 504}
 # Fallback de modelo, só Gemini e só modelos com camada gratuita (mesma chave, sem custo extra).
 # O 503 "high demand" e a quota (429) são POR MODELO: outro modelo costuma responder na hora.
 # AI_FALLBACK_MODELS (separado por vírgula) substitui a lista; vazio desliga o fallback.
-DEFAULT_FALLBACK_MODELS = ("gemini-2.5-flash", "gemini-2.5-flash-lite")
+# Modelos saem do ar: um 404 ("no longer available") só faz a cadeia pular para o próximo, nunca derruba a chamada.
+DEFAULT_FALLBACK_MODELS = ("gemini-3.8-flash", "gemini-2.5-flash-lite")
 OVERLOAD_STATUSES = {429, 500, 502, 503, 504}  # 401/403 = chave/permissão: trocar de modelo não ajuda
-PRIMARY_COOLDOWN_SECONDS = 90
+GONE_STATUS = 404  # modelo aposentado/inexistente para esta conta
+FALLBACK_STATUSES = OVERLOAD_STATUSES | {GONE_STATUS}
+COOLDOWN_SECONDS = 90  # sobrecarga é passageira
+GONE_COOLDOWN_SECONDS = 6 * 3600  # modelo aposentado não volta tão cedo: não paga uma chamada falha por vaga
 _cooldown_until: dict[tuple[str, str], float] = {}
 _cooldown_lock = threading.Lock()
 
@@ -47,9 +51,9 @@ def _cooling_down(provider: str, model: str) -> bool:
         return _cooldown_until.get((provider, model), 0.0) > time.monotonic()
 
 
-def _start_cooldown(provider: str, model: str) -> None:
+def _start_cooldown(provider: str, model: str, seconds: float = COOLDOWN_SECONDS) -> None:
     with _cooldown_lock:
-        _cooldown_until[(provider, model)] = time.monotonic() + PRIMARY_COOLDOWN_SECONDS
+        _cooldown_until[(provider, model)] = time.monotonic() + seconds
 
 
 def model_chain(provider: str, model: str) -> list[str]:
@@ -59,16 +63,15 @@ def model_chain(provider: str, model: str) -> list[str]:
         return [model]
     others = [m for m in fallback_models() if m.casefold() != model.casefold()]
     chain = [model, *dict.fromkeys(others)]
-    if len(chain) > 1 and _cooling_down(provider, model):
-        chain = [*chain[1:], model]  # primário sobrecarregado há pouco: tenta por último
-    return chain
+    # Quem falhou há pouco (sobrecarga ou modelo aposentado) vai para o fim, mantendo a ordem relativa.
+    return [m for m in chain if not _cooling_down(provider, m)] + [m for m in chain if _cooling_down(provider, m)]
 
 
 def _should_fall_back(exc: Exception) -> bool:
     """Sobrecarga/quota do modelo ou resposta inutilizável: outro modelo pode resolver."""
     if isinstance(exc, AiResponseError):
         return True
-    return getattr(exc, "http_status", None) in OVERLOAD_STATUSES
+    return getattr(exc, "http_status", None) in FALLBACK_STATUSES
 
 
 def _with_fallback(provider: str, model: str, call, on_model=None):
@@ -77,11 +80,12 @@ def _with_fallback(provider: str, model: str, call, on_model=None):
     for index, candidate in enumerate(chain):
         try:
             result = call(candidate)
-        except AiUnavailableError as exc:
+        except RuntimeError as exc:  # inclui AiUnavailableError/AiResponseError e o 404 de modelo aposentado
             if not _should_fall_back(exc) or index == len(chain) - 1:
                 raise
-            if candidate == model and not isinstance(exc, AiResponseError):
-                _start_cooldown(provider.casefold().strip(), model)
+            if not isinstance(exc, AiResponseError):
+                gone = getattr(exc, "http_status", None) == GONE_STATUS
+                _start_cooldown(provider.casefold().strip(), candidate, GONE_COOLDOWN_SECONDS if gone else COOLDOWN_SECONDS)
             continue
         if on_model is not None:
             on_model(candidate)

@@ -636,7 +636,7 @@ def _answer_assistant(message: str, history: str) -> str:
     from candidate.assistant_chat import answer_form_question
     cfg = core.settings()
     provider = (cfg.get("ai_provider") or "gemini").strip()
-    model = (cfg.get("ai_model") or "gemini-2.5-flash").strip()
+    model = (cfg.get("ai_model") or "gemini-3.5-flash-lite").strip()
     with core.connect() as db:
         answer = answer_form_question(
             question=message, cfg=cfg, db=db, provider=provider,

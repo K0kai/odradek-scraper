@@ -63,7 +63,7 @@ DEFAULT_SETTINGS = {
     "locations": "remote, remoto, brazil, brasil, worldwide, anywhere",
     "sources": "remotive,remoteok",
     "ai_provider": "gemini",
-    "ai_model": "gemini-2.5-flash",
+    "ai_model": "gemini-3.5-flash-lite",
     "candidate_name": "",
     "candidate_email": "",
     "candidate_phone": "",

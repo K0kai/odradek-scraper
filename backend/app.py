@@ -154,7 +154,7 @@ def create_cover_letter(job_id: int, resume_language: str | None = None, bridges
     cfg["resume_summary_pt"] = summaries.get("pt", "")
     cfg["resume_summary_en"] = summaries.get("en", "")
     provider = cfg.get("ai_provider", "gemini").casefold()
-    model = cfg.get("ai_model", "gemini-2.5-flash").strip()
+    model = cfg.get("ai_model", "gemini-3.5-flash-lite").strip()
     letter = ai_generate_letter(provider, model, language, dict(job), cfg, bridges)
     stamp = now_iso()
     with connect() as db:
@@ -233,7 +233,7 @@ def ai_assess_job(job: dict, cfg: dict[str, str], *, track: str = "core", call_j
     profile, resume_norm = bundle
 
     provider = cfg.get("ai_provider", "gemini").casefold()
-    model = cfg.get("ai_model", "gemini-2.5-flash").strip()
+    model = cfg.get("ai_model", "gemini-3.5-flash-lite").strip()
     if call_json is None:
         api_key = get_ai_key(provider)
         if not api_key:
@@ -435,7 +435,7 @@ def handle_resume_analysis_job(payload: dict) -> str:
     language = str(payload.get("language") or "").casefold()
     cfg = settings()
     provider = cfg.get("ai_provider", "gemini").casefold()
-    model = cfg.get("ai_model", "gemini-2.5-flash").strip()
+    model = cfg.get("ai_model", "gemini-3.5-flash-lite").strip()
     stamp = now_iso()
     try:
         with connect() as db:
@@ -1201,7 +1201,7 @@ def _generate_filter(cfg: dict[str, str], slot: str) -> dict:
         )
     profile, _ = bundle
     provider = cfg.get("ai_provider", "gemini").casefold()
-    model = cfg.get("ai_model", "gemini-2.5-flash").strip()
+    model = cfg.get("ai_model", "gemini-3.5-flash-lite").strip()
     api_key = get_ai_key(provider)
     if not api_key:
         raise AiUnavailableError("Configure a chave da API de IA para gerar o filtro LinkedIn.")
