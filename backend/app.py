@@ -1324,6 +1324,99 @@ def split_apify_count(base: int, filters: list[dict], main_share: int) -> list[i
     return [main, max(1, base - main)]
 
 
+# Actors custom (ex.: Indeed) cujo modelo usa {{keyword}}/{{location}} rodam uma consulta por cargo dos filtros
+# (Principal e Secundário) em cada local, em vez de uma única consulta fixa. O teto limita o gasto de créditos.
+CUSTOM_ACTOR_MAX_RUNS = 6
+CUSTOM_ACTOR_MAX_LOCATIONS = 3
+_REMOTE_LOCATION_WORDS = {"remote", "remoto", "worldwide", "anywhere", "global", "home office"}
+
+
+def custom_actor_uses_search_placeholders(actor: dict) -> bool:
+    template = actor.get("input_template")
+    blob = json.dumps(template, ensure_ascii=False) if isinstance(template, (dict, list)) else ""
+    return "{{keyword" in blob or "{{location" in blob
+
+
+def custom_search_locations(cfg: dict[str, str]) -> list[str]:
+    """Locais das buscas custom: os do painel sem repetir sinônimos, sempre com "remote" E o país, e a cidade.
+
+    "remote/remoto/worldwide/anywhere" contam como um local só, e "brazil/brasil" também; nenhum dos dois fica de fora
+    por não estar digitado em `locations`.
+    """
+    from candidate.resume_profile import normalize_text
+    from jobs.form_rules import infer_candidate_country
+
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(name: str) -> None:
+        name = name.strip()
+        norm = normalize_text(name)
+        if not norm:
+            return
+        key = "remote" if norm in _REMOTE_LOCATION_WORDS else min(_country_names(name) or {norm})
+        if key not in seen:
+            seen.add(key)
+            out.append(name)
+
+    for name in terms(cfg.get("locations", "")):
+        add(name)
+    add("remote")
+    add(infer_candidate_country(cfg))
+    add(cfg.get("candidate_city") or "")
+    return out[:CUSTOM_ACTOR_MAX_LOCATIONS]
+
+
+def plan_custom_actor_runs(
+    actor: dict, active: list[dict], fallback_keywords: list[str], locations: list[str],
+) -> list[tuple[dict, dict | None, list[str] | None]]:
+    """Uma execução por (cargo do filtro × local). Primeiro o 1º cargo de cada filtro em todos os locais (Principal
+    antes do Secundário), depois as variantes, até CUSTOM_ACTOR_MAX_RUNS. Sem filtros, usa as palavras gerais do painel."""
+    pairs: list[tuple[dict | None, str, str]] = []
+    if active:
+        deepest = max(len(item.get("keywords") or []) for item in active)
+        for index in range(deepest):
+            for location in locations:
+                for item in active:
+                    keywords = item.get("keywords") or []
+                    if index < len(keywords):
+                        pairs.append((item, str(keywords[index]), location))
+    else:
+        pairs = [(None, keyword, location) for keyword in fallback_keywords[:3] for location in locations]
+    runs: list[tuple[dict | None, str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item, keyword, location in pairs:
+        key = (keyword.casefold(), location.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        runs.append((item, keyword, location))
+        if len(runs) >= CUSTOM_ACTOR_MAX_RUNS:
+            break
+    base = int(actor.get("count") or 25)
+    per_run = base if len(runs) <= 1 else max(5, -(-base * 2 // len(runs)))  # ~2x o count do actor no total
+    label = str(actor.get("label") or actor["id"])
+    planned = []
+    for item, keyword, location in runs:
+        context = {"keyword": keyword, "keyword0": keyword, "location": location, "location0": location}
+        name = f"{label}: {item['name']} ({location})" if item else f"{label}: {keyword} ({location})"
+        planned.append(({**actor, "count": per_run, "label": name, "_ctx": context}, item, None))
+    return planned
+
+
+def interleave_runs(groups: list[list]) -> list:
+    """Intercala as execuções de cada actor (uma de cada por vez), mantendo a ordem interna de cada um.
+
+    Sem isso o primeiro actor (LinkedIn, com dezenas de execuções) enchia o limite de vagas por ciclo e os
+    seguintes (Indeed) nunca chegavam a rodar."""
+    merged: list = []
+    for position in range(max((len(group) for group in groups), default=0)):
+        for group in groups:
+            if position < len(group):
+                merged.append(group[position])
+    return merged
+
+
 def plan_apify_runs(
     actors: list[dict],
     main: dict | None,
@@ -1332,18 +1425,27 @@ def plan_apify_runs(
     scope: list[dict],
     main_share: int = 70,
     max_age_days: int = LINKEDIN_MAX_AGE_DAYS,
+    custom_locations: list[str] | None = None,
+    fallback_keywords: list[str] | None = None,
 ) -> list[tuple[dict, dict | None, list[str] | None]]:
-    """Divide a quantidade entre Principal e Secundário e prioriza os lotes do dia."""
-    planned: list[tuple[dict, dict | None, list[str] | None]] = []
+    """Divide a quantidade entre Principal e Secundário e prioriza os lotes do dia.
+
+    Os actors são intercalados (uma execução de cada por vez) para que o limite de vagas do ciclo não seja
+    consumido só pelo primeiro. Actors custom com {{keyword}}/{{location}} rodam um cargo dos filtros por local."""
+    groups: list[list[tuple[dict, dict | None, list[str] | None]]] = []
     active = [item for item in (main, secondary) if item and item.get("enabled", True)]
     for actor in actors:
         if not actor.get("enabled", True):
             continue
         if actor.get("input_mode") != "linkedin_search":
-            planned.append((actor, None, None))
+            if custom_locations and custom_actor_uses_search_placeholders(actor):
+                groups.append(plan_custom_actor_runs(actor, active, fallback_keywords or [], custom_locations))
+            else:
+                groups.append([(actor, None, None)])
             continue
         if not active:
             continue
+        planned: list[tuple[dict, dict | None, list[str] | None]] = []
         counts = split_apify_count(int(actor.get("count") or 25), active, main_share)
         searches = [(item, build_linkedin_search_urls(item, scope, max_age_days), count) for item, count in zip(active, counts)]
         for days in linkedin_recency_phases(max_age_days):  # janelas mais recentes sempre primeiro
@@ -1357,7 +1459,8 @@ def plan_apify_runs(
                     run_actor = {**actor, "count": count,
                                  "label": f"{label}: {item['name']} ({phase}, lote {offset // LINKEDIN_SEARCH_MAX_URLS + 1})"}
                     planned.append((run_actor, item, batch))
-    return planned
+        groups.append(planned)
+    return interleave_runs(groups)
 
 
 def build_apify_run_input(
@@ -1395,7 +1498,9 @@ def build_apify_run_input(
         "keyword1": keywords[1] if len(keywords) > 1 else keywords[0],
         "location0": locations[0],
         "location1": locations[1] if len(locations) > 1 else locations[0],
+        "max_age_days": str(linkedin_max_age_days(cfg)),
     }
+    ctx.update(actor.get("_ctx") or {})  # consulta específica (cargo do filtro × local) planejada para esta execução
     built = _substitute_apify_value(template, ctx)
     if isinstance(built, list):
         return {"items": built}
@@ -1682,11 +1787,20 @@ def iter_apify_jobs():
                 log_event("info", "apify", "Países com viés (buscados primeiro): " + ", ".join(linkedin_preferred_countries(cfg)) + ".")
             phases = linkedin_recency_phases(linkedin_max_age_days(cfg))
             log_event("info", "apify", "Janela de publicação (mais recentes primeiro): " + " → ".join("24h" if d == 1 else f"{d} dias" for d in phases) + ".")
+    elif any(custom_actor_uses_search_placeholders(actor) for actor in actors):
+        main_filter = get_main_filter(cfg)  # actors custom também buscam pelos cargos dos filtros
+        if main_filter is not None:
+            secondary = get_secondary_filter(cfg)
+            secondary_filter = secondary if secondary and secondary.get("enabled", True) else None
+    custom_locations = custom_search_locations(cfg)
+    if any(custom_actor_uses_search_placeholders(actor) for actor in actors):
+        log_event("info", "apify", "Locais das buscas custom (Indeed etc.): " + ", ".join(custom_locations) + ".")
 
     results: list[dict] = []
     errors: list[str] = []
     max_age_days = linkedin_max_age_days(cfg)
-    planned = plan_apify_runs(actors, main_filter, secondary_filter, scope=scope, main_share=main_share, max_age_days=max_age_days)
+    planned = plan_apify_runs(actors, main_filter, secondary_filter, scope=scope, main_share=main_share, max_age_days=max_age_days,
+                              custom_locations=custom_locations, fallback_keywords=terms(cfg.get("keywords", "")))
     active_count = sum(1 for item in (main_filter, secondary_filter) if item)
     log_event("info", "apify", f"Coleta planejada: Principal{' + Secundário' if secondary_filter else ''} ({active_count} filtro(s)), {len(planned)} execução(ões) Apify.")
     attempted = 0
