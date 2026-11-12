@@ -29,7 +29,8 @@ QUOTA_STATUSES = {401, 403, 429, 502, 503, 504}
 # O 503 "high demand" e a quota (429) são POR MODELO: outro modelo costuma responder na hora.
 # AI_FALLBACK_MODELS (separado por vírgula) substitui a lista; vazio desliga o fallback.
 # Modelos saem do ar: um 404 ("no longer available") só faz a cadeia pular para o próximo, nunca derruba a chamada.
-DEFAULT_FALLBACK_MODELS = ("gemini-3.8-flash", "gemini-2.5-flash-lite")
+# gemini-2.5-flash e gemini-2.5-flash-lite foram aposentados (404 "no longer available"). Ajustável por AI_FALLBACK_MODELS.
+DEFAULT_FALLBACK_MODELS = ("gemini-3.8-flash",)
 OVERLOAD_STATUSES = {429, 500, 502, 503, 504}  # 401/403 = chave/permissão: trocar de modelo não ajuda
 GONE_STATUS = 404  # modelo aposentado/inexistente para esta conta
 FALLBACK_STATUSES = OVERLOAD_STATUSES | {GONE_STATUS}
@@ -74,18 +75,39 @@ def _should_fall_back(exc: Exception) -> bool:
     return getattr(exc, "http_status", None) in FALLBACK_STATUSES
 
 
+def _failure_label(exc: BaseException) -> str:
+    if isinstance(exc, AiResponseError):
+        return "resposta inutilizável"
+    status = getattr(exc, "http_status", None)
+    return f"HTTP {status}" if status else exc.__class__.__name__
+
+
 def _with_fallback(provider: str, model: str, call, on_model=None):
-    """Executa call(modelo) pela cadeia; o último erro sobe se todos falharem."""
+    """Executa call(modelo) pela cadeia.
+
+    Se todos os modelos falharem por motivo de modelo (sobrecarga, quota, aposentado, JSON inutilizável), o erro
+    final é AiUnavailableError, que a fila repete depois, e lista o resultado de cada modelo.
+    Erros que trocar de modelo não resolve (chave inválida, permissão) sobem como vieram.
+    """
     chain = model_chain(provider, model)
+    failures: list[tuple[str, BaseException]] = []
     for index, candidate in enumerate(chain):
         try:
             result = call(candidate)
         except RuntimeError as exc:  # inclui AiUnavailableError/AiResponseError e o 404 de modelo aposentado
-            if not _should_fall_back(exc) or index == len(chain) - 1:
+            if not _should_fall_back(exc):
                 raise
+            failures.append((candidate, exc))
             if not isinstance(exc, AiResponseError):
                 gone = getattr(exc, "http_status", None) == GONE_STATUS
                 _start_cooldown(provider.casefold().strip(), candidate, GONE_COOLDOWN_SECONDS if gone else COOLDOWN_SECONDS)
+            if index == len(chain) - 1:
+                summary = "; ".join(f"{name}: {_failure_label(err)}" for name, err in failures)
+                final = AiUnavailableError(f"IA indisponível: nenhum modelo respondeu ({summary}).")
+                final.http_status = getattr(exc, "http_status", None)  # type: ignore[attr-defined]
+                if isinstance(exc, AiResponseError):
+                    raise AiResponseError(str(final)) from exc
+                raise final from exc
             continue
         if on_model is not None:
             on_model(candidate)

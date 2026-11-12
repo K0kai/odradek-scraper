@@ -7,7 +7,7 @@ from candidate.resume_pipeline import AiUnavailableError
 from integrations import ai_client
 
 PRIMARY = "gemini-3.5-flash-lite"
-F1, F2 = ai_client.DEFAULT_FALLBACK_MODELS  # primeiro e segundo fallback gratuitos
+F1, F2 = "gemini-3.8-flash", "gemini-test-fallback-2"  # os testes fixam a cadeia por AI_FALLBACK_MODELS
 SCHEMA = {"type": "object", "properties": {"ok": {"type": "boolean"}}}
 
 
@@ -37,7 +37,7 @@ class FallbackTests(unittest.TestCase):
         env = patch.dict(os.environ)
         env.start()
         self.addCleanup(env.stop)
-        os.environ.pop("AI_FALLBACK_MODELS", None)
+        os.environ["AI_FALLBACK_MODELS"] = f"{F1},{F2}"
 
     def call(self, plan, provider="gemini", **kwargs):
         fake = FakeRequest(plan)
@@ -134,9 +134,30 @@ class FallbackTests(unittest.TestCase):
         with patch.object(ai_client, "_request", FakeRequest(plan)), self.assertRaises(RuntimeError):
             ai_client.call_ai_json(prompt="x", schema=SCHEMA, provider="gemini", model=PRIMARY, api_key="k")
 
-    def test_default_fallbacks_are_current_models_not_the_retired_2_5_flash(self):
-        self.assertNotIn("gemini-2.5-flash", ai_client.DEFAULT_FALLBACK_MODELS)
-        self.assertEqual(ai_client.DEFAULT_FALLBACK_MODELS[0], "gemini-3.8-flash")
+    def test_default_fallbacks_are_current_models_not_the_retired_2_5_family(self):
+        os.environ.pop("AI_FALLBACK_MODELS")
+        self.assertEqual(ai_client.fallback_models(), ["gemini-3.8-flash"])
+        self.assertFalse([m for m in ai_client.DEFAULT_FALLBACK_MODELS if m.startswith("gemini-2.5")])
+
+    def test_when_every_model_fails_the_error_is_retryable_and_lists_each_model(self):
+        gone = RuntimeError("HTTP 404 NOT_FOUND")
+        gone.http_status = 404
+        plan = {PRIMARY: http_error(503), F1: http_error(429), F2: gone}
+        with patch.object(ai_client, "_request", FakeRequest(plan)), self.assertRaises(AiUnavailableError) as ctx:
+            ai_client.call_ai_json(prompt="x", schema=SCHEMA, provider="gemini", model=PRIMARY, api_key="k")
+        message = str(ctx.exception)
+        for model, status in ((PRIMARY, "503"), (F1, "429"), (F2, "404")):
+            self.assertIn(f"{model}: HTTP {status}", message)
+        # a fila só repete erros "indisponíveis": isso evita a falha definitiva da vaga
+        from jobs.job_queue import is_retryable_error
+        self.assertTrue(is_retryable_error(ctx.exception))
+
+    def test_single_model_that_is_gone_is_retryable_instead_of_killing_the_job(self):
+        os.environ["AI_FALLBACK_MODELS"] = ""
+        gone = RuntimeError("HTTP 404 NOT_FOUND no longer available")
+        gone.http_status = 404
+        with patch.object(ai_client, "_request", FakeRequest({PRIMARY: gone})), self.assertRaises(AiUnavailableError):
+            ai_client.call_ai_json(prompt="x", schema=SCHEMA, provider="gemini", model=PRIMARY, api_key="k")
 
 
 if __name__ == "__main__":
