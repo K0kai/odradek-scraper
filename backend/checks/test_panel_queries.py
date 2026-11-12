@@ -104,6 +104,74 @@ class TriageViewTests(AppDbCase):
         self.assertEqual([item["id"] for item in payload["items"]], [2, 1])
         self.assertEqual(payload["counts"], {"discarded": 1, "pending": 2})
 
+    def test_filters_match_minimum_period_and_sort_like_the_review_page(self):
+        self.add_job(1, "", approved=False, status="ignored", seen="2026-01-10T12:00:00+00:00")   # nota 20
+        self.add_job(2, "", approved=False, status="ignored", seen="2026-03-10T12:00:00+00:00")
+        self.add_decision(2, 85, False)
+        self.add_job(3, "", approved=False, status="ignored", seen="2026-02-10T12:00:00+00:00")
+        self.add_decision(3, 60, False)
+        ids = lambda **kw: [i["id"] for i in panel_queries.triage_api_payload(tab="discarded", **kw)["items"]]
+        self.assertEqual(ids(), [2, 3, 1])                                   # padrão: maior nota primeiro
+        self.assertEqual(ids(min_match=50), [2, 3])
+        self.assertEqual(ids(date_from="2026-02-01"), [2, 3])
+        self.assertEqual(ids(date_from="2026-02-01", date_to="2026-02-28"), [3])
+        self.assertEqual(ids(date_from="2026-02-28", date_to="2026-02-01"), [3])  # intervalo invertido é corrigido
+        self.assertEqual(ids(sort="seen_asc"), [1, 3, 2])
+        self.assertEqual(ids(sort="match_asc"), [1, 3, 2])
+
+    def test_filtered_total_and_pages_follow_filters_but_tab_badges_do_not(self):
+        for i in range(1, 8):
+            self.add_job(i, "", approved=False, status="ignored")
+            self.add_decision(i, 90 if i <= 6 else 10, False)
+        payload = panel_queries.triage_api_payload(tab="discarded", min_match=50, page_size=5)
+        self.assertEqual((payload["total"], payload["pages"], len(payload["items"])), (6, 2, 5))
+        self.assertEqual(payload["counts"]["discarded"], 7)  # selo da aba: sem filtros
+        self.assertEqual(payload["filters"]["min_match"], 50)
+
+    def test_pending_tab_ignores_match_minimum_but_honors_the_period(self):
+        self.add_job(1, "", status="new", seen="2026-01-10T12:00:00+00:00")
+        self.add_job(2, "", status="review", seen="2026-03-10T12:00:00+00:00")
+        pending = lambda **kw: [i["id"] for i in panel_queries.triage_api_payload(tab="pending", **kw)["items"]]
+        self.assertEqual(pending(min_match=90), [2, 1])           # ainda sem nota: o match mínimo não esconde nada
+        self.assertEqual(pending(date_from="2026-03-01"), [2])
+        self.assertEqual(pending(sort="seen_asc"), [1, 2])
+
+    def add_titled(self, job_id, title, company="Acme", location="Remoto", status="ignored", score=50):
+        self.seed_job(id=job_id, fingerprint=f"fp{job_id}", url=f"https://example.com/{job_id}", title=title,
+                      company=company, location=location, status=status)
+        if status == "ignored":
+            self.add_decision(job_id, score, False)
+
+    def test_text_search_matches_title_company_or_location_case_insensitively(self):
+        self.add_titled(1, "Analista de Processos", "Banco Azul", "Belo Horizonte, Brazil", score=70)
+        self.add_titled(2, "Full Stack Developer", "Processos Digitais SA", "Remote", score=60)
+        self.add_titled(3, "Engenheiro de Dados", "Acme", "Lisboa, Portugal", score=50)
+        search = lambda q, **kw: [i["id"] for i in panel_queries.triage_api_payload(tab="discarded", q=q, **kw)["items"]]
+        self.assertEqual(search("PROCESSOS"), [1, 2])      # título ou empresa
+        self.assertEqual(search("lisboa"), [3])            # local
+        self.assertEqual(search("belo brazil"), [1])       # várias palavras: todas precisam aparecer
+        self.assertEqual(search("analista dados"), [])     # ...e nenhuma vaga tem as duas
+        self.assertEqual(search("  "), [1, 2, 3])          # busca vazia não filtra
+        self.assertEqual(search("processos", min_match=65), [1])  # combina com os outros filtros
+
+    def test_text_search_treats_percent_and_underscore_as_plain_text(self):
+        self.add_titled(1, "Dev 100% remoto")
+        self.add_titled(2, "Dev presencial")
+        self.add_titled(3, "back_end Engineer")
+        search = lambda q: [i["id"] for i in panel_queries.triage_api_payload(tab="discarded", q=q)["items"]]
+        self.assertEqual(search("100%"), [1])
+        self.assertEqual(search("%"), [1])    # sem escape, "%" casaria com tudo
+        self.assertEqual(search("back_end"), [3])
+        self.assertEqual(search("_"), [3])
+
+    def test_text_search_also_works_on_the_pending_tab_and_is_echoed_back(self):
+        self.add_titled(1, "Analista de Suporte", status="new")
+        self.add_titled(2, "Engenheiro", status="review")
+        payload = panel_queries.triage_api_payload(tab="pending", q="Suporte  ANALISTA")
+        self.assertEqual([i["id"] for i in payload["items"]], [1])
+        self.assertEqual(payload["filters"]["q"], "suporte analista")
+        self.assertEqual(payload["counts"]["pending"], 2)  # selo da aba segue sem filtros
+
     def test_unknown_tab_falls_back_to_discarded_and_pages_are_clamped(self):
         for i in range(1, 8):
             self.add_job(i, "", approved=False, status="ignored")

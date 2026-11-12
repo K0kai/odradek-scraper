@@ -173,8 +173,10 @@ def jobs(page: int = 1, page_size: int = 15, status: str = "worth", min_match: i
 
 
 @api.get("/api/triage")
-def triage(tab: str = "discarded", page: int = 1, page_size: int = 15) -> dict:
-    return panel_queries.triage_api_payload(tab=tab, page=page, page_size=page_size)
+def triage(tab: str = "discarded", page: int = 1, page_size: int = 15, min_match: int = 0,
+           sort: str = "", date_from: str = "", date_to: str = "", q: str = "") -> dict:
+    return panel_queries.triage_api_payload(tab=tab, page=page, page_size=page_size, min_match=min_match,
+                                            sort=sort, date_from=date_from, date_to=date_to, q=q)
 
 
 @api.post("/api/triage/reviewed")

@@ -19,12 +19,12 @@ function cycleSort(value: string, column: SortColumn): string {
   return next ? [`${column}_${next}`, ...remaining].join(',') : remaining.join(',')
 }
 
-export function JobSort({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+export function JobSort({ value, onChange, hide = [] }: { value: string; onChange: (value: string) => void; hide?: SortColumn[] }) {
   const active = activeSorts(value)
   return <div className="job-sort">
     <div className="job-sort-heading"><strong>Ordenação</strong><span>Clique para alternar: crescente → decrescente → desligada. O último critério ativado tem prioridade.</span></div>
     <div className="job-sort-options">
-      {columns.map(({ key, label }) => {
+      {columns.filter(({ key }) => !hide.includes(key)).map(({ key, label }) => {
         const index = active.findIndex(token => token.startsWith(`${key}_`))
         const direction = index < 0 ? null : active[index].endsWith('_asc') ? 'asc' : 'desc'
         return <button type="button" className={`job-sort-option${direction ? ' active' : ''}`} aria-pressed={Boolean(direction)} key={key} onClick={() => onChange(cycleSort(value, key))}>

@@ -119,21 +119,53 @@ TRIAGE_TABS = {
 }
 
 
-def triage_api_payload(*, tab: str = "discarded", page: int = 1, page_size: int = 15) -> dict:
+def triage_api_payload(*, tab: str = "discarded", page: int = 1, page_size: int = 15, min_match: int = 0,
+                       sort: str = "", date_from: str = "", date_to: str = "", q: str = "") -> dict:
+    """Mesmos filtros de "Vagas para revisar" (match mínimo, período em que foi encontrada, ordenação)
+    mais busca por texto: cada palavra de `q` precisa aparecer no título, na empresa ou no local (sem diferenciar
+    maiúsculas; % e _ valem como texto, não como curinga).
+
+    `counts` (selos das abas) ignora os filtros; `total` e a paginação respeitam. Vagas aguardando triagem ainda
+    não têm nota: match mínimo não se aplica a elas.
+    """
     tab = tab if tab in TRIAGE_TABS else "discarded"
     page = max(1, page)
     page_size = max(5, min(50, page_size))
-    where, order = TRIAGE_TABS[tab]
+    min_match = max(0, min(100, min_match))
+    sort = normalize_worth_sort(sort)
+    if date_from and date_to and date_from > date_to:
+        date_from, date_to = date_to, date_from
+    lo, hi = worth_date_bounds_utc(date_from, date_to)
+    where, default_order = TRIAGE_TABS[tab]
+    clauses, params = [where], []
+    if min_match and tab == "discarded":
+        clauses.append(f"COALESCE({_worth_match_expr()}, 0) >= ?")
+        params.append(min_match)
+    if lo:
+        clauses.append("jobs.first_seen_at >= ?")
+        params.append(lo)
+    if hi:
+        clauses.append("jobs.first_seen_at < ?")
+        params.append(hi)
+    terms = [term for term in re.split(r"\s+", (q or "").strip().lower()[:100]) if term][:6]
+    for term in terms:
+        clauses.append("LOWER(COALESCE(jobs.title, '') || ' ' || COALESCE(jobs.company, '') || ' ' || "
+                       "COALESCE(jobs.location, '')) LIKE ? ESCAPE '!'")
+        params.append("%" + term.replace("!", "!!").replace("%", "!%").replace("_", "!_") + "%")
+    filtered = " AND ".join(clauses)
+    order = worth_order_sql(sort) if sort else default_order
     with connect() as db:
         counts = {key: int(db.execute(f"SELECT COUNT(*) n FROM jobs WHERE {cond}").fetchone()["n"])
                   for key, (cond, _) in TRIAGE_TABS.items()}
-        total = counts[tab]
+        total = int(db.execute(f"SELECT COUNT(*) n FROM jobs WHERE {filtered}", params).fetchone()["n"])
         pages = max(1, (total + page_size - 1) // page_size)
         page = min(page, pages)
-        rows = db.execute(JOB_SELECT + f"WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
-                          [page_size, (page - 1) * page_size]).fetchall()
+        rows = db.execute(JOB_SELECT + f"WHERE {filtered} ORDER BY {order} LIMIT ? OFFSET ?",
+                          [*params, page_size, (page - 1) * page_size]).fetchall()
     return {"tab": tab, "items": [_job_api_record(row) for row in rows], "total": total, "page": page,
-            "pages": pages, "page_size": page_size, "counts": counts}
+            "pages": pages, "page_size": page_size, "counts": counts,
+            "filters": {"min_match": min_match, "sort": sort, "date_from": date_from, "date_to": date_to,
+                        "q": " ".join(terms)}}
 
 
 def mark_jobs_reviewed(ids: list[int]) -> int:
