@@ -172,6 +172,7 @@ export type CopilotAsk = {
   created_at: string
 }
 export type SettingsGroup = 'search' | 'profile' | 'ai' | 'automation' | 'smtp'
+export type ExtensionTokenStatus = { configured: boolean; created_at: string | null }
 export type FormRule = { key: string; aliases: string; mode: string; value_from: string; value: string }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -266,5 +267,8 @@ export const api = {
   filterMetrics: () => request<{ metrics: Record<string, FilterMetric> }>('/api/linkedin-filters/metrics'),
   formRules: () => request<{ items: FormRule[] }>('/api/form-rules'),
   saveFormRules: (items: FormRule[]) => request<{ notice: string }>('/api/form-rules', { method: 'POST', body: JSON.stringify({ items }) }),
+  extensionToken: () => request<ExtensionTokenStatus>('/api/extension-token'),
+  issueExtensionToken: () => request<ExtensionTokenStatus & { notice: string; token: string }>('/api/extension-token', { method: 'POST' }),
+  revokeExtensionToken: () => request<ExtensionTokenStatus & { notice: string }>('/api/extension-token/revoke', { method: 'POST' }),
   testSmtp: () => request<{ notice: string }>('/api/smtp/test', { method: 'POST' }),
 }

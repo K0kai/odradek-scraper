@@ -26,7 +26,7 @@ type Section = {
   fields: Field[]
   fold?: boolean
   generate?: 'main' | 'secondary'
-  action?: 'smtp-test'
+  action?: 'smtp-test' | 'extension'
 }
 type Tab = { id: string; label: string; sections: Section[] }
 
@@ -192,6 +192,10 @@ const tabs: Tab[] = [
           { key: 'smtp_use_tls', group: 'smtp', label: 'Usar TLS', kind: 'toggle' },
         ],
       },
+      {
+        title: 'Extensão do navegador', description: 'Conecta a extensão Odradek Autofill a este painel, para o assistente e o preenchimento. Gere um token, copie e cole em Configurações da extensão.', action: 'extension',
+        fields: [],
+      },
     ],
   },
 ]
@@ -236,6 +240,49 @@ function FieldView({ field, value, secretSet, onChange }: { field: Field; value:
             onChange={event => onChange(event.target.value)} autoComplete={field.kind === 'password' ? 'new-password' : 'off'} />}
     {hint}
   </label>
+}
+
+function ExtensionPairing({ notify }: { notify: (message: string, error?: boolean) => void }) {
+  const [status, setStatus] = useState<{ configured: boolean; created_at: string | null } | null>(null)
+  const [token, setToken] = useState('')
+  const [busy, setBusy] = useState(false)
+  useEffect(() => {
+    let live = true
+    api.extensionToken().then(result => { if (live) setStatus(result) }).catch(err => notify((err as Error).message, true))
+    return () => { live = false }
+  }, [notify])
+  async function run(action: 'issue' | 'revoke') {
+    if (busy || (action === 'issue' && status?.configured && !window.confirm('Gerar um novo token desconecta a extensão atual até você colar o novo. Continuar?'))) return
+    setBusy(true)
+    try {
+      const result = action === 'issue' ? await api.issueExtensionToken() : { ...(await api.revokeExtensionToken()), token: '' }
+      setStatus({ configured: result.configured, created_at: result.created_at })
+      setToken(result.token)
+      notify(result.notice)
+    } catch (err) { notify((err as Error).message, true) }
+    finally { setBusy(false) }
+  }
+  async function copy(value: string) {
+    try { await navigator.clipboard.writeText(value); notify('Copiado.') }
+    catch { notify('Não foi possível copiar. Selecione o texto e copie manualmente.', true) }
+  }
+  const created = status?.created_at ? new Date(status.created_at).toLocaleString('pt-BR') : ''
+  return <div className="extension-pairing">
+    <p className="settings-state-line">
+      Estado: <em className={`secret-state${status?.configured ? ' ok' : ''}`}>{status === null ? 'Carregando…' : status.configured ? `Token ativo${created ? ` (gerado em ${created})` : ''}` : 'Sem token'}</em>
+    </p>
+    <label className="wide">URL do painel (cole em “Backend URL” na extensão)
+      <span className="copy-row"><input readOnly value={window.location.origin} /><button type="button" className="secondary" onClick={() => copy(window.location.origin)}>Copiar</button></span>
+    </label>
+    {token && <label className="wide">Token (aparece só agora)
+      <span className="copy-row"><input readOnly value={token} onFocus={event => event.currentTarget.select()} /><button type="button" className="secondary" onClick={() => copy(token)}>Copiar</button></span>
+      <small className="settings-hint">Guarde-o na extensão agora. Depois disso só dá para gerar outro.</small>
+    </label>}
+    <div className="settings-card-actions">
+      <button type="button" className="secondary" disabled={busy || status === null} onClick={() => run('issue')}>{status?.configured ? 'Gerar novo token' : 'Gerar token'}</button>
+      {status?.configured && <button type="button" className="secondary" disabled={busy} onClick={() => run('revoke')}>Revogar</button>}
+    </div>
+  </div>
 }
 
 const clone = (source: Partial<Record<SettingsGroup, Values>>) => {
@@ -334,8 +381,8 @@ export function SettingsView({ notify }: { notify: (message: string, error?: boo
   function renderSection(section: Section) {
     const body = <>
       {section.description && <p className="section-description">{section.description}</p>}
-      <div className="settings-grid">{section.fields.map(renderField)}</div>
-      {(section.generate || section.action) && <div className="settings-card-actions">
+      {section.action === 'extension' ? <ExtensionPairing notify={notify} /> : <div className="settings-grid">{section.fields.map(renderField)}</div>}
+      {(section.generate || section.action === 'smtp-test') && <div className="settings-card-actions">
         {section.generate && <button className="secondary" disabled={busy} onClick={() => generateFilter(section.generate!)}>Gerar com IA</button>}
         {section.generate && <small className="settings-hint">Salva a busca e substitui só este filtro.</small>}
         {section.action === 'smtp-test' && <button className="secondary" disabled={busy || smtpDirty} onClick={testSmtp}>Enviar e-mail de teste</button>}

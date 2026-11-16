@@ -24,6 +24,7 @@ from jobs.bulk_ignore import apply as apply_bulk_ignore, criteria_from_body, pre
 from jobs.job_queue import KIND_RESUME
 from web.panel_log import clear_logs, log_event
 from candidate.resume_pipeline import AiUnavailableError, get_resume, persist_resume_upload
+from web.extension_token import EXTENSION_PATHS, issue_token, revoke_token, token_status, verify_token
 from web.panel_auth import configured, requires_auth, same_origin_post
 from web.panel_session import (clear_session_cookie, issue_session, login_form, login_page,
                            safe_next, secure_cookie, session_cookie, session_expiry, verify_login)
@@ -59,6 +60,15 @@ async def guard(request: Request, call_next):
         supplied = request.headers.get("authorization", "")
         if not hmac.compare_digest(supplied.encode(), ("Bearer " + token).encode()):
             return JSONResponse({"error": "Token inválido."}, status_code=401)
+        response = await call_next(request)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    bearer = request.headers.get("authorization", "")
+    if request.url.path in EXTENSION_PATHS and bearer[:7].casefold() == "bearer ":
+        # Extension pairing token: a header credential, so no origin/session check applies.
+        if not await run_in_threadpool(verify_token, bearer[7:].strip()):
+            return JSONResponse({"error": "Token da extensão inválido ou revogado. Gere outro no painel (Configurações)."},
+                                status_code=401, headers={"Cache-Control": "no-store"})
         response = await call_next(request)
         response.headers["Cache-Control"] = "no-store"
         return response
@@ -248,6 +258,26 @@ def settings_group(group: str) -> dict:
     if group not in panel_settings.SETTINGS_API_GROUPS:
         return JSONResponse({"error": "Grupo de configuração inválido"}, status_code=404)
     return panel_settings.settings_api_payload(group)
+
+
+@api.get("/api/extension-token")
+def extension_token_status() -> dict:
+    return token_status()
+
+
+@api.post("/api/extension-token")
+def extension_token_issue() -> dict:
+    token = issue_token()
+    log_event("info", "extension", "Token de pareamento da extensão gerado.")
+    return {"ok": True, "token": token, "notice": "Token gerado. Copie agora: ele não será exibido de novo.",
+            **token_status()}
+
+
+@api.post("/api/extension-token/revoke")
+def extension_token_revoke() -> dict:
+    revoke_token()
+    log_event("info", "extension", "Token de pareamento da extensão revogado.")
+    return {"ok": True, "notice": "Token revogado.", **token_status()}
 
 
 @api.get("/api/form-rules")

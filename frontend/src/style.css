@@ -1538,6 +1538,24 @@ button:hover:not(:disabled),.open-link:hover{
 .secret-state.ok{
   color:#7fc79a
 }
+.extension-pairing{
+  display:grid;
+  gap:12px
+}
+.extension-pairing .settings-state-line{
+  margin:0;
+  font-size:12px;
+  color:#b8c1b8
+}
+.copy-row{
+  display:flex;
+  gap:8px;
+  margin-top:5px
+}
+.copy-row input{
+  flex:1;
+  min-width:0
+}
 .settings-card-actions{
   display:flex;
   flex-wrap:wrap;
