@@ -177,10 +177,10 @@ class AssessmentTests(unittest.TestCase):
                            "work from anywhere. Located in Germany.</p>")
     GEO_WORDS = ("exterior", "presencial", "híbrida", "configure sua cidade", "restrita", "sem informar")
 
-    def geo(self, stated, *, location="Remoto", cfg=None):
+    def geo(self, stated, *, location="Remoto", cfg=None, extra="", job_extra=None):
         raw = base_raw()
         raw["stated"].update(stated)
-        result, _ = run(raw, job={**JOB, "location": location, "description": self.GEO_DESC}, cfg=cfg)
+        result, _ = run(raw, job={**JOB, "location": location, "description": self.GEO_DESC + extra, **(job_extra or {})}, cfg=cfg)
         blocks = result["assessment"]["decision"]["blocks"]
         return [b for b in blocks if any(word in b for word in self.GEO_WORDS)], blocks
 
@@ -215,6 +215,51 @@ class AssessmentTests(unittest.TestCase):
         self.assertTrue(any("presencial fora de Belo Horizonte" in b for b in elsewhere))
         hybrid = {"workplace": "hybrid", "workplace_quote": "Hybrid in Berlin"}
         self.assertTrue(any("híbrida fora de" in b for b in self.geo(hybrid, location="São Paulo, Brasil")[0]))
+
+    def test_country_city_from_preferred_countries_also_accepts_onsite_and_hybrid(self):
+        cfg = {"linkedin_preferred_countries": "Brazil (São Paulo), Portugal (Lisboa)"}
+        onsite = {"workplace": "onsite", "workplace_quote": "Trabalho presencial"}
+        self.assertEqual(self.geo(onsite, location="São Paulo, Brasil", cfg=cfg)[0], [])  # cidade escolhida no próprio país
+        self.assertEqual(self.geo(onsite, location="Belo Horizonte, MG", cfg=cfg)[0], [])  # cidade de residência continua valendo
+        elsewhere = self.geo(onsite, location="Recife, Brasil", cfg=cfg)[0]
+        self.assertTrue(any("fora de Belo Horizonte / São Paulo / Lisboa" in b for b in elsewhere))
+        foreign = {"job_country": "Portugal", "job_country_quote": "Vaga em Portugal", **onsite}
+        extra = "<p>Vaga em Portugal.</p>"
+        self.assertEqual(self.geo(foreign, location="Lisboa, Portugal", cfg=cfg, extra=extra)[0], [])
+        porto = self.geo(foreign, location="Porto, Portugal", cfg=cfg, extra=extra)[0]
+        self.assertTrue(any("exterior não remota" in b for b in porto))
+
+    def test_job_found_by_a_remote_filtered_search_is_trusted_when_the_text_is_silent(self):
+        stated = {"job_country": "Brasil", "job_country_quote": "Vaga em São Paulo, Brasil",
+                  "job_city": "São Paulo", "job_city_quote": "Vaga em São Paulo, Brasil",
+                  "workplace": "unspecified", "workplace_quote": ""}
+        extra = "<p>Vaga em São Paulo, Brasil.</p>"
+        silent = self.geo(stated, location="São Paulo, Brasil", extra=extra)[0]
+        self.assertTrue(any("sem informar trabalho remoto" in b for b in silent))  # sem a marca, continua bloqueando
+        trusted = self.geo(stated, location="São Paulo, Brasil", extra=extra, job_extra={"search_remote": "1"})[0]
+        self.assertEqual(trusted, [])
+        not_remote = self.geo(stated, location="São Paulo, Brasil", extra=extra, job_extra={"search_remote": ""})[0]
+        self.assertTrue(any("sem informar trabalho remoto" in b for b in not_remote))
+
+    def test_remote_search_mark_never_overrides_a_quoted_onsite_or_hybrid_text(self):
+        onsite = {"workplace": "onsite", "workplace_quote": "Trabalho presencial"}
+        blocks = self.geo(onsite, location="São Paulo, Brasil", job_extra={"search_remote": "1"})[0]
+        self.assertTrue(any("presencial fora de" in b for b in blocks))
+
+    def test_remote_search_mark_does_not_lift_a_quoted_restriction(self):
+        restricted = {"foreign_eligibility": "restricted", "eligibility_quote": "Trabalho presencial"}
+        self.assertTrue(any("restrita" in b for b in self.geo(restricted, job_extra={"search_remote": "1"})[0]))
+
+    def test_unspecified_workplace_in_a_chosen_country_city_is_not_blocked(self):
+        stated = {"job_country": "Brasil", "job_country_quote": "Vaga em São Paulo, Brasil",
+                  "job_city": "São Paulo", "job_city_quote": "Vaga em São Paulo, Brasil",
+                  "workplace": "unspecified", "workplace_quote": ""}
+
+        def blocks(cfg):
+            return self.geo(stated, location="São Paulo, Brasil", cfg=cfg, extra="<p>Vaga em São Paulo, Brasil.</p>")[1]
+
+        self.assertTrue(any("sem informar trabalho remoto" in b for b in blocks({})))
+        self.assertFalse(any("sem informar trabalho remoto" in b for b in blocks({"linkedin_preferred_countries": "Brazil (São Paulo)"})))
 
     def test_unverified_workplace_quote_never_counts_as_remote_or_onsite(self):
         stated = {"workplace": "onsite", "workplace_quote": "100% in the office"}

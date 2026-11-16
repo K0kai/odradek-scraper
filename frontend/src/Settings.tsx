@@ -80,7 +80,7 @@ const tabs: Tab[] = [
         title: 'Alcance',
         fields: [
           { key: 'linkedin_max_age_days', group: 'search', label: 'Idade máxima das vagas do LinkedIn', kind: 'slider', min: 1, max: 30, def: 7, wide: true, format: days => days <= 1 ? 'até 24 horas' : `até ${days} dias`, hint: 'As mais recentes são sempre buscadas primeiro; este é só o limite até onde a busca alarga (24h, depois 7 dias, depois este valor).' },
-          { key: 'linkedin_preferred_countries', group: 'search', label: 'Países preferidos (até 5)', wide: true, hint: 'Ex.: Brazil, Portugal. Vagas desses países são buscadas e triadas primeiro; nenhum país é excluído.' },
+          { key: 'linkedin_preferred_countries', group: 'search', label: 'Países preferidos (até 5)', wide: true, hint: 'Ex.: Brazil (Belo Horizonte), Portugal. Vagas desses países são buscadas e triadas primeiro; nenhum país é excluído. A cidade entre parênteses é opcional: além das vagas remotas do país, busca nela em qualquer modelo e aceita vaga híbrida/presencial só lá.' },
           { key: 'geo_eligibility_enabled', group: 'search', label: 'Respeitar elegibilidade geográfica', kind: 'toggle', wide: true, hint: 'Fora do seu país só vagas remotas e abertas a estrangeiros; híbrido/presencial só na sua cidade.' },
         ],
       },

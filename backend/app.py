@@ -822,15 +822,16 @@ _COUNTRY_SYNONYMS = (
 )
 
 
+def linkedin_preferred_places(cfg: dict[str, str] | None) -> list[tuple[str, str]]:
+    """Países com viés do painel e a cidade opcional de cada um ('Brazil (Belo Horizonte), Portugal'), no máximo 5."""
+    from jobs.job_assessment import parse_preferred_countries
+
+    return parse_preferred_countries((cfg or {}).get("linkedin_preferred_countries"))[:LINKEDIN_PREFERRED_COUNTRIES_MAX]
+
+
 def linkedin_preferred_countries(cfg: dict[str, str] | None) -> list[str]:
-    """Países com viés do painel (vírgula/ponto e vírgula/linha), sem repetir, no máximo 5, na ordem dada."""
-    raw = str((cfg or {}).get("linkedin_preferred_countries") or "")
-    names: list[str] = []
-    for part in re.split(r"[,;\n]+", raw):
-        name = part.strip()
-        if name and name.casefold() not in {n.casefold() for n in names}:
-            names.append(name[:40])
-    return names[:LINKEDIN_PREFERRED_COUNTRIES_MAX]
+    """Só os nomes dos países com viés, sem repetir, no máximo 5, na ordem dada."""
+    return [name for name, _ in linkedin_preferred_places(cfg)]
 
 
 def _country_names(name: str) -> set[str]:
@@ -1260,10 +1261,14 @@ def linkedin_search_scope(cfg: dict[str, str]) -> list[dict]:
     remote = "2" if enabled else ""
     country = infer_candidate_country(cfg).strip()
     city = (cfg.get("candidate_city") or "").strip()
-    preferred = linkedin_preferred_countries(cfg)
-    pairs: list[tuple[str, str]] = [(name, remote) for name in preferred]  # países com viés antes de qualquer outro
-    if enabled and city and country and any(_country_names(country) & _country_names(name) for name in preferred):
-        pairs.append((city, ""))  # o país de casa tem viés: a sua cidade (qualquer modelo) vem logo depois
+    places = linkedin_preferred_places(cfg)
+    pairs: list[tuple[str, str]] = []
+    for name, place_city in places:  # países com viés antes de qualquer outro
+        pairs.append((name, remote))
+        if enabled and place_city:
+            pairs.append((place_city, ""))  # a cidade escolhida para este país (qualquer modelo), logo depois dele
+    if enabled and city and country and any(not place_city and _country_names(country) & _country_names(name) for name, place_city in places):
+        pairs.append((city, ""))  # o país de casa tem viés sem cidade própria: a sua cidade vem logo depois
     pairs.append(("Worldwide", remote))
     if country and country.casefold() != "worldwide":
         pairs.append((country, remote))
@@ -1417,6 +1422,19 @@ def interleave_runs(groups: list[list]) -> list:
     return merged
 
 
+def split_urls_by_work_model(batch: list[str], count: int) -> list[tuple[list[str], int, bool]]:
+    """Separa as URLs do lote em buscas com o filtro remoto do LinkedIn (f_WT=2) e as demais.
+
+    O actor não informa de qual URL cada vaga veio, então a origem remota só é conhecida se as duas ficarem em
+    execuções separadas. O `count` do lote é repartido na proporção das URLs (mínimo 1), sem aumentar o custo."""
+    remote = [url for url in batch if "&f_WT=2" in url]
+    other = [url for url in batch if "&f_WT=2" not in url]
+    if not remote or not other:
+        return [(batch, count, bool(remote))]
+    first = max(1, min(count - 1, round(count * len(remote) / len(batch)))) if count > 1 else 1
+    return [(remote, first, True), (other, max(1, count - first), False)]
+
+
 def plan_apify_runs(
     actors: list[dict],
     main: dict | None,
@@ -1456,9 +1474,12 @@ def plan_apify_runs(
                     batch = phase_urls[offset:offset + LINKEDIN_SEARCH_MAX_URLS]
                     label = str(actor.get("label") or actor["id"])
                     phase = "24h" if days == 1 else f"{days}d"
-                    run_actor = {**actor, "count": count,
-                                 "label": f"{label}: {item['name']} ({phase}, lote {offset // LINKEDIN_SEARCH_MAX_URLS + 1})"}
-                    planned.append((run_actor, item, batch))
+                    parts = split_urls_by_work_model(batch, count)
+                    for part_urls, part_count, remote in parts:
+                        suffix = (", remoto" if remote else ", qualquer modelo") if len(parts) > 1 else ""
+                        run_actor = {**actor, "count": part_count, "_search_remote": remote,
+                                     "label": f"{label}: {item['name']} ({phase}, lote {offset // LINKEDIN_SEARCH_MAX_URLS + 1}{suffix})"}
+                        planned.append((run_actor, item, part_urls))
         groups.append(planned)
     return interleave_runs(groups)
 
@@ -1824,7 +1845,8 @@ def iter_apify_jobs():
                 batch, dropped_india = drop_excluded_region_jobs(batch)
                 if dropped_india:
                     log_event("info", "apify", f"{run_label}: {dropped_india} vaga(s) da Índia descartada(s) antes de entrar na coleta.")
-                batch = [{**job, "_linkedin_filter_id": linkedin_filter["id"]} for job in batch]
+                remote_search = "1" if run_actor.get("_search_remote") else ""
+                batch = [{**job, "_linkedin_filter_id": linkedin_filter["id"], "_search_remote": remote_search} for job in batch]
             results.extend(batch)
         except Exception as exc:
             LOG.exception("Falha no actor Apify %s", run_label)
@@ -1987,8 +2009,8 @@ class Collector:
                         continue
                     language, language_confidence = detect_language(job["title"] + "\n" + re.sub(r"<[^>]+>", " ", job["description"]))
                     with connect() as db:
-                        cursor = db.execute("""INSERT INTO jobs(source,source_id,title,company,location,description,url,posted_at,first_seen_at,fingerprint,language,language_confidence,search_filter_id)
-                          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(fingerprint) DO NOTHING""", (job["source"], job["source_id"], job["title"], job["company"], job["location"], job["description"], job["url"], job["posted_at"],  now_iso(), fingerprint(job), language, language_confidence, str(job.get("_linkedin_filter_id") or "")))
+                        cursor = db.execute("""INSERT INTO jobs(source,source_id,title,company,location,description,url,posted_at,first_seen_at,fingerprint,language,language_confidence,search_filter_id,search_remote)
+                          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(fingerprint) DO NOTHING""", (job["source"], job["source_id"], job["title"], job["company"], job["location"], job["description"], job["url"], job["posted_at"],  now_iso(), fingerprint(job), language, language_confidence, str(job.get("_linkedin_filter_id") or ""), str(job.get("_search_remote") or "")))
                         inserted = max(cursor.rowcount, 0)
                     found += inserted
                     if inserted:

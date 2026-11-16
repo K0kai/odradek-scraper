@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -291,11 +292,21 @@ class ScopeAndPlanTests(unittest.TestCase):
         self.assertEqual(app.split_apify_count(1, [main, sec], 70), [1, 1])
         self.assertEqual(app.split_apify_count(10, [main, sec], 99), [10, 1])  # fatia limitada a 95%; mínimo 1 para o secundário
 
+    @staticmethod
+    def batch_totals(planned):
+        """Soma o count das execuções de um mesmo lote (remoto + qualquer modelo) por filtro e lote."""
+        totals = {}
+        for actor, item, _ in planned:
+            key = (item["id"], re.sub(r", (remoto|qualquer modelo)\)", ")", actor["label"]))
+            totals[key] = totals.get(key, 0) + actor["count"]
+        return totals
+
     def test_plan_gives_each_filter_its_share_and_day_batches_come_first(self):
         main, sec = make_filter("main"), make_filter("secondary", ("IT Support",))
         planned = app.plan_apify_runs([self.ACTOR], main, sec, scope=self.scope(), main_share=70)
-        counts = {item["id"]: actor["count"] for actor, item, _ in planned}
-        self.assertEqual(counts, {main["id"]: 18, sec["id"]: 7})
+        totals = self.batch_totals(planned)
+        self.assertEqual({count for (fid, _), count in totals.items() if fid == main["id"]}, {18})
+        self.assertEqual({count for (fid, _), count in totals.items() if fid == sec["id"]}, {7})
         phases = ["24h" if "24h" in actor["label"] else "7d" for actor, _, _ in planned]
         self.assertEqual(phases, sorted(phases, key=lambda p: p != "24h"))
 
@@ -303,11 +314,33 @@ class ScopeAndPlanTests(unittest.TestCase):
         main, sec = make_filter("main"), make_filter("secondary", ("IT Support",), enabled=False)
         planned = app.plan_apify_runs([self.ACTOR], main, sec, scope=self.scope())
         self.assertEqual({item["id"] for _, item, _ in planned}, {main["id"]})
-        self.assertTrue(all(actor["count"] == 25 for actor, _, _ in planned))
+        self.assertEqual(set(self.batch_totals(planned).values()), {25})
 
     def test_secondary_alone_gets_the_whole_count(self):
         planned = app.plan_apify_runs([self.ACTOR], None, make_filter("secondary", ("IT Support",)), scope=self.scope())
-        self.assertTrue(planned and all(actor["count"] == 25 for actor, _, _ in planned))
+        self.assertTrue(planned and set(self.batch_totals(planned).values()) == {25})
+
+    def test_remote_and_any_model_urls_run_separately_and_share_the_batch_count(self):
+        planned = app.plan_apify_runs([self.ACTOR], make_filter("main"), None, scope=self.scope())
+        for actor, _, urls in planned:
+            self.assertTrue(all(("&f_WT=2" in url) == actor["_search_remote"] for url in urls))  # nunca mistura os dois
+        self.assertTrue(any(actor["_search_remote"] for actor, _, _ in planned))
+        self.assertTrue(any(not actor["_search_remote"] for actor, _, _ in planned))
+        self.assertEqual(set(self.batch_totals(planned).values()), {25})
+
+    def test_geo_rule_off_never_marks_a_run_as_remote(self):
+        planned = app.plan_apify_runs([self.ACTOR], make_filter("main"), None, scope=self.scope(geo_eligibility_enabled="0"))
+        self.assertTrue(planned and not any(actor["_search_remote"] for actor, _, _ in planned))
+        self.assertTrue(all(actor["count"] == 25 for actor, _, _ in planned))
+
+    def test_split_keeps_one_url_set_when_there_is_nothing_to_split(self):
+        remote = ["https://x?a=1&f_WT=2"]
+        self.assertEqual(app.split_urls_by_work_model(remote, 10), [(remote, 10, True)])
+        self.assertEqual(app.split_urls_by_work_model(["https://x?a=1"], 10), [(["https://x?a=1"], 10, False)])
+        mixed = app.split_urls_by_work_model(["u&f_WT=2", "u&f_WT=2", "v", "w"], 10)
+        self.assertEqual([(len(urls), count, flag) for urls, count, flag in mixed], [(2, 5, True), (2, 5, False)])
+        tiny = app.split_urls_by_work_model(["u&f_WT=2", "v"], 1)
+        self.assertEqual([count for _, count, _ in tiny], [1, 1])  # mínimo de 1 vaga por busca
 
     def test_no_filter_at_all_plans_no_linkedin_run(self):
         self.assertEqual(app.plan_apify_runs([self.ACTOR], None, None, scope=self.scope()), [])
@@ -494,6 +527,23 @@ class PreferredCountriesTests(unittest.TestCase):
         self.assertEqual(self.scope("Brasil, Portugal"),
                          [("Brasil", "2"), ("Portugal", "2"), ("Belo Horizonte", ""), ("Worldwide", "2")])
 
+    def test_country_city_is_searched_in_any_model_right_after_its_country(self):
+        self.assertEqual(self.scope("Portugal (Lisboa), Brazil (Belo Horizonte)"),
+                         [("Portugal", "2"), ("Lisboa", ""), ("Brazil", "2"), ("Belo Horizonte", ""), ("Worldwide", "2")])
+
+    def test_country_city_can_differ_from_the_home_city(self):
+        self.assertEqual(self.scope("Brazil (São Paulo)"),
+                         [("Brazil", "2"), ("São Paulo", ""), ("Worldwide", "2"), ("Belo Horizonte", "")])
+
+    def test_country_city_is_ignored_when_geo_eligibility_is_off(self):
+        cfg = {**self.CFG, "geo_eligibility_enabled": "0", "linkedin_preferred_countries": "Portugal (Lisboa)"}
+        self.assertEqual([s["location"] for s in app.linkedin_search_scope(cfg)], ["Portugal", "Worldwide", "Brazil"])
+
+    def test_city_in_parentheses_does_not_leak_into_the_country_names(self):
+        cfg = {"linkedin_preferred_countries": "Brazil (Belo Horizonte), Portugal"}
+        self.assertEqual(app.linkedin_preferred_countries(cfg), ["Brazil", "Portugal"])
+        self.assertEqual(app.linkedin_preferred_places(cfg), [("Brazil", "Belo Horizonte"), ("Portugal", "")])
+
     def test_list_is_trimmed_deduplicated_and_capped_at_five(self):
         cfg = {"linkedin_preferred_countries": " Brazil ; brazil\nPortugal, Spain, Canada, Germany, Italy, France "}
         self.assertEqual(app.linkedin_preferred_countries(cfg), ["Brazil", "Portugal", "Spain", "Canada", "Germany"])
@@ -535,7 +585,9 @@ class SearchSettingsValidationTests(unittest.TestCase):
     def test_preferred_countries_are_normalized_and_validated(self):
         self.assertEqual(self.validate(linkedin_preferred_countries=" Brazil ;Portugal\n")["linkedin_preferred_countries"], "Brazil, Portugal")
         self.assertEqual(self.validate(linkedin_preferred_countries="")["linkedin_preferred_countries"], "")
-        for bad in ("A, B, C, D, E, F", "Brazil 123", "<script>"):
+        self.assertEqual(self.validate(linkedin_preferred_countries="brazil( Belo Horizonte ) ; Portugal")["linkedin_preferred_countries"],
+                         "brazil (Belo Horizonte), Portugal")
+        for bad in ("A, B, C, D, E, F", "Brazil 123", "<script>", "Brazil (Belo 123)", "Brazil (Belo Horizonte"):
             with self.assertRaises(ValueError, msg=bad):
                 self.validate(linkedin_preferred_countries=bad)
 

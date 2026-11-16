@@ -382,6 +382,51 @@ _COUNTRY_ALIASES = {
 }
 
 
+_PLACE_RE = re.compile(r"^(.*?)\s*\(([^()]*)\)\s*$")
+
+
+def parse_preferred_countries(raw: object) -> list[tuple[str, str]]:
+    """'Brazil (Belo Horizonte), Portugal' -> [('Brazil', 'Belo Horizonte'), ('Portugal', '')].
+
+    Separadores: vírgula, ponto e vírgula ou linha. A cidade entre parênteses é opcional e diz onde buscar
+    (qualquer modelo) e aceitar vagas híbridas/presenciais naquele país. Sem repetir países.
+    """
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for part in re.split(r"[,;\n]+", str(raw or "")):
+        part = part.strip()
+        if not part:
+            continue
+        match = _PLACE_RE.match(part)
+        name, city = (match.group(1).strip(), match.group(2).strip()) if match else (part, "")
+        if not name or name.casefold() in seen:
+            continue
+        seen.add(name.casefold())
+        out.append((name[:40], city[:60]))
+    return out
+
+
+def accepted_cities(cfg: dict) -> list[str]:
+    """Cidades (normalizadas) onde vaga híbrida/presencial é aceita: a de residência e as escolhidas por país."""
+    cities = [normalize_text(cfg.get("candidate_city") or "")]
+    cities += [normalize_text(city) for _, city in parse_preferred_countries(cfg.get("linkedin_preferred_countries"))]
+    return [city for city in dict.fromkeys(cities) if city]
+
+
+def accepted_city_labels(cfg: dict) -> str:
+    """Os mesmos nomes de `accepted_cities`, como o usuário os escreveu (com acentos), para mensagens."""
+    names = [str(cfg.get("candidate_city") or "").strip()]
+    names += [city for _, city in parse_preferred_countries(cfg.get("linkedin_preferred_countries"))]
+    seen: set[str] = set()
+    labels = []
+    for name in names:
+        key = normalize_text(name)
+        if key and key not in seen:
+            seen.add(key)
+            labels.append(name)
+    return " / ".join(labels)
+
+
 def geo_enabled(cfg: dict) -> bool:
     """Elegibilidade geográfica opcional (padrão ligada). Desligada: modelo e país não bloqueiam."""
     return str(cfg.get("geo_eligibility_enabled", "1")).strip() != "0"
@@ -403,7 +448,7 @@ def geo_blocks(stated: dict, job: dict, cfg: dict, language: str = "") -> list[s
         return []
     from jobs.form_rules import infer_candidate_country
 
-    home_city = normalize_text(cfg.get("candidate_city") or "")
+    cities = accepted_cities(cfg)  # residência + cidades escolhidas por país
     home_country = _country_key(infer_candidate_country(cfg))
     job_country = _country_key(stated.get("job_country"))
     workplace, eligibility = stated.get("workplace", "unspecified"), stated.get("foreign_eligibility", "unstated")
@@ -420,21 +465,23 @@ def geo_blocks(stated: dict, job: dict, cfg: dict, language: str = "") -> list[s
     if foreign:
         # Só bloqueia o que a vaga afirma (presencial/híbrido citado, ou restrição citada acima).
         # Silêncio sobre estrangeiros ou sobre o modelo de trabalho não é recusa.
-        if workplace in ("onsite", "hybrid"):
+        if workplace in ("onsite", "hybrid") and not any(city in where for city in cities):
             return ["vaga no exterior não remota"]
         return []
     if workplace == "remote":
         return []
-    city = home_city.title() if home_city else ""
+    if workplace == "unspecified" and str(job.get("search_remote") or "") == "1":
+        return []  # o LinkedIn já filtrou esta vaga como remota; só um texto presencial/híbrido citado a bloquearia
+    city = accepted_city_labels(cfg)
     if workplace == "unspecified":
         job_city = normalize_text(stated.get("job_city") or "")
-        if job_city and home_city and home_city not in job_city:
+        if job_city and cities and not any(item in job_city for item in cities):
             return [f"vaga em {stated['job_city']} sem informar trabalho remoto (fora de {city})"]
         return []
     label = "presencial" if workplace == "onsite" else "híbrida"
-    if not home_city:
+    if not cities:
         return [f"vaga {label}: configure sua cidade no Perfil para avaliar"]
-    if home_city not in where:
+    if not any(item in where for item in cities):
         return [f"vaga {label} fora de {city}"]
     return []
 

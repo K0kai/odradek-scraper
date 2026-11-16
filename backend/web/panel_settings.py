@@ -12,6 +12,7 @@ from app import (
     save_settings, secret_get, secret_set, set_setting, settings,
 )
 from jobs.apply_channels import send_smtp_email
+from jobs.job_assessment import parse_preferred_countries
 from web.panel_log import log_event
 
 
@@ -158,12 +159,15 @@ def _validate_search_form(form: dict[str, str]) -> None:
     if "linkedin_max_age_days" in form and not (form["linkedin_max_age_days"].isdigit() and 1 <= int(form["linkedin_max_age_days"]) <= 30):
         raise ValueError("A idade máxima das vagas deve ficar entre 1 e 30 dias")
     if "linkedin_preferred_countries" in form:
-        names = [part.strip() for part in re.split(r"[,;\n]+", form["linkedin_preferred_countries"]) if part.strip()]
-        if len(names) > 5:
+        places = parse_preferred_countries(form["linkedin_preferred_countries"])
+        if len(places) > 5:
             raise ValueError("Informe no máximo 5 países com viés")
-        if any(len(name) > 40 or not re.fullmatch(r"[^\W\d_][^\W\d_ .'-]*(?: [^\W\d_][^\W\d_ .'-]*)*", name) for name in names):
-            raise ValueError("Países com viés: use só nomes de países separados por vírgula (ex.: Brazil, Portugal)")
-        form["linkedin_preferred_countries"] = ", ".join(names)
+        country_ok = r"[^\W\d_][^\W\d_ .'-]*(?: [^\W\d_][^\W\d_ .'-]*)*"
+        city_ok = r"[^\W\d_]+(?:[ .'-]+[^\W\d_]+)*"
+        if any(not re.fullmatch(country_ok, name) or (city and not re.fullmatch(city_ok, city)) for name, city in places):
+            raise ValueError("Países com viés: use nomes de países separados por vírgula, com a cidade opcional entre parênteses "
+                             "(ex.: Brazil (Belo Horizonte), Portugal)")
+        form["linkedin_preferred_countries"] = ", ".join(f"{name} ({city})" if city else name for name, city in places)
     if "geo_eligibility_enabled" in form:
         form["geo_eligibility_enabled"] = "1" if form["geo_eligibility_enabled"] == "1" else "0"
     if "linkedin_filter_prompt" in form and form["linkedin_filter_prompt"].strip() == DEFAULT_LINKEDIN_FILTER_PROMPT.strip():

@@ -147,6 +147,8 @@ NEW_COLUMNS = (
     ("ai_decisions", "provider", "TEXT NOT NULL DEFAULT ''"),
     ("ai_decisions", "model", "TEXT NOT NULL DEFAULT ''"),
     ("jobs", "search_filter_id", "TEXT NOT NULL DEFAULT ''"),
+    # '1' = a vaga veio de uma busca com o filtro "remoto" do LinkedIn (f_WT=2); vazio = origem não remota/desconhecida.
+    ("jobs", "search_remote", "TEXT NOT NULL DEFAULT ''"),
     ("jobs", "reviewed_at", "TEXT NOT NULL DEFAULT ''"),  # quando o usuário conferiu uma vaga descartada pela IA
 )
 
