@@ -118,6 +118,14 @@ class AssessmentTests(unittest.TestCase):
         self.assertEqual(req(result, "Q2")["status"], "met")
         self.assertEqual(result["assessment"]["dropped"]["matches_downgraded"], 0)
 
+    def test_short_skill_name_quote_is_verified_by_the_cited_skill(self):
+        # "C#" tem 2 caracteres: quote_in_text a recusa, mas o nome exato da skill citada basta.
+        index = {"S1": {"kind": "skill", "text": "C#", "quotes": ["C#"]}, "R1": {"kind": "role", "text": "Dev", "quotes": ["x"]}}
+        resume = NormalizedText.of("Experience with C# automation")
+        self.assertTrue(ja._quote_supported("C#", resume, ["S1"], index))
+        self.assertFalse(ja._quote_supported("C#", resume, ["R1"], index))  # só vale citando a própria skill
+        self.assertFalse(ja._quote_supported("Go", resume, ["S1"], index))
+
     def test_met_without_valid_evidence_id_becomes_unmet(self):
         raw = base_raw()
         raw["matches"][1] = match("Q2", "met", ("S99",), "APIs em Python e FastAPI")

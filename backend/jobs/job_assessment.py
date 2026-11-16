@@ -233,10 +233,19 @@ def _quote_variants(quote: str) -> list[str]:
     return variants
 
 
+def index_names_skill(norm_quote: str, evidence: list[str], index: dict) -> bool:
+    return any(index[e].get("kind") == "skill" and normalize_text(index[e]["text"]) == norm_quote for e in evidence)
+
+
 def _quote_supported(quote: str, resume_norm: NormalizedText, evidence: list[str], index: dict) -> bool:
     """Citação do currículo encontrada no texto do currículo/portfólio ou nas próprias evidências citadas."""
     if not quote:
         return False
+    # Nome curto de skill ("C#", "Go", "R") é rejeitado por quote_in_text (mínimo de 3 caracteres): vale quando é
+    # exatamente o nome de uma skill citada, que já existe no perfil verificado.
+    short = normalize_text(quote)
+    if short and index_names_skill(short, evidence, index):
+        return True
     blob = NormalizedText.of(" ".join(f"{index[e]['text']} {' '.join(index[e]['quotes'])}" for e in evidence))
     return any(quote_in_text(v, resume_norm) or quote_in_text(v, blob) for v in _quote_variants(quote))
 
