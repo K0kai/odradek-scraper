@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 from app import STATUSES, collector, connect, load_apify_quota_snapshot, queue, settings
+from integrations.ai_client import split_model_label
 from jobs.job_filters import _worth_match_expr, normalize_worth_sort, worth_date_bounds_utc, worth_order_sql
 from web.panel_log import list_logs
 from candidate.resume_pipeline import get_resume
@@ -250,12 +251,14 @@ def _queue_subject(kind: str, payload: dict, jobs: dict[int, dict]) -> dict | No
 def _queue_decision(decision: dict | None) -> dict | None:
     if not decision:
         return None
+    # Decisões antigas gravaram provedor "gemini" com modelo "tokenharbor/x": corrige só na exibição.
+    provider, model = split_model_label(str(decision.get("provider") or ""), str(decision.get("model") or ""))
     return {
         "score": decision.get("match_score"),
         "approved": bool(decision.get("should_apply")),
         "reason": str(decision.get("reason") or "")[:1000],
-        "model": str(decision.get("model") or ""),
-        "provider": str(decision.get("provider") or ""),
+        "model": model,
+        "provider": provider,
         "decided_at": decision.get("decided_at") or "",
     }
 

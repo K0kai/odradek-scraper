@@ -333,6 +333,11 @@ class FallbackTests(unittest.TestCase):
         self.assertNotIn("response_format", captured["body"])  # structured output não é documentado para os :free
         self.assertIn('"ok"', captured["body"]["messages"][0]["content"])  # schema vai no prompt
 
+    def test_fallback_label_is_split_into_its_own_provider_and_model(self):
+        self.assertEqual(ai_client.split_model_label("gemini", f"tokenharbor/{self.TH1}"), ("tokenharbor", self.TH1))
+        self.assertEqual(ai_client.split_model_label("gemini", "gemini-3.8-flash"), ("gemini", "gemini-3.8-flash"))
+        self.assertEqual(ai_client.split_model_label("openai", "tokenharbor/"), ("openai", "tokenharbor/"))
+
     def test_model_list_parsing_trims_and_dedupes(self):
         self.assertEqual(ai_client.parse_model_list(" a:free, b ,a:free,\n c,, "), ["a:free", "b", "c"])
 

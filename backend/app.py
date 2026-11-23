@@ -235,6 +235,7 @@ def ai_assess_job(job: dict, cfg: dict[str, str], *, track: str = "core", call_j
                   progress: ProgressFn = noop_progress) -> dict:
     """Triagem v2: requisitos × evidência verificada (ver jobs/job_assessment.py)."""
     from candidate.resume_profile import merged_profile
+    from integrations.ai_client import split_model_label
     from jobs.job_assessment import SCORING_VERSION, assess_job
 
     language = job.get("language", "unknown")
@@ -269,6 +270,7 @@ def ai_assess_job(job: dict, cfg: dict[str, str], *, track: str = "core", call_j
     model = getattr(call_json, "last_model", model)  # modelo que de fato respondeu (pode ser o fallback)
     if model != configured_model:
         progress(f"Modelo de fallback respondeu: {model} (configurado: {configured_model})")
+    provider, model = split_model_label(provider, model)  # "tokenharbor/x" → provedor tokenharbor, modelo x
     return {
         **result, "provider": provider, "model": model, "resume_language": resume_language,
         "scoring_version": SCORING_VERSION,
@@ -351,7 +353,7 @@ def process_auto_job(job_id: int, progress: ProgressFn = noop_progress) -> str:
     )
     progress(
         f"Decisão: {'APROVADA' if qualifies else 'DESCARTADA'} · score {decision['match_score']}/100 · "
-        f"trilha {decision['track']} · CV {resume_language} · modelo {decision['model']}"
+        f"trilha {decision['track']} · CV {resume_language} · modelo {decision['provider']}/{decision['model']}"
     )
     progress(f"Raciocínio da IA: {decision['reason']}")
     if not qualifies:

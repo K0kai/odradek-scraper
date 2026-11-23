@@ -71,6 +71,14 @@ def set_tokenharbor_source(source) -> None:
         _th_source, _th_cache = source, None
 
 
+def split_model_label(provider: str, label: str) -> tuple[str, str]:
+    """`on_model` devolve "tokenharbor/modelo" quando o último recurso respondeu; separa provedor e modelo."""
+    prefix, sep, rest = (label or "").partition("/")
+    if sep and prefix == TOKENHARBOR and rest:
+        return TOKENHARBOR, rest
+    return provider, label
+
+
 def parse_model_list(raw: str) -> list[str]:
     return list(dict.fromkeys(item.strip() for item in (raw or "").replace("\n", ",").split(",") if item.strip()))
 
