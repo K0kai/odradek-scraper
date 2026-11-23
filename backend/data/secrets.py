@@ -6,6 +6,7 @@ from typing import Callable
 SECRET_ENV_VARS = {
     "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
     "openai": ("OPENAI_API_KEY",),
+    "tokenharbor": ("TOKENHARBOR_API_KEY",),
     "adzuna_app_id": ("ADZUNA_APP_ID",),
     "adzuna_app_key": ("ADZUNA_APP_KEY",),
     "apify_token": ("APIFY_TOKEN", "APIFY_API_TOKEN"),

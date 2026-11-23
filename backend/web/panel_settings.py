@@ -6,11 +6,12 @@ from urllib.parse import urlparse
 
 from app import (
     DEFAULT_JOB_SELECTION_PROMPT, DEFAULT_LINKEDIN_FILTER_PROMPT, DEFAULT_TRANSFERABLE_PROMPT,
-    FILTER_SLOT_KEY, _validate_filter_form, ai_generate_main_filter, ai_generate_secondary_filter,
+    FILTER_SLOT_KEY, _install_tokenharbor_fallback, _validate_filter_form, ai_generate_main_filter, ai_generate_secondary_filter,
     effective_linkedin_filter_prompt, effective_transferable_prompt,
     job_selection_optimism_instruction, linkedin_search_scope, load_apify_actors,
     save_settings, secret_get, secret_set, set_setting, settings,
 )
+from integrations.ai_client import parse_model_list
 from jobs.apply_channels import send_smtp_email
 from jobs.job_assessment import parse_preferred_countries
 from web.panel_log import log_event
@@ -49,7 +50,7 @@ SETTINGS_API_GROUPS = {
                 "salary_expectation_usd", "salary_currency_preference", "salary_pj_multiplier",
                 "candidate_contract_type", "candidate_gender", "candidate_race", "candidate_lgbtq",
                 "candidate_pcd", "candidate_diversity_note", "portfolio_profile_url"),
-    "ai": ("ai_provider", "ai_model", "candidate_facts_pt", "candidate_facts_en",
+    "ai": ("ai_provider", "ai_model", "tokenharbor_fallback_models", "candidate_facts_pt", "candidate_facts_en",
            "job_selection_optimism", "job_selection_prompt"),
     "automation": ("auto_apply", "minimum_match_score", "queue_max_workers", "queue_max_attempts",
                    "queue_ttl_hours", "transferable_minimum_score"),
@@ -70,6 +71,7 @@ def settings_api_payload(group: str) -> dict:
     # Somente leitura: informa se o segredo existe, nunca o valor.
     if group == "ai":
         values["api_key_set"] = _secret_is_set(cfg.get("ai_provider") or "gemini")
+        values["tokenharbor_api_key_set"] = _secret_is_set("tokenharbor")
         for key in ("adzuna_app_id", "adzuna_app_key", "apify_token"):
             values[f"{key}_set"] = _secret_is_set(key)
     elif group == "smtp":
@@ -95,7 +97,7 @@ def save_settings_api_group(group: str, incoming: dict) -> str:
             if not isinstance(value, str) or len(value) > 30000:
                 raise ValueError(f"Valor inválido para {key}")
             form[key] = value
-    for key in ("api_key", "adzuna_app_id", "adzuna_app_key", "apify_token", "smtp_password"):
+    for key in ("api_key", "tokenharbor_api_key", "adzuna_app_id", "adzuna_app_key", "apify_token", "smtp_password"):
         if key in incoming and (not isinstance(incoming[key], str) or len(incoming[key]) > 8192):
             raise ValueError(f"Valor inválido para {key}")
     if group == "search":
@@ -105,6 +107,11 @@ def save_settings_api_group(group: str, incoming: dict) -> str:
     if group == "ai":
         if "ai_provider" in form and form["ai_provider"] not in {"gemini", "openai"}:
             raise ValueError("Provedor de IA inválido")
+        if "tokenharbor_fallback_models" in form:
+            models = parse_model_list(form["tokenharbor_fallback_models"])
+            if len(models) > 6 or any(len(name) > 100 or not re.fullmatch(r"[\w.:/\-]+", name) for name in models):
+                raise ValueError("Modelos do TokenHarbor: use até 6 IDs separados por vírgula (ex.: deepseek-v4.1-flash:free)")
+            form["tokenharbor_fallback_models"] = ", ".join(models)
         if "job_selection_optimism" in form:
             form["job_selection_optimism"] = str(job_selection_optimism_instruction(form["job_selection_optimism"])[0])
         if "job_selection_prompt" in form and form["job_selection_prompt"].strip() == DEFAULT_JOB_SELECTION_PROMPT.strip():
@@ -113,6 +120,9 @@ def save_settings_api_group(group: str, incoming: dict) -> str:
         provider = form.get("ai_provider") or settings().get("ai_provider") or "gemini"
         if incoming.get("api_key"):
             secret_set(provider, str(incoming["api_key"]))
+        if incoming.get("tokenharbor_api_key"):
+            secret_set("tokenharbor", str(incoming["tokenharbor_api_key"]))
+        _install_tokenharbor_fallback()  # zera o cache de 30s: chave/lista novas valem na próxima chamada
         for key in ("adzuna_app_id", "adzuna_app_key", "apify_token"):
             if incoming.get(key):
                 secret_set(key, str(incoming[key]))

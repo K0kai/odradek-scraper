@@ -52,6 +52,48 @@ def fallback_models() -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+# Último recurso: modelos gratuitos do TokenHarbor (OpenAI-compatível), tentados só depois que todos os do provedor
+# principal falharam. Só ativo com chave salva. Prompts de rota gratuita podem ser retidos e usados pelos provedores
+# dos modelos (política de privacidade do TokenHarbor), por isso o uso é opt-in pela chave.
+TOKENHARBOR = "tokenharbor"
+TOKENHARBOR_ENDPOINT = "https://tokenharbor.ai/v1/chat/completions"
+DEFAULT_TOKENHARBOR_MODELS = ("deepseek-v4.1-flash:free", "mimo-v2.6-flash:free")
+_TH_CACHE_SECONDS = 30.0
+_th_source = None  # callable -> (api_key, [modelos]); definido pelo app para ler painel/cofre
+_th_cache: tuple[float, tuple[str, list[str]]] | None = None
+_th_lock = threading.Lock()
+
+
+def set_tokenharbor_source(source) -> None:
+    """Registra de onde vêm a chave e a lista de modelos (o app liga ao cofre/configurações)."""
+    global _th_source, _th_cache
+    with _th_lock:
+        _th_source, _th_cache = source, None
+
+
+def parse_model_list(raw: str) -> list[str]:
+    return list(dict.fromkeys(item.strip() for item in (raw or "").replace("\n", ",").split(",") if item.strip()))
+
+
+def tokenharbor_config() -> tuple[str, list[str]]:
+    """(chave, modelos); chave vazia ou lista vazia = fallback desligado. Nunca levanta."""
+    global _th_cache
+    with _th_lock:
+        source, cached = _th_source, _th_cache
+    if source is None:
+        return "", []
+    if cached and cached[0] > time.monotonic():
+        return cached[1]
+    try:
+        key, models = source()
+        value = ((key or "").strip(), list(models or []))
+    except Exception:
+        value = ("", [])
+    with _th_lock:
+        _th_cache = (time.monotonic() + _TH_CACHE_SECONDS, value)
+    return value
+
+
 def _cooling_down(provider: str, model: str) -> bool:
     with _cooldown_lock:
         return _cooldown_until.get((provider, model), 0.0) > time.monotonic()
@@ -119,32 +161,60 @@ def _failure_label(exc: BaseException) -> str:
 
 
 def _walk_chain(provider: str, model: str, call, on_model=None):
-    """Uma passada pela cadeia de modelos; se todos falharem, levanta o erro final com `.chain_transient`."""
-    chain = model_chain(provider, model)
+    """Uma passada pela cadeia de modelos; se todos falharem, levanta o erro final com `.chain_transient`.
+
+    `call(provedor, modelo)` executa uma tentativa. A cadeia do provedor principal vem primeiro; os modelos
+    gratuitos do TokenHarbor (se configurados) só entram depois que todos eles falharam.
+    """
+    primary = provider.casefold().strip()
+    chain = [(primary, name) for name in model_chain(provider, model)]
+    extras_loaded = primary == TOKENHARBOR
     failures: list[tuple[str, BaseException]] = []
-    for index, candidate in enumerate(chain):
+    weighed: list[BaseException] = []
+    index = 0
+    while index < len(chain):
+        prov, candidate = chain[index]
+        label = candidate if prov == primary else f"{prov}/{candidate}"
         try:
-            result = call(candidate)
+            result = call(prov, candidate)
         except RuntimeError as exc:  # inclui AiUnavailableError/AiResponseError e o 404 de modelo aposentado
-            if not _should_fall_back(exc):
+            # Falha do último recurso (chave/permissão do TokenHarbor) não mascara o erro do provedor principal.
+            if prov == primary and not _should_fall_back(exc):
                 raise
-            failures.append((candidate, exc))
+            failures.append((label, exc))
+            # Uma chave/modelo do TokenHarbor quebrados não podem impedir as rodadas de backoff do principal.
+            if prov == primary or _is_transient(exc) or getattr(exc, "http_status", None) == RATE_LIMIT_STATUS:
+                weighed.append(exc)
             if not isinstance(exc, AiResponseError):
                 gone = getattr(exc, "http_status", None) == GONE_STATUS
-                _start_cooldown(provider.casefold().strip(), candidate, GONE_COOLDOWN_SECONDS if gone else COOLDOWN_SECONDS)
-            if index == len(chain) - 1:
-                summary = "; ".join(f"{name}: {_failure_label(err)}" for name, err in failures)
-                final = AiUnavailableError(f"IA indisponível: nenhum modelo respondeu ({summary}).")
-                final.http_status = getattr(exc, "http_status", None)  # type: ignore[attr-defined]
-                if isinstance(exc, AiResponseError):
-                    final = AiResponseError(str(final))
-                final.chain_transient = _worth_another_round([err for _, err in failures])  # type: ignore[attr-defined]
-                raise final from exc
-            continue
+                _start_cooldown(prov, candidate, GONE_COOLDOWN_SECONDS if gone else COOLDOWN_SECONDS)
+            index += 1
+            if index == len(chain) and not extras_loaded:
+                extras_loaded = True
+                key, models = tokenharbor_config()
+                if key:
+                    ordered = [m for m in models if not _cooling_down(TOKENHARBOR, m)] + [m for m in models if _cooling_down(TOKENHARBOR, m)]
+                    chain.extend((TOKENHARBOR, name) for name in ordered)
+            if index < len(chain):
+                continue
+            summary = "; ".join(f"{name}: {_failure_label(err)}" for name, err in failures)
+            final = AiUnavailableError(f"IA indisponível: nenhum modelo respondeu ({summary}).")
+            final.http_status = getattr(exc, "http_status", None)  # type: ignore[attr-defined]
+            if isinstance(exc, AiResponseError):
+                final = AiResponseError(str(final))
+            final.chain_transient = _worth_another_round(weighed)  # type: ignore[attr-defined]
+            raise final from exc
         if on_model is not None:
-            on_model(candidate)
+            on_model(label)
         return result
     raise AiUnavailableError("IA indisponível: nenhum modelo respondeu.")  # cadeia vazia: não ocorre
+
+
+def _credentials(call_provider: str, primary_provider: str, api_key: str) -> str:
+    """Chave da tentativa: a do provedor principal, ou a do TokenHarbor nos modelos de último recurso."""
+    if call_provider == primary_provider.casefold().strip():
+        return api_key
+    return tokenharbor_config()[0]
 
 
 def _with_fallback(provider: str, model: str, call, on_model=None):
@@ -249,6 +319,21 @@ def _request(
             endpoint = "https://api.openai.com/v1/responses"
             payload = json.dumps(body).encode("utf-8")
             headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        elif provider == TOKENHARBOR:
+            # Chat Completions puro: structured output não é documentado para os modelos gratuitos, então o schema
+            # vai no prompt e a resposta passa pelo parser tolerante (cercas ```json, texto extra).
+            content = prompt
+            if schema is not None:
+                content += (
+                    "\n\nRespond ONLY with one valid JSON object (no markdown, no commentary) that follows this JSON Schema:\n"
+                    + json.dumps(schema, ensure_ascii=False)
+                )
+            body = {"model": model, "messages": [{"role": "user", "content": content}], "max_tokens": max_output_tokens}
+            if temperature is not None:
+                body["temperature"] = temperature
+            endpoint = TOKENHARBOR_ENDPOINT
+            payload = json.dumps(body).encode("utf-8")
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         elif provider == "gemini":
             config: dict = {"maxOutputTokens": max_output_tokens}
             if temperature is not None:
@@ -297,9 +382,16 @@ def _request(
             raise AiUnavailableError(f"IA indisponível: {exc}") from exc
         raise
 
-    _record(provider, model, result if isinstance(result, dict) else None, ok=True, quota_error=False)
+    # O contador de uso entende o formato Gemini/OpenAI; as respostas do TokenHarbor só contam como chamada.
+    _record(provider, model, result if isinstance(result, dict) and provider != TOKENHARBOR else None, ok=True, quota_error=False)
     result = result if isinstance(result, dict) else {}
-    if provider == "openai":
+    if provider == TOKENHARBOR:
+        choices = result.get("choices") or [{}]
+        message = (choices[0].get("message") or {}) if isinstance(choices[0], dict) else {}
+        content = message.get("content")
+        text = (content if isinstance(content, str) else "").strip()
+        truncated = isinstance(choices[0], dict) and choices[0].get("finish_reason") == "length"
+    elif provider == "openai":
         text = "\n".join(
             part.get("text", "")
             for item in result.get("output", [])
@@ -332,10 +424,10 @@ def call_ai_text(
     on_model=None,
 ) -> str:
     """Chama o provedor configurado e devolve o texto puro da resposta (com fallback de modelo)."""
-    return _with_fallback(provider, model, lambda m: _request(
-        prompt=prompt, provider=provider, model=m, api_key=api_key,
+    return _with_fallback(provider, model, lambda prov, m: _request(
+        prompt=prompt, provider=prov, model=m, api_key=_credentials(prov, provider, api_key),
         max_output_tokens=max_output_tokens,
-        temperature=temperature if provider.casefold().strip() == "gemini" else None,
+        temperature=temperature if prov in ("gemini", TOKENHARBOR) else None,
         timeout=timeout,
     ).text, on_model)
 
@@ -365,8 +457,8 @@ def call_ai_json(
     on_model=None,
 ) -> dict:
     """call_ai_json com fallback de modelo gratuito; `on_model(nome)` recebe o modelo que respondeu."""
-    return _with_fallback(provider, model, lambda m: _call_ai_json_once(
-        prompt=prompt, schema=schema, provider=provider, model=m, api_key=api_key,
+    return _with_fallback(provider, model, lambda prov, m: _call_ai_json_once(
+        prompt=prompt, schema=schema, provider=prov, model=m, api_key=_credentials(prov, provider, api_key),
         max_output_tokens=max_output_tokens, temperature=temperature, thinking_budget=thinking_budget, timeout=timeout,
     ), on_model)
 

@@ -1,4 +1,5 @@
 """Offline: fallback de modelo gratuito quando o modelo principal está sobrecarregado ou sem quota."""
+import json
 import os
 import unittest
 from unittest.mock import patch
@@ -34,6 +35,8 @@ class FakeRequest:
 class FallbackTests(unittest.TestCase):
     def setUp(self):
         ai_client._cooldown_until.clear()
+        ai_client.set_tokenharbor_source(None)  # o app pode ter registrado a fonte real ao ser importado
+        self.addCleanup(ai_client.set_tokenharbor_source, None)
         env = patch.dict(os.environ)
         env.start()
         self.addCleanup(env.stop)
@@ -253,6 +256,85 @@ class FallbackTests(unittest.TestCase):
             ai_client.call_ai_json(prompt="x", schema=SCHEMA, provider="gemini", model=PRIMARY, api_key="k")
         from jobs.job_queue import is_retryable_error
         self.assertTrue(is_retryable_error(ctx.exception))
+
+    # --- TokenHarbor: último recurso gratuito, só depois de toda a cadeia do provedor principal ---
+
+    TH1, TH2 = "deepseek-v4.1-flash:free", "mimo-v2.6-flash:free"
+
+    def with_tokenharbor(self, key="thk_live_x", models=None):
+        ai_client.set_tokenharbor_source(lambda: (key, [self.TH1, self.TH2] if models is None else models))
+        self.addCleanup(ai_client.set_tokenharbor_source, None)
+
+    def test_tokenharbor_is_only_tried_after_every_primary_model_failed(self):
+        self.with_tokenharbor()
+        plan = {PRIMARY: http_error(503), F1: http_error(503), F2: http_error(503), self.TH1: '{"ok": true}'}
+        result, calls, used = self.call(plan)
+        self.assertEqual((result, calls), ({"ok": True}, [PRIMARY, F1, F2, self.TH1]))
+        self.assertEqual(used, [f"tokenharbor/{self.TH1}"])  # o rótulo deixa claro qual provedor respondeu
+
+    def test_primary_success_never_touches_tokenharbor(self):
+        self.with_tokenharbor()
+        _, calls, used = self.call({PRIMARY: '{"ok": true}'})
+        self.assertEqual((calls, used), ([PRIMARY], [PRIMARY]))
+
+    def test_tokenharbor_is_off_without_key_or_without_models(self):
+        for key, models in (("", None), ("thk_live_x", [])):
+            ai_client._cooldown_until.clear()
+            self.with_tokenharbor(key, models)
+            plan = {PRIMARY: http_error(503), F1: http_error(503), F2: http_error(503)}
+            fake = FakeRequest(plan)
+            with patch.object(ai_client, "_request", fake), self.assertRaises(AiUnavailableError):
+                ai_client.call_ai_json(prompt="x", schema=SCHEMA, provider="gemini", model=PRIMARY, api_key="k")
+            self.assertNotIn(self.TH1, fake.calls)
+
+    def test_tokenharbor_gets_its_own_key_and_provider(self):
+        self.with_tokenharbor("thk_live_secret")
+        seen = []
+
+        def request(**kwargs):
+            seen.append((kwargs["provider"], kwargs["model"], kwargs["api_key"]))
+            if kwargs["provider"] == "gemini":
+                raise http_error(503)
+            return ai_client._Reply('{"ok": true}', False)
+
+        with patch.object(ai_client, "_request", request):
+            ai_client.call_ai_json(prompt="x", schema=SCHEMA, provider="gemini", model=PRIMARY, api_key="gemini-key")
+        self.assertEqual(seen[-1], ("tokenharbor", self.TH1, "thk_live_secret"))
+        self.assertTrue(all(key == "gemini-key" for prov, _, key in seen if prov == "gemini"))  # a chave Gemini não vaza
+
+    def test_broken_tokenharbor_key_does_not_mask_the_primary_failure_or_skip_the_backoff_rounds(self):
+        self.with_tokenharbor()
+        plan = {PRIMARY: http_error(503), F1: http_error(503), F2: http_error(503),
+                self.TH1: http_error(401), self.TH2: http_error(401)}
+        fake = FakeRequest(plan)
+        with patch.object(ai_client, "_request", fake), self.assertRaises(AiUnavailableError) as ctx:
+            ai_client.call_ai_json(prompt="x", schema=SCHEMA, provider="gemini", model=PRIMARY, api_key="k")
+        self.assertIn(f"tokenharbor/{self.TH1}: HTTP 401", str(ctx.exception))
+        self.assertEqual(len(self.pauses), len(ai_client.TRANSIENT_RETRY_DELAYS))  # 401 do TokenHarbor não cancela o retry
+
+    def test_tokenharbor_request_is_plain_chat_completions_with_the_schema_in_the_prompt(self):
+        captured = {}
+
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *exc): return False
+            def read(self): return b'{"choices":[{"message":{"content":"```json\\n{\\"ok\\": true}\\n```"},"finish_reason":"stop"}]}'
+
+        def fake_urlopen(request, timeout):
+            captured["url"], captured["auth"] = request.full_url, request.get_header("Authorization")
+            captured["body"] = json.loads(request.data)
+            return Response()
+
+        with patch.object(ai_client, "urlopen", fake_urlopen):
+            result = ai_client.call_ai_json(prompt="oi", schema=SCHEMA, provider="tokenharbor", model=self.TH1, api_key="thk_live_x")
+        self.assertEqual(result, {"ok": True})  # cerca ```json é tolerada
+        self.assertEqual(captured["url"], "https://tokenharbor.ai/v1/chat/completions")
+        self.assertEqual(captured["auth"], "Bearer thk_live_x")
+        self.assertNotIn("response_format", captured["body"])  # structured output não é documentado para os :free
+        self.assertIn('"ok"', captured["body"]["messages"][0]["content"])  # schema vai no prompt
+
+    def test_model_list_parsing_trims_and_dedupes(self):
+        self.assertEqual(ai_client.parse_model_list(" a:free, b ,a:free,\n c,, "), ["a:free", "b", "c"])
 
 
 if __name__ == "__main__":

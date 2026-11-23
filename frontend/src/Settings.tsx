@@ -176,6 +176,13 @@ const tabs: Tab[] = [
         ],
       },
       {
+        title: 'TokenHarbor (fallback gratuito)', description: 'Último recurso: só é usado quando todos os modelos do provedor acima falharam (503/429). Sem a chave, fica desligado. Atenção: nas rotas gratuitas o TokenHarbor pode reter os prompts, e os provedores dos modelos podem usá-los para treino. Currículo e dados da vaga vão nesses prompts.',
+        fields: [
+          { key: 'tokenharbor_api_key', group: 'ai', label: 'Chave do TokenHarbor', kind: 'password', secret: 'tokenharbor_api_key_set', wide: true, hint: 'Formato thk_live_…. Ative os modelos gratuitos no painel do TokenHarbor.' },
+          { key: 'tokenharbor_fallback_models', group: 'ai', label: 'Modelos gratuitos (em ordem)', wide: true, hint: 'IDs com sufixo :free separados por vírgula. Limite gratuito: 60 requisições por minuto.' },
+        ],
+      },
+      {
         title: 'Apify e Adzuna', description: 'Credenciais das fontes de vagas. Só preencha as que você usa.',
         fields: [
           { key: 'apify_token', group: 'ai', label: 'Apify token', kind: 'password', secret: 'apify_token_set', wide: true },

@@ -64,6 +64,8 @@ DEFAULT_SETTINGS = {
     "sources": "remotive,remoteok",
     "ai_provider": "gemini",
     "ai_model": "gemini-3.5-flash-lite",
+    # Último recurso quando todos os modelos do provedor falham; só vale com a chave do TokenHarbor salva.
+    "tokenharbor_fallback_models": "deepseek-v4.1-flash:free,mimo-v2.6-flash:free",
     "candidate_name": "",
     "candidate_email": "",
     "candidate_phone": "",

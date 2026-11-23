@@ -141,6 +141,22 @@ secret_set = _secrets.set
 get_ai_key = _secrets.get
 
 
+def _tokenharbor_source() -> tuple[str, list[str]]:
+    """Chave (cofre) e modelos gratuitos (painel) do último recurso; sem chave o fallback fica desligado."""
+    from integrations.ai_client import parse_model_list
+
+    return get_ai_key("tokenharbor"), parse_model_list(settings().get("tokenharbor_fallback_models", ""))
+
+
+def _install_tokenharbor_fallback() -> None:
+    from integrations.ai_client import set_tokenharbor_source
+
+    set_tokenharbor_source(_tokenharbor_source)
+
+
+_install_tokenharbor_fallback()
+
+
 def create_cover_letter(job_id: int, resume_language: str | None = None, bridges: list[str] | None = None) -> int:
     cfg = settings()
     with connect() as db:
