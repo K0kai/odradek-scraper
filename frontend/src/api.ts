@@ -109,6 +109,20 @@ export type BulkIgnoreFilters = {
   all: boolean
 }
 
+export type QueueSubject =
+  | { type: 'job'; job_id: number; title: string; company: string; location: string; url: string; job_status: string; missing: boolean }
+  | { type: 'resume'; language: string }
+  | { type: 'worth'; scheduled_date: string }
+
+export type QueueDecision = {
+  score: number | null
+  approved: boolean
+  reason: string
+  model: string
+  provider: string
+  decided_at: string
+}
+
 export type QueueItem = {
   id: number
   kind: string
@@ -121,6 +135,8 @@ export type QueueItem = {
   last_step: string
   progress: string
   outcome: string
+  subject: QueueSubject | null
+  decision: QueueDecision | null
 }
 
 export type QueueData = { counts: Record<string, number>; items: QueueItem[] }
@@ -230,6 +246,7 @@ export const api = {
   notes: (id: number, notes: string) => request<{ notice: string }>(`/api/jobs/${id}/notes`, { method: 'POST', body: JSON.stringify({ notes }) }),
   queue: () => request<QueueData>('/api/queue'),
   logs: () => request<{ items: LogItem[] }>('/api/logs'),
+  queueAssessment: (id: number) => request<{ assessment: Assessment | null }>(`/api/queue/${id}/assessment`),
   queueItem: (id: number, action: 'cancel' | 'retry') => request<{ notice: string }>(`/api/queue/${id}/${action}`, { method: 'POST' }),
   queueAction: (action: 'retry-all' | 'evaluate-new' | 'clear') => request<{ notice: string }>(`/api/queue/${action}`, { method: 'POST' }),
   clearLogs: () => request<{ notice: string }>('/api/logs/clear', { method: 'POST' }),

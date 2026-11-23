@@ -25,6 +25,7 @@ from jobs.job_queue import (
     KIND_WORTH_REVERIFY,
     JobQueue,
 )
+from jobs.queue_progress import ProgressFn, make_progress_fn, noop_progress
 from candidate.resume_pipeline import (
     AiUnavailableError,
     get_resume,
@@ -214,7 +215,8 @@ def _assessment_caller(provider: str, model: str, api_key: str):
     return call
 
 
-def ai_assess_job(job: dict, cfg: dict[str, str], *, track: str = "core", call_json=None) -> dict:
+def ai_assess_job(job: dict, cfg: dict[str, str], *, track: str = "core", call_json=None,
+                  progress: ProgressFn = noop_progress) -> dict:
     """Triagem v2: requisitos × evidência verificada (ver jobs/job_assessment.py)."""
     from candidate.resume_profile import merged_profile
     from jobs.job_assessment import SCORING_VERSION, assess_job
@@ -239,14 +241,18 @@ def ai_assess_job(job: dict, cfg: dict[str, str], *, track: str = "core", call_j
         if not api_key:
             raise AiUnavailableError("Configure a chave da API de IA para ativar o julgamento automático.")
         call_json = _assessment_caller(provider, model, api_key)
+    progress(f"Avaliando com {provider}/{model}, trilha {track}, idioma da vaga {language}")
     result = assess_job(
         job, cfg, profile=profile, resume_norm=resume_norm, call_json=call_json, language=language,
-        preferences=effective_job_selection_prompt(cfg), track=track,
+        preferences=effective_job_selection_prompt(cfg), track=track, progress=progress,
     )
     # O currículo é escolhido pelo idioma da vaga (não pelo LLM); cai para o outro se ausente.
     other = "en" if language == "pt" else "pt"
     resume_language = language if language in analyzed else other
+    configured_model = model
     model = getattr(call_json, "last_model", model)  # modelo que de fato respondeu (pode ser o fallback)
+    if model != configured_model:
+        progress(f"Modelo de fallback respondeu: {model} (configurado: {configured_model})")
     return {
         **result, "provider": provider, "model": model, "resume_language": resume_language,
         "scoring_version": SCORING_VERSION,
@@ -278,32 +284,37 @@ def mark_worth_looking(job_id: int, *, score: int, reason: str, detail: str) -> 
     log_event("info", "worth", f"Vaga #{job_id} enviada para 'Vale a pena olhar' — {detail}")
 
 
-def process_auto_job(job_id: int) -> str:
+def process_auto_job(job_id: int, progress: ProgressFn = noop_progress) -> str:
 
     """Triagem com análise do currículo; candidatura automática fica limitada a e-mail."""
     cfg = settings()
     with connect() as db:
         job_row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
     if not job_row:
+        progress(f"Vaga #{job_id} não existe mais; nada a fazer")
         return "vaga removida"
     job = dict(job_row)
     title = job.get("title", "")
+    progress(f"Vaga #{job_id}: {title} — {job.get('company') or 'empresa n/d'} ({job.get('location') or 'local n/d'})")
     log_event("info", "auto-apply", f"Triagem da vaga #{job_id}: {title}")
     excluded = excluded_region_reason(job)
     if excluded:  # sem chamar a IA: vagas da Índia já coletadas antes do filtro também saem da fila
         with connect() as db:
             db.execute("UPDATE jobs SET status='ignored', notes=? WHERE id=?", (f"Região excluída: {excluded}.", job_id))
         log_event("info", "auto-apply", f"Vaga #{job_id} ignorada sem triagem: {excluded}.")
+        progress(f"Ignorada sem chamar a IA — região excluída: {excluded}")
         return f"vaga {job_id}: região excluída"
     try:
-        decision = ai_assess_job(job, cfg, track=job_track(job, cfg))
-    except AiUnavailableError:
+        decision = ai_assess_job(job, cfg, track=job_track(job, cfg), progress=progress)
+    except AiUnavailableError as exc:
         # Propagates to the job queue for retry/backoff.
+        progress(f"IA indisponível: {exc}")
         raise
     except ValueError as exc:
         with connect() as db:
             db.execute("UPDATE jobs SET status='blocked', notes=? WHERE id=?", (str(exc), job_id))
         log_event("warning", "auto-apply", f"Vaga #{job_id}: {exc}")
+        progress(f"Bloqueada antes da IA: {exc}")
         return f"vaga {job_id}: {exc}"
 
     # A aprovação já aplica o mínimo da trilha (core/transferível), bloqueios e revisão cética.
@@ -322,10 +333,16 @@ def process_auto_job(job_id: int) -> str:
         "auto-apply",
         f"Vaga #{job_id}: score {decision['match_score']}/100, aprovada={qualifies}, trilha={decision['track']}, CV={resume_language}. {decision['reason']}",
     )
+    progress(
+        f"Decisão: {'APROVADA' if qualifies else 'DESCARTADA'} · score {decision['match_score']}/100 · "
+        f"trilha {decision['track']} · CV {resume_language} · modelo {decision['model']}"
+    )
+    progress(f"Raciocínio da IA: {decision['reason']}")
     if not qualifies:
         with connect() as db:
             db.execute("UPDATE jobs SET status='ignored', notes=? WHERE id=?", (f"IA: score {decision['match_score']}/100. {decision['reason']}", job_id))
         log_event("info", "auto-apply", f"Vaga #{job_id} ignorada (bloqueio, cobertura ou score abaixo do mínimo).")
+        progress("Vaga movida para descartadas (bloqueio, cobertura ou score abaixo do mínimo)")
         return f"IA descartou vaga {job_id} ({decision['match_score']}/100)"
 
     with connect() as db:
@@ -333,15 +350,19 @@ def process_auto_job(job_id: int) -> str:
     if not resume or not (resume["analysis_summary"] or "").strip():
         with connect() as db:
             db.execute("UPDATE jobs SET status='blocked', notes=? WHERE id=?", (f"Sem currículo analisado em {resume_language}.", job_id))
+        progress(f"Bloqueada: currículo {resume_language} sem análise")
         return f"vaga {job_id}: currículo {resume_language} ausente"
 
+    progress(f"Gerando carta de apresentação ({resume_language})")
     try:
         cover_id = create_cover_letter(job_id, resume_language=resume_language, bridges=decision.get("bridges"))
-    except AiUnavailableError:
+    except AiUnavailableError as exc:
+        progress(f"IA indisponível ao gerar a carta: {exc}")
         raise
     except Exception as exc:
         with connect() as db:
             db.execute("UPDATE jobs SET status='blocked', notes=? WHERE id=?", (f"Falha ao gerar carta: {exc}", job_id))
+        progress(f"Falha ao gerar a carta: {exc}")
         return f"vaga {job_id}: falha na carta"
 
     with connect() as db:
@@ -349,9 +370,11 @@ def process_auto_job(job_id: int) -> str:
     cover_body = letter_row["body"] if letter_row else ""
     stamp = now_iso()
     score = int(decision["match_score"])
+    progress("Carta de apresentação pronta")
 
     # Candidaturas via página web ficam para o usuário no Chrome com a extensão.
     if is_linkedin_job(job):
+        progress("Vaga do LinkedIn: movida para 'Vale a pena olhar' (candidatura manual pela extensão)")
         mark_worth_looking(
             job_id,
             score=score,
@@ -376,6 +399,7 @@ def process_auto_job(job_id: int) -> str:
     )
     channel = "email"
     if not ok:
+        progress(f"Envio por e-mail indisponível, movida para 'Vale a pena olhar': {detail}")
         record_blocked(connect, job_id, detail, now_iso(), int(resume["id"]), cover_id)
         mark_worth_looking(
             job_id,
@@ -391,6 +415,7 @@ def process_auto_job(job_id: int) -> str:
             (channel, detail[:500], job_id),
         )
     log_event("success", "auto-apply", f"Vaga #{job_id} aplicada via {channel}: {detail}")
+    progress(f"Candidatura enviada via {channel}: {detail}")
     return f"vaga {job_id}: aplicada via {channel} — {detail}"
 
 
@@ -459,7 +484,7 @@ def handle_job_apply_job(payload: dict) -> str:
     job_id = int(payload.get("job_id") or 0)
     if not job_id:
         raise ValueError("job_id ausente no payload da fila.")
-    return process_auto_job(job_id)
+    return process_auto_job(job_id, progress=make_progress_fn(queue, payload.get("_queue_job_id")))
 
 
 def handle_worth_reverify_job(payload: dict) -> str:

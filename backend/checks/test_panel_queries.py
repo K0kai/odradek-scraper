@@ -32,6 +32,35 @@ class PanelQueryTests(AppDbCase):
         self.assertFalse(a["low_precision"])
         self.assertEqual((metrics["li-b"]["collected"], metrics["li-b"]["last_7d"], metrics["li-b"]["last_30d"]), (1, 0, 0))
 
+    def test_queue_items_carry_job_subject_decision_and_lazy_audit(self):
+        audit = {"track": "core", "decision": {"must_cov": 0.9, "threshold": 0.7, "blocks": [], "track": "core"},
+                 "requirements": [{"id": "Q1", "text": "Excel", "kind": "must", "status": "met", "realism": "core",
+                                   "resume_quote": "planilhas", "job_quote": "Excel"}],
+                 "responsibilities": [], "objections": []}
+        self.add_job(1, "li-a", approved=True, status="worth", audit=json.dumps(audit))
+        self.seed_job(id=2, fingerprint="fp2", url="javascript:alert(1)", title="Sem URL segura")
+        queue = panel_queries.queue
+        queue._ensure_schema()
+        first = queue.enqueue("job_apply", {"job_id": 1}, dedupe_key="apply:1")
+        second = queue.enqueue("job_apply", {"job_id": 2}, dedupe_key="apply:2")
+        gone = queue.enqueue("job_apply", {"job_id": 999}, dedupe_key="apply:999")
+        resume = queue.enqueue("resume_analysis", {"language": "pt"}, dedupe_key="resume:pt")
+        items = {item["id"]: item for item in panel_queries.queue_api_payload()["items"]}
+
+        job = items[first]
+        self.assertEqual((job["subject"]["job_id"], job["subject"]["title"], job["subject"]["company"]), (1, "Estágio em Suporte de TI", "Acme"))
+        self.assertEqual(job["subject"]["url"], "https://example.com/1")
+        self.assertEqual((job["decision"]["score"], job["decision"]["approved"], job["decision"]["reason"]), (80, True, "r"))
+        self.assertEqual(items[second]["subject"]["url"], "")  # esquema inseguro não chega ao navegador
+        self.assertIsNone(items[second]["decision"])
+        self.assertTrue(items[gone]["subject"]["missing"])
+        self.assertEqual(items[resume]["subject"], {"type": "resume", "language": "pt"})
+
+        detail = panel_queries.queue_item_detail_api_payload(first)
+        self.assertEqual(detail["assessment"]["requirements"][0]["status"], "met")
+        self.assertIsNone(panel_queries.queue_item_detail_api_payload(resume))
+        self.assertIsNone(panel_queries.queue_item_detail_api_payload(second))
+
     def test_low_precision_warning_needs_enough_triaged_jobs(self):
         for i in range(1, 23):
             self.add_job(i, "li-x", approved=(i == 1))

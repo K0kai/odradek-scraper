@@ -232,6 +232,14 @@ def queue() -> dict:
     return panel_queries.queue_api_payload()
 
 
+@api.get("/api/queue/{queue_id}/assessment")
+def queue_item_assessment(queue_id: int):
+    detail = panel_queries.queue_item_detail_api_payload(queue_id)
+    if detail is None:
+        return _error("Este item não tem auditoria de triagem.", 404)
+    return detail
+
+
 @api.get("/api/logs")
 def logs(limit: int = 200) -> dict:
     return panel_queries.logs_api_payload(limit)

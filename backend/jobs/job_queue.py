@@ -295,7 +295,7 @@ class JobQueue:
         if not text:
             return
         stamp = _utc_now().strftime("%H:%M:%S")
-        line = f"{stamp} {text[:400]}"
+        line = f"{stamp} {text[:1000]}"
         with self._connect() as db:
             row = db.execute(
                 "SELECT progress_log FROM queue_jobs WHERE id=?", (qid,)

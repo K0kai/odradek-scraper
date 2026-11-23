@@ -637,8 +637,10 @@ def assess_job(
     language: str,
     preferences: str,
     track: str = "core",
+    progress: Callable[[str], None] | None = None,
 ) -> dict:
     """Passo A (auditoria) → decisão determinística → passo B cético (só se aprovada)."""
+    say = progress or (lambda _message: None)
     job_text = clean_job_html(job.get("description", ""))
     job_norm = NormalizedText.of(f"{job.get('title', '')}\n{job.get('company', '')}\n{job.get('location', '')}\n{job_text}")
     raw = call_json(
@@ -648,8 +650,22 @@ def assess_job(
     verified = _verify(raw, job_norm, resume_norm, profile)
     decision = decide(verified, profile, cfg, track=track, job=job, language=language)
     approved = _approved(decision)
+    musts = [r for r in verified["requirements"] + verified["responsibilities"] if r["id"] in decision["must_ids"]]
+    met = sum(1 for r in musts if r["status"] in ("met", "transferable"))
+    say(
+        f"Passo A (auditoria): {met}/{len(musts)} obrigatórios atendidos · cobertura {decision['must_cov']:.0%} "
+        f"(mín. {decision['threshold']:.0%}) · score {decision['score']}/100 (mín. {decision['min_score']})"
+    )
+    if decision["blocks"]:
+        say("Bloqueios: " + "; ".join(decision["blocks"]))
+    inflated = [r["text"][:60] for r in verified["requirements"] if r["realism"] == "inflated"]
+    if inflated:
+        say(f"Requisitos desconsiderados (inflados): {'; '.join(inflated[:4])}")
     objections: list[dict] = []
+    if not approved:
+        say("Passo B (revisão cética) pulado: reprovada no passo A")
     if approved:
+        say("Passo A aprovou; rodando revisão cética (passo B)")
         skeptic = call_json(
             build_skeptic_prompt(job, job_text, profile, verified), SKEPTIC_SCHEMA,
             max_output_tokens=4096, thinking_budget=1024,
@@ -670,6 +686,12 @@ def assess_job(
         if any(o["severity"] == "blocker" for o in objections):
             decision["blocks"].append("objeção bloqueante verificada na revisão cética")
         approved = _approved(decision, penalty)
+        majors = sum(1 for o in objections if o["severity"] == "major")
+        blockers = sum(1 for o in objections if o["severity"] == "blocker")
+        say(
+            f"Passo B (revisão cética): {len(objections)} objeção(ões) verificada(s) "
+            f"({blockers} bloqueante(s), {majors} grave(s)) · resultado final: {'aprovada' if approved else 'reprovada'}"
+        )
     bridges = [
         f"{r['text'][:120]} ← {r['bridge']}" for r in verified["requirements"] + verified["responsibilities"]
         if r["status"] == "transferable" and r.get("bridge")

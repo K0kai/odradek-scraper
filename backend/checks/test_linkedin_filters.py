@@ -408,6 +408,22 @@ class TriageEndToEndTests(AppDbCase):
         self.assertIn("requirements", audit)
         self.assertEqual(audit["decision"]["track"], "core")
 
+    def test_triage_reports_job_decision_and_reasoning_to_the_queue_progress(self):
+        self.seed_resume()
+        self.seed_job()
+        raw = base_raw()
+        for item in raw["matches"]:
+            item["status"], item["evidence_ids"] = "unmet", []
+        lines = []
+        with patch.object(app, "_assessment_caller", self.fake_caller(raw)):
+            app.process_auto_job(1, progress=lines.append)
+        text = "\n".join(lines)
+        self.assertIn("Vaga #1: Estágio em Suporte de TI — Acme (Remoto)", text)
+        self.assertIn("Passo A (auditoria)", text)
+        self.assertIn("pulado", text)  # reprovada no passo A: sem revisão cética
+        self.assertIn("DESCARTADA", text)
+        self.assertIn("Raciocínio da IA:", text)
+
     def test_resume_language_comes_from_the_job_not_the_model(self):
         self.seed_resume("en")
         self.seed_job(language="pt")

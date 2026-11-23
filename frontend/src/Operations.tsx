@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { api, type LogItem, type PortfolioStatus, type QueueData, type QueueItem, type ResumeRecord, type ResumesData, type UsageData } from './api'
+import { api, type Assessment, type LogItem, type PortfolioStatus, type QueueData, type QueueItem, type ResumeRecord, type ResumesData, type UsageData } from './api'
 import { formatDate } from './format'
+import { AssessmentView } from './JobCard'
 
 const kinds: Record<string, string> = {
   resume_analysis: 'Análise de currículo',
-  job_apply: 'Candidatura',
+  job_apply: 'Triagem de vaga',
   worth_reverify: 'Verificação de vaga',
   linkedin_apply: 'Candidatura por navegador',
 }
@@ -27,18 +28,60 @@ function usePolling<T>(loader: () => Promise<T>, setData: (value: T) => void, se
   return refresh
 }
 
-function QueueCard({ item, action }: { item: QueueItem; action: (id: number, name: 'cancel' | 'retry') => Promise<void> }) {
+function QueueSubjectView({ item, statusLabels }: { item: QueueItem; statusLabels: Record<string, string> }) {
+  const subject = item.subject
+  if (!subject) return null
+  if (subject.type === 'resume') return <p className="queue-subject"><strong>Currículo {subject.language.toUpperCase() || '—'}</strong></p>
+  if (subject.type === 'worth') return <p className="queue-subject"><strong>Verificação diária{subject.scheduled_date ? ` de ${subject.scheduled_date}` : ''}</strong></p>
+  if (subject.missing) return <p className="queue-subject"><strong>Vaga #{subject.job_id}</strong> <em>(removida)</em></p>
+  const title = subject.title || 'Sem título'
+  return <div className="queue-subject">
+    <p><strong>{subject.url ? <a href={subject.url} target="_blank" rel="noreferrer">{title}</a> : title}</strong></p>
+    <div className="operation-meta"><span>Vaga #{subject.job_id}</span>{subject.company && <span>{subject.company}</span>}{subject.location && <span>{subject.location}</span>}{subject.job_status && <span>Status: {statusLabels[subject.job_status] || subject.job_status}</span>}</div>
+  </div>
+}
+
+function QueueDecisionView({ item }: { item: QueueItem }) {
+  const decision = item.decision
+  const [audit, setAudit] = useState<Assessment | null | undefined>(undefined)
+  const [loading, setLoading] = useState(false)
+  const [auditError, setAuditError] = useState('')
+  if (!decision) return null
+  async function loadAudit() {
+    setLoading(true); setAuditError('')
+    try { setAudit((await api.queueAssessment(item.id)).assessment) }
+    catch (err) { setAuditError((err as Error).message) }
+    finally { setLoading(false) }
+  }
+  return <div className="queue-decision">
+    <div className="operation-meta">
+      <span className={`queue-status ${decision.approved ? 'succeeded' : 'failed'}`}>{decision.approved ? 'Aprovada' : 'Descartada'}</span>
+      {decision.score !== null && <span>Score {decision.score}/100</span>}
+      {decision.model && <span>{decision.provider ? `${decision.provider}/` : ''}{decision.model}</span>}
+      {decision.decided_at && <span>Decidido {formatDate(decision.decided_at, true)}</span>}
+    </div>
+    {decision.reason && <p className="triage-reason"><strong>Raciocínio da IA:</strong> {decision.reason}</p>}
+    {audit === undefined && <button className="secondary" disabled={loading} onClick={loadAudit}>{loading ? 'Carregando…' : 'Ver checklist da IA'}</button>}
+    {auditError && <p className="banner error" role="alert">{auditError}</p>}
+    {audit === null && <p className="section-description">Sem checklist detalhado para esta decisão.</p>}
+    {audit && <AssessmentView assessment={audit} open />}
+  </div>
+}
+
+function QueueCard({ item, statusLabels, action }: { item: QueueItem; statusLabels: Record<string, string>; action: (id: number, name: 'cancel' | 'retry') => Promise<void> }) {
   const [busy, setBusy] = useState(false)
   async function run(name: 'cancel' | 'retry') { setBusy(true); try { await action(item.id, name) } finally { setBusy(false) } }
   return <article className="operation-card"><div className="operation-head"><div><strong>#{item.id} · {kinds[item.kind] || item.kind}</strong><small>Criado {formatDate(item.created_at, true)}</small></div><span className={`queue-status ${item.status}`}>{statuses[item.status] || item.status}</span></div>
+    <QueueSubjectView item={item} statusLabels={statusLabels} />
     <div className="operation-meta"><span>Tentativas: {item.attempts}/{item.max_attempts}</span>{item.next_run_at && <span>Próxima: {formatDate(item.next_run_at, true)}</span>}</div>
+    <QueueDecisionView item={item} />
     {item.last_step && <p>{item.last_step}</p>}{item.outcome && <p className="operation-outcome">{item.outcome}</p>}
-    {item.progress && <details><summary>Histórico do processamento</summary><pre>{item.progress}</pre></details>}
+    {item.progress && <details open={item.status === 'running'}><summary>Histórico do processamento</summary><pre>{item.progress}</pre></details>}
     <div className="job-actions">{['pending', 'running', 'retry_wait'].includes(item.status) && <button className="secondary" disabled={busy} onClick={() => run('cancel')}>Cancelar</button>}{item.kind !== 'linkedin_apply' && ['running', 'retry_wait', 'failed', 'cancelled'].includes(item.status) && <button className="secondary" disabled={busy} onClick={() => run('retry')}>Reenfileirar</button>}</div>
   </article>
 }
 
-export function QueueView({ notify }: { notify: (message: string, error?: boolean) => void }) {
+export function QueueView({ notify, statusLabels }: { notify: (message: string, error?: boolean) => void; statusLabels: Record<string, string> }) {
   const [data, setData] = useState<QueueData | null>(null)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
@@ -58,7 +101,7 @@ export function QueueView({ notify }: { notify: (message: string, error?: boolea
   return <><section className="filter-panel"><p className="eyebrow">PROCESSAMENTO</p><h2>Fila de IA</h2><p className="section-description">Acompanhe análises e candidaturas. Itens com erro podem ser reenfileirados.</p>
     <div className="queue-stats">{(['pending', 'running', 'retry_wait', 'succeeded', 'failed'] as const).map(key => <div key={key}><strong>{data?.counts[key] || 0}</strong><span>{statuses[key]}</span></div>)}</div>
     <div className="job-actions"><button disabled={busy} onClick={() => action('evaluate-new')}>Triar vagas novas</button><button className="secondary" disabled={busy} onClick={() => action('retry-all')}>Reenfileirar falhas</button><button className="secondary" disabled={busy} onClick={() => action('clear')}>{confirmClear ? 'Confirmar limpeza' : 'Limpar concluídos'}</button>{confirmClear && <button className="secondary" onClick={() => setConfirmClear(false)}>Cancelar</button>}</div>
-  </section>{error && <p className="banner error" role="alert">{error} <button onClick={refresh}>Tentar novamente</button></p>}{!data ? <p className="empty">Carregando fila…</p> : data.items.length ? <div className="operation-list">{data.items.map(item => <QueueCard key={item.id} item={item} action={itemAction} />)}</div> : <p className="empty">Nenhum job na fila.</p>}</>
+  </section>{error && <p className="banner error" role="alert">{error} <button onClick={refresh}>Tentar novamente</button></p>}{!data ? <p className="empty">Carregando fila…</p> : data.items.length ? <div className="operation-list">{data.items.map(item => <QueueCard key={item.id} item={item} statusLabels={statusLabels} action={itemAction} />)}</div> : <p className="empty">Nenhum job na fila.</p>}</>
 }
 
 export function LogsView({ notify }: { notify: (message: string, error?: boolean) => void }) {

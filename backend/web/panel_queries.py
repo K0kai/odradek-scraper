@@ -184,18 +184,118 @@ def mark_jobs_reviewed(ids: list[int]) -> int:
         return max(cursor.rowcount, 0)
 
 
+def _queue_payload_of(record: dict) -> dict:
+    try:
+        payload = json.loads(record.get("payload") or "{}")
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _queue_job_ids(payloads: list[dict]) -> list[int]:
+    ids = []
+    for payload in payloads:
+        try:
+            job_id = int(payload.get("job_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if job_id:
+            ids.append(job_id)
+    return sorted(set(ids))
+
+
+def _queue_job_context(db, job_ids: list[int]) -> tuple[dict[int, dict], dict[int, dict]]:
+    """Vaga + última decisão da IA de cada job_id, em consultas únicas (sem N+1)."""
+    jobs: dict[int, dict] = {}
+    decisions: dict[int, dict] = {}
+    if not job_ids:
+        return jobs, decisions
+    marks = ",".join("?" * len(job_ids))
+    for row in db.execute(
+        f"SELECT id, title, company, location, url, status FROM jobs WHERE id IN ({marks})", job_ids,
+    ).fetchall():
+        jobs[int(row["id"])] = dict(row)
+    for row in db.execute(
+        f"""SELECT job_id, decided_at, match_score, should_apply, reason, provider, model
+            FROM ai_decisions
+            WHERE id IN (SELECT MAX(id) FROM ai_decisions WHERE job_id IN ({marks}) GROUP BY job_id)""",
+        job_ids,
+    ).fetchall():
+        decisions[int(row["job_id"])] = dict(row)
+    return jobs, decisions
+
+
+def _queue_subject(kind: str, payload: dict, jobs: dict[int, dict]) -> dict | None:
+    if kind == "job_apply":
+        try:
+            job_id = int(payload.get("job_id") or 0)
+        except (TypeError, ValueError):
+            job_id = 0
+        job = jobs.get(job_id)
+        if not job:
+            return {"type": "job", "job_id": job_id, "title": "", "company": "", "location": "",
+                    "url": "", "job_status": "", "missing": True}
+        url = job.get("url") or ""
+        return {"type": "job", "job_id": job_id, "title": job.get("title") or "",
+                "company": job.get("company") or "", "location": job.get("location") or "",
+                "url": url if urlparse(url).scheme in {"http", "https"} else "",
+                "job_status": job.get("status") or "", "missing": False}
+    if kind == "resume_analysis":
+        return {"type": "resume", "language": str(payload.get("language") or "")}
+    if kind == "worth_reverify":
+        return {"type": "worth", "scheduled_date": str(payload.get("scheduled_date") or "")}
+    return None
+
+
+def _queue_decision(decision: dict | None) -> dict | None:
+    if not decision:
+        return None
+    return {
+        "score": decision.get("match_score"),
+        "approved": bool(decision.get("should_apply")),
+        "reason": str(decision.get("reason") or "")[:1000],
+        "model": str(decision.get("model") or ""),
+        "provider": str(decision.get("provider") or ""),
+        "decided_at": decision.get("decided_at") or "",
+    }
+
+
 def queue_api_payload() -> dict:
+    records = [dict(row) for row in queue.list_jobs(limit=100)]
+    payloads = [_queue_payload_of(record) for record in records]
+    with connect() as db:
+        jobs, decisions = _queue_job_context(db, _queue_job_ids(payloads))
     items = []
-    for row in queue.list_jobs(limit=100):
-        record = dict(row)
+    for record, payload in zip(records, payloads):
         progress = (record.get("progress_log") or "").splitlines()
+        subject = _queue_subject(str(record.get("kind") or ""), payload, jobs)
+        job_id = subject.get("job_id") if subject and subject["type"] == "job" else None
         items.append({key: record.get(key) for key in (
             "id", "kind", "status", "attempts", "max_attempts", "next_run_at",
             "created_at", "updated_at",
         )} | {"last_step": (progress[-1] if progress else "")[:280],
-             "progress": "\n".join(progress[-40:])[-4000:],
-             "outcome": (record.get("last_error") or record.get("result") or "")[:500]})
+             "progress": "\n".join(progress[-80:])[-8000:],
+             "outcome": (record.get("last_error") or record.get("result") or "")[:500],
+             "subject": subject,
+             "decision": _queue_decision(decisions.get(job_id)) if job_id else None})
     return {"counts": queue.counts(), "items": items}
+
+
+def queue_item_detail_api_payload(queue_id: int) -> dict | None:
+    """Auditoria compacta (checklist) da vaga de um item da fila; None se não houver."""
+    with connect() as db:
+        row = db.execute("SELECT kind, payload FROM queue_jobs WHERE id=?", (queue_id,)).fetchone()
+        if not row or row["kind"] != "job_apply":
+            return None
+        ids = _queue_job_ids([_queue_payload_of(dict(row))])
+        if not ids:
+            return None
+        decision = db.execute(
+            "SELECT assessment_json FROM ai_decisions WHERE job_id=? ORDER BY id DESC LIMIT 1", (ids[0],),
+        ).fetchone()
+    if not decision:
+        return None
+    return {"assessment": _compact_assessment(decision["assessment_json"])}
 
 
 def logs_api_payload(limit: int = 200) -> dict:

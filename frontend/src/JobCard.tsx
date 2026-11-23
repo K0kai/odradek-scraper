@@ -16,10 +16,10 @@ function AssessmentLine({ item }: { item: AssessmentItem }) {
   </li>
 }
 
-function AssessmentView({ assessment }: { assessment: Assessment }) {
+export function AssessmentView({ assessment, open }: { assessment: Assessment; open?: boolean }) {
   const musts = assessment.requirements.filter(item => item.kind === 'must')
   const nice = assessment.requirements.filter(item => item.kind !== 'must')
-  return <details className="job-details assessment">
+  return <details className="job-details assessment" open={open}>
     <summary>Por que esta nota <span className={`track-badge ${assessment.track}`}>{assessment.track === 'transferable' ? 'Secundária' : 'Principal'}</span>{assessment.inflated_posting && <span className="track-badge inflated">Anúncio inflado</span>}</summary>
     <p className="section-description">Cobertura dos obrigatórios essenciais: {Math.round(assessment.must_cov * 100)}% (mínimo {Math.round(assessment.threshold * 100)}%). Cada marca foi verificada contra o texto do currículo; passe o mouse para ver as citações.</p>
     {assessment.blocks.length > 0 && <ul className="assessment-blocks">{assessment.blocks.map(block => <li key={block}>Bloqueio: {block}</li>)}</ul>}
