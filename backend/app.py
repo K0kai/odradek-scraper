@@ -149,9 +149,11 @@ def _tokenharbor_source() -> tuple[str, list[str]]:
 
 
 def _install_tokenharbor_fallback() -> None:
+    global _th_quota_cache
     from integrations.ai_client import set_tokenharbor_source
 
     set_tokenharbor_source(_tokenharbor_source)
+    _th_quota_cache = None  # chave nova: a próxima leitura da cota consulta de verdade
 
 
 _install_tokenharbor_fallback()
@@ -749,8 +751,87 @@ def load_apify_quota_snapshot() -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def refresh_apify_quota_snapshot() -> dict:
-    """Busca limites oficiais da Apify e grava cache em settings."""
+APIFY_LIVE_REFRESH_SECONDS = 15  # durante a coleta o uso muda a cada execução: atualiza quase em tempo real
+APIFY_IDLE_REFRESH_SECONDS = 300  # parado, o painel só reconsulta a cada 5 min
+_apify_refresh_lock = threading.Lock()
+
+
+def _snapshot_age_seconds(snapshot: dict) -> float | None:
+    fetched = parse_utc(str(snapshot.get("fetched_at") or ""))
+    return None if fetched is None else (datetime.now(timezone.utc) - fetched).total_seconds()
+
+
+def refresh_apify_quota_snapshot(*, min_age: float = 0.0) -> dict:
+    """Busca limites oficiais da Apify e grava cache em settings.
+
+    Com `min_age`, devolve o cache se ele for mais novo que isso (evita martelar a API com várias abas/etapas).
+    A trava serializa consultas simultâneas: quem espera já encontra o snapshot fresco.
+    """
+    with _apify_refresh_lock:
+        if min_age > 0:
+            cached = load_apify_quota_snapshot()
+            age = _snapshot_age_seconds(cached) if cached and not cached.get("error") else None
+            if age is not None and age < min_age:
+                return cached
+        return _fetch_apify_quota_snapshot()
+
+
+def refresh_apify_quota_quietly(*, min_age: float = 0.0) -> None:
+    """Para uso dentro do coletor: falha de cota nunca derruba a coleta."""
+    try:
+        refresh_apify_quota_snapshot(min_age=min_age)
+    except Exception:
+        LOG.debug("Falha ao atualizar a cota Apify durante a coleta", exc_info=True)
+
+
+def fresh_apify_quota() -> dict:
+    """Snapshot para o painel, atualizado sozinho: a cada 15 s com coleta ativa, a cada 5 min parado."""
+    try:
+        has_token = bool(secret_get("apify_token"))
+    except Exception:
+        has_token = False
+    if not has_token:
+        return load_apify_quota_snapshot()
+    running = collector.snapshot().get("state") in ("running", "stopping")
+    try:
+        return refresh_apify_quota_snapshot(min_age=APIFY_LIVE_REFRESH_SECONDS if running else APIFY_IDLE_REFRESH_SECONDS)
+    except Exception:
+        return load_apify_quota_snapshot()
+
+
+TOKENHARBOR_QUOTA_URL = "https://tokenharbor.ai/api/cli/free-tier"  # na raiz do site, não em /v1; não consome a cota
+TOKENHARBOR_QUOTA_CACHE_SECONDS = 15  # mesmo tempo do Cache-Control da API
+_th_quota_lock = threading.Lock()
+_th_quota_cache: tuple[float, dict] | None = None
+
+
+def tokenharbor_quota_snapshot(*, force: bool = False) -> dict:
+    """Cota gratuita/plano do TokenHarbor (percentuais e data de reinício). Nunca levanta."""
+    global _th_quota_cache
+    from integrations.usage_tracker import parse_tokenharbor_free_tier
+
+    with _th_quota_lock:
+        if not force and _th_quota_cache and _th_quota_cache[0] > time.monotonic():
+            return _th_quota_cache[1]
+        try:
+            key = get_ai_key("tokenharbor")
+        except Exception as exc:
+            snap = {"configured": True, "error": f"Não foi possível ler a chave do TokenHarbor: {exc}", "fetched_at": ""}
+            key = ""
+        else:
+            snap = {"configured": False}
+        if key:
+            try:
+                payload = fetch_json(TOKENHARBOR_QUOTA_URL, headers={"Authorization": f"Bearer {key}"}, timeout=15)
+                snap = parse_tokenharbor_free_tier(payload if isinstance(payload, dict) else {})
+            except Exception as exc:
+                snap = {"configured": True, "error": f"Falha ao consultar o TokenHarbor: {str(exc).replace(key, '[chave omitida]')}",
+                        "fetched_at": ""}
+        _th_quota_cache = (time.monotonic() + TOKENHARBOR_QUOTA_CACHE_SECONDS, snap)
+        return snap
+
+
+def _fetch_apify_quota_snapshot() -> dict:
     from integrations.usage_tracker import APIFY_SNAPSHOT_KEY, parse_apify_limits
 
     token = secret_get("apify_token")
@@ -1826,6 +1907,7 @@ def run_apify_actor(
         run = progress.get("data", progress) if isinstance(progress, dict) else {}
         status = str(run.get("status") or status)
         dataset_id = str(run.get("defaultDatasetId") or dataset_id)
+        refresh_apify_quota_quietly(min_age=APIFY_LIVE_REFRESH_SECONDS)  # cota ao vivo enquanto o actor roda
     if status != "SUCCEEDED":
         raise RuntimeError(f"Apify ({label}) encerrada com status {status}.")
     if not dataset_id:
@@ -1854,10 +1936,11 @@ def iter_apify_jobs():
     used, cycle_label = apify_monthly_usage_usd(token)
     set_setting("apify_last_usage_usd", f"{used:.4f}")
     set_setting("apify_last_usage_cycle", cycle_label)
+    refresh_apify_quota_quietly()  # o painel mostra a cota desde o início da coleta
     if used >= limit:
         raise ValueError(f"Limite mensal de créditos Apify atingido ({used:.2f} USD de {limit:.2f} USD no ciclo {cycle_label}).")
 
-    actors = [actor for actor in load_apify_actors(cfg) if actor.get("enabled", True)]
+    actors =[actor for actor in load_apify_actors(cfg) if actor.get("enabled", True)]
     if not actors:
         raise ValueError("Nenhum actor Apify habilitado em apify_actors_json.")
     main_filter: dict | None = None
@@ -1926,7 +2009,9 @@ def iter_apify_jobs():
             LOG.exception("Falha no actor Apify %s", run_label)
             errors.append(f"{run_label}: {exc}")
             log_event("error", "apify", f"Falha no actor {run_label}: {exc}")
+            refresh_apify_quota_quietly()
         else:
+            refresh_apify_quota_quietly()  # o run acabou de gastar créditos
             yield from batch
     if attempted < len(planned):
         log_event("warning", "apify", f"Cobertura incompleta: {attempted} de {len(planned)} execução(ões) iniciadas; {len(planned) - attempted} pendente(s).")

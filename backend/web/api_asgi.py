@@ -514,8 +514,10 @@ def clear_panel_logs():
 @api.post("/api/usage/refresh")
 def refresh_usage():
     snapshot = core.refresh_apify_quota_snapshot()
-    return {"ok": not bool(snapshot.get("error")),
-            "notice": snapshot.get("error") or "Cotas Apify atualizadas.",
+    tokenharbor = core.tokenharbor_quota_snapshot(force=True)
+    errors = [message for message in (snapshot.get("error"), tokenharbor.get("error")) if message]
+    return {"ok": not errors,
+            "notice": "; ".join(errors) or "Cotas atualizadas.",
             "usage": panel_queries.usage_api_payload()}
 
 

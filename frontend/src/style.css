@@ -1856,3 +1856,25 @@ button:hover:not(:disabled),.open-link:hover{
 .triage-item{display:grid;gap:6px}
 .triage-reason{margin:0;font-size:.9em;opacity:.85;line-height:1.4}
 .pager{display:flex;gap:12px;align-items:center;justify-content:center;margin-top:16px}
+
+/* Cotas ao vivo: a cor da barra segue o consumo */
+.progress-track.ok div{background:#7ad19a}
+.progress-track.warn div{background:#e3c26b}
+.progress-track.bad div{background:#dc5a52}
+.quota-strip{
+  border:1px solid #303837;
+  border-radius:9px;
+  background:#151a1b;
+  padding:14px 18px;
+  margin:0 0 18px
+}
+.quota-strip .eyebrow{margin:0}
+.quota-strip-head{
+  display:flex;
+  justify-content:space-between;
+  align-items:baseline;
+  gap:12px
+}
+.quota-strip-head span{font-weight:700}
+.quota-strip-head small{font-weight:500;color:#a8b1a9}
+.quota-strip .progress-track{margin-top:10px}

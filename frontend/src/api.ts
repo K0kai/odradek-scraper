@@ -74,6 +74,7 @@ export type Dashboard = {
   runs: Run[]
   collector: Collector
   status_labels: Record<string, string>
+  apify_quota: ApifyQuota | null
 }
 
 export type JobList = {
@@ -142,19 +143,37 @@ export type QueueItem = {
 
 export type QueueData = { counts: Record<string, number>; items: QueueItem[] }
 export type LogItem = { id: number; created_at: string; level: string; source: string; message: string }
+export type ApifyQuota = {
+  used_usd?: number
+  api_limit_usd?: number
+  local_limit_usd?: number
+  pct_of_local?: number
+  pct_of_api?: number
+  cycle_label?: string
+  fetched_at?: string
+  error?: string
+}
+export type TokenHarborQuota = {
+  configured: boolean
+  error?: string
+  plan_name?: string
+  on_plan?: boolean
+  plan_used_pct?: number
+  plan_exhausted?: boolean
+  used_pct?: number
+  exhausted?: boolean
+  activated?: boolean
+  period_started_at?: string
+  reset_at?: string
+  models?: string[]
+  models_enabled?: boolean
+  fetched_at?: string
+}
 export type UsageData = {
   provider: string
   model: string
-  apify: {
-    used_usd?: number
-    api_limit_usd?: number
-    local_limit_usd?: number
-    pct_of_local?: number
-    pct_of_api?: number
-    cycle_label?: string
-    fetched_at?: string
-    error?: string
-  }
+  apify: ApifyQuota
+  tokenharbor: TokenHarborQuota
   ai: {
     day_label: string
     month_label: string
@@ -253,7 +272,7 @@ export const api = {
   queueAction: (action: 'retry-all' | 'evaluate-new' | 'clear') => request<{ notice: string }>(`/api/queue/${action}`, { method: 'POST' }),
   clearLogs: () => request<{ notice: string }>('/api/logs/clear', { method: 'POST' }),
   usage: () => request<UsageData>('/api/usage'),
-  refreshUsage: () => request<{ notice: string; usage: UsageData }>('/api/usage/refresh', { method: 'POST' }),
+  refreshUsage: () => request<{ ok: boolean; notice: string; usage: UsageData }>('/api/usage/refresh', { method: 'POST' }),
   assistant: (message: string, history: { role: string; content: string }[]) => postForm<{ answer: string }>(
     '/api/assistant', { message, history: JSON.stringify(history) },
   ),

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, type Assessment, type LogItem, type PortfolioStatus, type QueueData, type QueueItem, type ResumeRecord, type ResumesData, type UsageData } from './api'
 import { formatDate } from './format'
 import { AssessmentView } from './JobCard'
+import { apifyUsage, QuotaBar, TokenHarborCard } from './Quota'
 
 const kinds: Record<string, string> = {
   resume_analysis: 'Análise de currículo',
@@ -128,20 +129,19 @@ export function UsageView({ notify }: { notify: (message: string, error?: boolea
   const [data, setData] = useState<UsageData | null>(null)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
-  const refresh = usePolling(api.usage, setData, setError, 30000)
+  const refresh = usePolling(api.usage, setData, setError, 15000)  // o servidor limita as consultas externas (15 s com coleta ativa, 5 min parado)
   async function update() {
     setBusy(true)
-    try { const result = await api.refreshUsage(); setData(result.usage); notify(result.notice, Boolean(result.usage.apify.error)) }
+    try { const result = await api.refreshUsage(); setData(result.usage); notify(result.notice, !result.ok) }
     catch (err) { notify((err as Error).message, true) }
     finally { setBusy(false) }
   }
   const apify = data?.apify
-  const limit = Number(apify?.local_limit_usd || apify?.api_limit_usd || 0)
-  const used = Number(apify?.used_usd || 0)
-  const percent = limit > 0 ? Math.min(100, Math.max(0, used / limit * 100)) : 0
-  return <><section className="section"><div className="section-head"><div><p className="eyebrow">CUSTOS E LIMITES</p><h2>Uso e cotas</h2></div><button className="secondary" disabled={busy} onClick={update}>{busy ? 'Consultando…' : 'Atualizar cotas Apify'}</button></div>
+  const { limit, used, percent } = apifyUsage(apify)
+  return <><section className="section"><div className="section-head"><div><p className="eyebrow">CUSTOS E LIMITES</p><h2>Uso e cotas</h2></div><button className="secondary" disabled={busy} onClick={update}>{busy ? 'Consultando…' : 'Atualizar cotas agora'}</button></div>
     {error && <p className="banner error" role="alert">{error} <button onClick={refresh}>Tentar novamente</button></p>}
-    {!data ? <p className="empty">Carregando uso…</p> : <div className="usage-grid-new"><article className="usage-card-new"><p className="eyebrow">APIFY</p><h3>Consumo do ciclo</h3>{apify?.error && <p className="inline-message">{apify.error}</p>}<div className="usage-big">US$ {used.toFixed(2)} <small>de US$ {limit.toFixed(2)}</small></div><div className="progress-track"><div style={{ width: `${percent}%` }} /></div><p className="usage-caption">{percent.toFixed(0)}% do limite · {apify?.cycle_label || 'Ciclo não informado'}</p><p className="usage-caption">Última consulta: {formatDate(apify?.fetched_at || null, true)}</p></article>
+    {!data ? <p className="empty">Carregando uso…</p> : <div className="usage-grid-new"><article className="usage-card-new"><p className="eyebrow">APIFY</p><h3>Consumo do ciclo</h3>{apify?.error && <p className="inline-message">{apify.error}</p>}<div className="usage-big">US$ {used.toFixed(2)} <small>de US$ {limit.toFixed(2)}</small></div><QuotaBar percent={percent} label="Consumo da cota Apify" /><p className="usage-caption">{percent.toFixed(0)}% do limite · {apify?.cycle_label || 'Ciclo não informado'}</p><p className="usage-caption">Atualiza sozinha. Última consulta: {formatDate(apify?.fetched_at || null, true)}</p></article>
+      <TokenHarborCard quota={data.tokenharbor} />
       <article className="usage-card-new"><p className="eyebrow">INTELIGÊNCIA ARTIFICIAL</p><h3>{data.provider === 'gemini' ? 'Gemini' : data.provider === 'openai' ? 'OpenAI' : data.provider} <small>{data.model}</small></h3><p className="usage-caption">Estimativa local das chamadas feitas por este aplicativo.</p><div className="usage-metrics-new"><div><span>Chamadas hoje</span><strong>{data.ai.day.calls_ok || 0}</strong></div><div><span>Erros de quota hoje</span><strong>{data.ai.day.calls_quota_error || 0}</strong></div><div><span>Tokens hoje</span><strong>{data.ai.day.tokens_in || 0} / {data.ai.day.tokens_out || 0}</strong></div><div><span>Chamadas no mês</span><strong>{data.ai.month.calls_ok || 0}</strong></div><div><span>Tokens no mês</span><strong>{data.ai.month.tokens_in || 0} / {data.ai.month.tokens_out || 0}</strong></div></div></article></div>}
   </section></>
 }

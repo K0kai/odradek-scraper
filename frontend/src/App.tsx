@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { api, type Dashboard, type JobFilters, type JobList } from './api'
 import { AssistantView, LogsView, QueueView, ResumesView, UsageView } from './Operations'
 import { CopilotAsk } from './CopilotAsk'
+import { ApifyQuotaStrip } from './Quota'
 import { SettingsView } from './Settings'
 import { RulesView } from './Rules'
 import odradekIcon from '../../assets/public/odradek-icon.png'
@@ -122,6 +123,7 @@ export function App() {
       <CopilotAsk notify={notify} />
       {view === 'overview' ? <>
         <section className="hero"><div><p className="eyebrow">COLETA</p><h2>{dashboard?.collector.state === 'running' ? 'Buscando novas oportunidades' : 'Pronto para uma nova busca'}</h2><p>{dashboard?.collector.message || 'Carregando estado da coleta…'}</p></div><div className="hero-actions"><button disabled={busy || dashboard?.collector.state === 'running'} onClick={() => collectorAction('start')}>Iniciar bot</button><button className="secondary" disabled={busy || dashboard?.collector.state === 'stopped'} onClick={() => collectorAction('stop')}>Parar bot</button></div></section>
+        {dashboard?.collector.state === 'running' || dashboard?.collector.state === 'stopping' ? <ApifyQuotaStrip quota={dashboard.apify_quota} /> : null}
         <div className="stats">{([['new', 'Novas'], ['worth', 'Para revisar'], ['saved', 'Salvas'], ['applied', 'Aplicadas']] as const).map(([key, label]) => <div className="stat" key={key}><span>{label}</span><strong>{dashboard ? dashboard.counts[key] ?? 0 : '–'}</strong></div>)}</div>
         <section className="section"><div className="section-head"><div><p className="eyebrow">ÚLTIMAS CAPTURAS</p><h2>Vagas recentes</h2></div><button className="text-link" onClick={() => show('jobs')}>Ver vagas para revisar →</button></div>
           {!dashboard ? <p className="empty">Carregando vagas…</p> : dashboard.jobs.length ? <div className="compact-jobs">{dashboard.jobs.slice(0, 8).map(job => <div className="compact-job" key={job.id}><div>{job.url ? <a href={job.url} target="_blank" rel="noreferrer">{job.title} ↗</a> : <strong>{job.title}</strong>}<small>{job.company || 'Empresa não informada'} · {job.location || 'Local não informado'}</small></div><span>{statusLabels[job.status] || job.status}</span></div>)}</div> : <p className="empty">Nenhuma vaga ainda. Inicie uma busca para preencher o painel.</p>}

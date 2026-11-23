@@ -4,7 +4,10 @@ import re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
-from app import STATUSES, collector, connect, load_apify_quota_snapshot, queue, settings
+from app import (
+    STATUSES, collector, connect, fresh_apify_quota, load_apify_quota_snapshot, queue, settings,
+    tokenharbor_quota_snapshot,
+)
 from integrations.ai_client import split_model_label
 from jobs.apply_channels import job_contact_emails
 from jobs.job_filters import _worth_match_expr, normalize_worth_sort, worth_date_bounds_utc, worth_order_sql
@@ -70,8 +73,11 @@ def dashboard_api_payload() -> dict:
         counts = {row["status"]: row["n"] for row in db.execute("SELECT status, COUNT(*) n FROM jobs GROUP BY status")}
         rows = db.execute(JOB_SELECT + "ORDER BY jobs.first_seen_at DESC LIMIT 20").fetchall()
         runs = [dict(row) for row in db.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 8")]
+    state = collector.snapshot()
+    # Só lê o cache (o coletor o atualiza a cada ~15 s): este endpoint é consultado a cada 6 s e não deve chamar a Apify.
+    quota = load_apify_quota_snapshot() if state.get("state") in ("running", "stopping") else None
     return {"counts": counts, "jobs": [{**_job_api_record(row), "description": "", "notes": "", "assessment": None} for row in rows], "runs": runs,
-            "collector": collector.snapshot(), "status_labels": STATUSES}
+            "collector": state, "status_labels": STATUSES, "apify_quota": quota}
 
 
 def jobs_api_payload(*, page: int = 1, page_size: int = 15, status: str = "worth",
@@ -314,7 +320,8 @@ def usage_api_payload() -> dict:
     provider = (cfg.get("ai_provider") or "gemini").casefold()
     store = load_store(cfg.get(STORE_KEY) or "")
     return {"provider": provider, "model": cfg.get("ai_model") or "",
-            "apify": load_apify_quota_snapshot(),
+            "apify": fresh_apify_quota(),  # atualiza sozinha: 15 s com coleta ativa, 5 min parado
+            "tokenharbor": tokenharbor_quota_snapshot(),
             "ai": summarize_ai_usage(store, provider=provider)}
 
 

@@ -61,6 +61,106 @@ class PanelQueryTests(AppDbCase):
         self.assertIsNone(panel_queries.queue_item_detail_api_payload(resume))
         self.assertIsNone(panel_queries.queue_item_detail_api_payload(second))
 
+    # --- cotas ao vivo (Apify) e monitoramento do TokenHarbor ---
+
+    FREE_TIER = {"plan_name": "Office Pass", "on_plan": True, "plan_used_pct": 37, "plan_exhausted": False,
+                 "used_pct": 12, "exhausted": False, "activated": True,
+                 "period_started_at": "2026-11-05T09:12:44.512+00:00", "period_ends_at": "2026-11-12T09:12:44.512+00:00",
+                 "reset_at": "2026-11-12T09:12:44.512+00:00",
+                 "models": ["deepseek-v4.1-flash:free", "mimo-v2.6-flash:free"], "models_enabled": True, "extra": "ignored"}
+
+    def th_snapshot(self, **patches):
+        import app
+        app._th_quota_cache = None
+        self.addCleanup(setattr, app, "_th_quota_cache", None)
+        return app, patches
+
+    def test_tokenharbor_quota_parses_the_free_tier_payload(self):
+        from integrations.usage_tracker import parse_tokenharbor_free_tier
+        snap = parse_tokenharbor_free_tier(self.FREE_TIER)
+        self.assertEqual((snap["plan_name"], snap["plan_used_pct"], snap["used_pct"], snap["exhausted"]), ("Office Pass", 37, 12, False))
+        self.assertEqual(snap["reset_at"], "2026-11-12T09:12:44.512+00:00")
+        self.assertEqual(snap["models"], ["deepseek-v4.1-flash:free", "mimo-v2.6-flash:free"])
+        self.assertNotIn("extra", snap)
+        self.assertEqual(parse_tokenharbor_free_tier({"used_pct": 250})["used_pct"], 100)  # limitado a 0-100
+
+    def test_tokenharbor_quota_without_a_key_makes_no_request(self):
+        from unittest.mock import patch
+        app, _ = self.th_snapshot()
+        with patch.object(app, "get_ai_key", return_value=""), patch.object(app, "fetch_json") as fetch:
+            self.assertEqual(app.tokenharbor_quota_snapshot(), {"configured": False})
+        fetch.assert_not_called()
+
+    def test_tokenharbor_quota_is_fetched_with_the_key_and_cached_for_15_seconds(self):
+        from unittest.mock import patch
+        app, _ = self.th_snapshot()
+        with patch.object(app, "get_ai_key", return_value="thk_live_abc"), \
+                patch.object(app, "fetch_json", return_value=self.FREE_TIER) as fetch:
+            first = app.tokenharbor_quota_snapshot()
+            app.tokenharbor_quota_snapshot()
+            self.assertEqual(fetch.call_count, 1)  # segunda leitura vem do cache
+            app.tokenharbor_quota_snapshot(force=True)
+            self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(fetch.call_args.args[0], "https://tokenharbor.ai/api/cli/free-tier")
+        self.assertEqual(fetch.call_args.kwargs["headers"], {"Authorization": "Bearer thk_live_abc"})
+        self.assertTrue(first["configured"] and first["used_pct"] == 12)
+
+    def test_tokenharbor_quota_failure_is_reported_without_leaking_the_key(self):
+        from unittest.mock import patch
+        app, _ = self.th_snapshot()
+        with patch.object(app, "get_ai_key", return_value="thk_live_abc"), \
+                patch.object(app, "fetch_json", side_effect=RuntimeError("HTTP 401: bad key thk_live_abc")):
+            snap = app.tokenharbor_quota_snapshot()
+        self.assertTrue(snap["configured"])
+        self.assertIn("HTTP 401", snap["error"])
+        self.assertNotIn("thk_live_abc", snap["error"])
+
+    def test_apify_quota_refresh_is_throttled_by_min_age(self):
+        import app
+        from datetime import datetime, timedelta, timezone
+        from unittest.mock import patch
+        from integrations.usage_tracker import APIFY_SNAPSHOT_KEY
+
+        def stored(age_seconds):
+            fetched = (datetime.now(timezone.utc) - timedelta(seconds=age_seconds)).isoformat(timespec="seconds")
+            app.set_setting(APIFY_SNAPSHOT_KEY, json.dumps({"used_usd": 1.0, "fetched_at": fetched, "error": ""}))
+
+        with patch.object(app, "_fetch_apify_quota_snapshot", return_value={"used_usd": 2.0}) as fetch:
+            stored(5)
+            self.assertEqual(app.refresh_apify_quota_snapshot(min_age=15)["used_usd"], 1.0)  # fresco: sem chamada à Apify
+            fetch.assert_not_called()
+            stored(60)
+            self.assertEqual(app.refresh_apify_quota_snapshot(min_age=15)["used_usd"], 2.0)  # velho: consulta
+            self.assertEqual(fetch.call_count, 1)
+            stored(1)
+            app.refresh_apify_quota_snapshot()  # sem min_age sempre consulta (botão "atualizar agora")
+            self.assertEqual(fetch.call_count, 2)
+
+    def test_fresh_apify_quota_uses_live_interval_while_collecting_and_idle_interval_otherwise(self):
+        import app
+        from unittest.mock import patch
+        for state, expected in (("running", app.APIFY_LIVE_REFRESH_SECONDS), ("stopped", app.APIFY_IDLE_REFRESH_SECONDS)):
+            with patch.object(app, "secret_get", return_value="apify_token"), \
+                    patch.object(app.collector, "snapshot", return_value={"state": state}), \
+                    patch.object(app, "refresh_apify_quota_snapshot", return_value={"used_usd": 3.0}) as refresh:
+                self.assertEqual(app.fresh_apify_quota(), {"used_usd": 3.0})
+            refresh.assert_called_once_with(min_age=expected)
+        with patch.object(app, "secret_get", return_value=""), patch.object(app, "refresh_apify_quota_snapshot") as refresh:
+            app.fresh_apify_quota()  # sem token não há o que consultar
+        refresh.assert_not_called()
+
+    def test_dashboard_carries_the_cached_apify_quota_only_while_collecting(self):
+        import app
+        from unittest.mock import patch
+        from integrations.usage_tracker import APIFY_SNAPSHOT_KEY
+        app.set_setting(APIFY_SNAPSHOT_KEY, json.dumps({"used_usd": 1.5, "fetched_at": "2026-11-23T10:00:00+00:00"}))
+        with patch.object(panel_queries.collector, "snapshot", return_value={"state": "running"}), \
+                patch.object(app, "refresh_apify_quota_snapshot") as refresh:
+            self.assertEqual(panel_queries.dashboard_api_payload()["apify_quota"]["used_usd"], 1.5)
+        refresh.assert_not_called()  # o painel (polling de 6 s) só lê o cache; quem atualiza é o coletor
+        with patch.object(panel_queries.collector, "snapshot", return_value={"state": "stopped"}):
+            self.assertIsNone(panel_queries.dashboard_api_payload()["apify_quota"])
+
     def test_low_precision_warning_needs_enough_triaged_jobs(self):
         for i in range(1, 23):
             self.add_job(i, "li-x", approved=(i == 1))

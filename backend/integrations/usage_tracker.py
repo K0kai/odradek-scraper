@@ -187,6 +187,35 @@ def parse_apify_limits(payload: dict[str, Any], *, local_limit_usd: float) -> di
     }
 
 
+def _pct(value: Any) -> int:
+    try:
+        return max(0, min(100, int(float(value))))
+    except (TypeError, ValueError):
+        return 0
+
+
+def parse_tokenharbor_free_tier(payload: dict[str, Any]) -> dict[str, Any]:
+    """Normaliza GET /api/cli/free-tier do TokenHarbor (só percentuais: a API não informa USD nem tokens)."""
+    data = payload if isinstance(payload, dict) else {}
+    models = data.get("models")
+    return {
+        "configured": True,
+        "plan_name": str(data.get("plan_name") or ""),
+        "on_plan": bool(data.get("on_plan")),
+        "plan_used_pct": _pct(data.get("plan_used_pct")),
+        "plan_exhausted": bool(data.get("plan_exhausted")),
+        "used_pct": _pct(data.get("used_pct")),
+        "exhausted": bool(data.get("exhausted")),
+        "activated": bool(data.get("activated")),
+        "period_started_at": str(data.get("period_started_at") or ""),
+        "reset_at": str(data.get("reset_at") or data.get("period_ends_at") or ""),
+        "models": [str(m) for m in models] if isinstance(models, list) else [],
+        "models_enabled": bool(data.get("models_enabled", True)),
+        "fetched_at": _utc_now().isoformat(timespec="seconds"),
+        "error": "",
+    }
+
+
 def persist_ai_call(
     *,
     get_raw: Callable[[], str],
