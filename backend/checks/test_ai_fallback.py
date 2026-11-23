@@ -38,6 +38,11 @@ class FallbackTests(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
         os.environ["AI_FALLBACK_MODELS"] = f"{F1},{F2}"
+        os.environ.pop("AI_TRANSIENT_RETRIES", None)
+        self.pauses = []
+        pause = patch.object(ai_client, "_pause", self.pauses.append)  # sem dormir de verdade
+        pause.start()
+        self.addCleanup(pause.stop)
 
     def call(self, plan, provider="gemini", **kwargs):
         fake = FakeRequest(plan)
@@ -80,13 +85,15 @@ class FallbackTests(unittest.TestCase):
         fake = FakeRequest(plan)
         with patch.object(ai_client, "_request", fake), self.assertRaises(AiUnavailableError):
             ai_client.call_ai_json(prompt="x", schema=SCHEMA, provider="gemini", model=PRIMARY, api_key="k")
-        self.assertEqual(fake.calls, [PRIMARY, F1, F2])
+        rounds = 1 + len(ai_client.TRANSIENT_RETRY_DELAYS)
+        self.assertEqual(len(fake.calls), 3 * rounds)  # cada rodada percorre a cadeia toda
+        self.assertEqual(len(self.pauses), rounds - 1)
 
     def test_other_providers_never_fall_back_to_gemini(self):
         fake = FakeRequest({"gpt-4o": http_error(503)})
         with patch.object(ai_client, "_request", fake), self.assertRaises(AiUnavailableError):
             ai_client.call_ai_json(prompt="x", schema=SCHEMA, provider="openai", model="gpt-4o", api_key="k")
-        self.assertEqual(fake.calls, ["gpt-4o"])
+        self.assertEqual(set(fake.calls), {"gpt-4o"})  # só repete o mesmo modelo, nunca troca de provedor
 
     def test_fallback_list_comes_from_env_and_empty_disables_it(self):
         os.environ["AI_FALLBACK_MODELS"] = F2
@@ -158,6 +165,94 @@ class FallbackTests(unittest.TestCase):
         gone.http_status = 404
         with patch.object(ai_client, "_request", FakeRequest({PRIMARY: gone})), self.assertRaises(AiUnavailableError):
             ai_client.call_ai_json(prompt="x", schema=SCHEMA, provider="gemini", model=PRIMARY, api_key="k")
+
+    # --- rodadas de retry para sobrecarga passageira (503 "high demand") ---
+
+    def test_503_on_every_model_is_retried_with_backoff_until_one_recovers(self):
+        outcomes = iter([http_error(503)] * 3 + ['{"ok": true}'])  # 1ª rodada inteira falha; 2ª rodada: o primário volta
+
+        def request(**kwargs):
+            calls.append(kwargs["model"])
+            outcome = next(outcomes)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return ai_client._Reply(outcome, False)
+
+        calls = []
+        with patch.object(ai_client, "_request", request):
+            result = ai_client.call_ai_json(prompt="x", schema=SCHEMA, provider="gemini", model=PRIMARY, api_key="k")
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(self.pauses), 1)
+        self.assertTrue(1.0 <= self.pauses[0] <= 3.0)  # ~2s com jitter
+
+    def test_connection_timeout_falls_back_and_is_retried_like_a_503(self):
+        timeout = AiUnavailableError("IA indisponível: timed out")
+        timeout.transient = True
+        result, calls, used = self.call({PRIMARY: timeout, F1: '{"ok": true}'})
+        self.assertEqual((result, calls, used), ({"ok": True}, [PRIMARY, F1], [F1]))
+
+    def test_quota_429_is_not_retried_in_rounds_because_waiting_seconds_does_not_help(self):
+        plan = {PRIMARY: http_error(429), F1: http_error(429), F2: http_error(429)}
+        fake = FakeRequest(plan)
+        with patch.object(ai_client, "_request", fake), self.assertRaises(AiUnavailableError):
+            ai_client.call_ai_json(prompt="x", schema=SCHEMA, provider="gemini", model=PRIMARY, api_key="k")
+        self.assertEqual(fake.calls, [PRIMARY, F1, F2])
+        self.assertEqual(self.pauses, [])
+
+    def test_mixed_503_and_429_is_retried_in_rounds_like_the_production_log(self):
+        # log real: "gemini-3.5-flash-lite: HTTP 503; gemini-3.8-flash: HTTP 429"
+        plan = {PRIMARY: http_error(503), F1: http_error(429), F2: http_error(503)}
+        fake = FakeRequest(plan)
+        with patch.object(ai_client, "_request", fake), self.assertRaises(AiUnavailableError):
+            ai_client.call_ai_json(prompt="x", schema=SCHEMA, provider="gemini", model=PRIMARY, api_key="k")
+        self.assertEqual(len(self.pauses), len(ai_client.TRANSIENT_RETRY_DELAYS))
+
+    def test_429_then_recovery_on_the_second_round(self):
+        outcomes = iter([http_error(503), http_error(429), http_error(503), '{"ok": true}'])
+        calls = []
+
+        def request(**kwargs):
+            calls.append(kwargs["model"])
+            outcome = next(outcomes)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return ai_client._Reply(outcome, False)
+
+        with patch.object(ai_client, "_request", request):
+            result = ai_client.call_ai_json(prompt="x", schema=SCHEMA, provider="gemini", model=PRIMARY, api_key="k")
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(len(self.pauses), 1)
+
+    def test_retired_model_alongside_503_does_not_start_extra_rounds(self):
+        gone = RuntimeError("HTTP 404")
+        gone.http_status = 404
+        fake = FakeRequest({PRIMARY: http_error(503), F1: gone, F2: http_error(503)})
+        with patch.object(ai_client, "_request", fake), self.assertRaises(AiUnavailableError):
+            ai_client.call_ai_json(prompt="x", schema=SCHEMA, provider="gemini", model=PRIMARY, api_key="k")
+        self.assertEqual(self.pauses, [])
+
+    def test_missing_key_fails_immediately_without_retries(self):
+        with self.assertRaises(AiUnavailableError):
+            ai_client.call_ai_json(prompt="x", schema=SCHEMA, provider="gemini", model=PRIMARY, api_key="")
+        self.assertEqual(self.pauses, [])
+
+    def test_transient_retries_can_be_limited_or_disabled_by_env(self):
+        plan = {PRIMARY: http_error(503), F1: http_error(503), F2: http_error(503)}
+        for value, rounds in (("0", 1), ("1", 2)):
+            os.environ["AI_TRANSIENT_RETRIES"] = value
+            ai_client._cooldown_until.clear()
+            fake = FakeRequest(plan)
+            with patch.object(ai_client, "_request", fake), self.assertRaises(AiUnavailableError):
+                ai_client.call_ai_json(prompt="x", schema=SCHEMA, provider="gemini", model=PRIMARY, api_key="k")
+            self.assertEqual(len(fake.calls), 3 * rounds)
+
+    def test_final_error_after_all_rounds_is_still_retryable_by_the_queue(self):
+        plan = {PRIMARY: http_error(503), F1: http_error(503), F2: http_error(503)}
+        with patch.object(ai_client, "_request", FakeRequest(plan)), self.assertRaises(AiUnavailableError) as ctx:
+            ai_client.call_ai_json(prompt="x", schema=SCHEMA, provider="gemini", model=PRIMARY, api_key="k")
+        from jobs.job_queue import is_retryable_error
+        self.assertTrue(is_retryable_error(ctx.exception))
 
 
 if __name__ == "__main__":

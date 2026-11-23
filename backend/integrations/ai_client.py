@@ -14,6 +14,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import random
 import re
 import threading
 import time
@@ -34,6 +35,10 @@ DEFAULT_FALLBACK_MODELS = ("gemini-3.8-flash",)
 OVERLOAD_STATUSES = {429, 500, 502, 503, 504}  # 401/403 = chave/permissão: trocar de modelo não ajuda
 GONE_STATUS = 404  # modelo aposentado/inexistente para esta conta
 FALLBACK_STATUSES = OVERLOAD_STATUSES | {GONE_STATUS}
+# 503 "high demand" costuma durar segundos: antes de desistir, repete a cadeia inteira algumas vezes com backoff.
+TRANSIENT_STATUSES = {500, 502, 503, 504}  # falha do lado do provedor
+RATE_LIMIT_STATUS = 429  # quota por minuto (RPM) passa em segundos; só entra nas rodadas junto de uma falha transitória
+TRANSIENT_RETRY_DELAYS = (2.0, 6.0, 15.0)  # pausa antes de cada nova rodada; AI_TRANSIENT_RETRIES limita/desliga
 COOLDOWN_SECONDS = 90  # sobrecarga é passageira
 GONE_COOLDOWN_SECONDS = 6 * 3600  # modelo aposentado não volta tão cedo: não paga uma chamada falha por vaga
 _cooldown_until: dict[tuple[str, str], float] = {}
@@ -69,10 +74,41 @@ def model_chain(provider: str, model: str) -> list[str]:
 
 
 def _should_fall_back(exc: Exception) -> bool:
-    """Sobrecarga/quota do modelo ou resposta inutilizável: outro modelo pode resolver."""
-    if isinstance(exc, AiResponseError):
+    """Sobrecarga/quota do modelo, queda de rede/timeout ou resposta inutilizável: outro modelo pode resolver."""
+    if isinstance(exc, AiResponseError) or getattr(exc, "transient", False):
         return True
     return getattr(exc, "http_status", None) in FALLBACK_STATUSES
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """Falha que costuma passar sozinha em segundos (5xx, timeout, conexão), ao contrário de quota, chave ou modelo aposentado."""
+    return bool(getattr(exc, "transient", False)) or getattr(exc, "http_status", None) in TRANSIENT_STATUSES
+
+
+def _worth_another_round(errors: list[BaseException]) -> bool:
+    """Vale repetir a cadeia depois de um backoff?
+
+    Sim quando toda falha é passageira (5xx/timeout) ou limite por minuto (429) e há ao menos uma passageira,
+    como "503 num modelo + 429 no outro". 429 puro (cota esgotada), 404, 401/403 e JSON inutilizável não melhoram esperando segundos.
+    """
+    if not errors or not any(_is_transient(err) for err in errors):
+        return False
+    return all(_is_transient(err) or getattr(err, "http_status", None) == RATE_LIMIT_STATUS for err in errors)
+
+
+def transient_retry_delays() -> tuple[float, ...]:
+    raw = os.environ.get("AI_TRANSIENT_RETRIES")
+    if raw is None or not raw.strip():
+        return TRANSIENT_RETRY_DELAYS
+    try:
+        rounds = max(0, int(raw))
+    except ValueError:
+        return TRANSIENT_RETRY_DELAYS
+    return TRANSIENT_RETRY_DELAYS[:rounds]
+
+
+def _pause(seconds: float) -> None:
+    time.sleep(seconds)
 
 
 def _failure_label(exc: BaseException) -> str:
@@ -82,13 +118,8 @@ def _failure_label(exc: BaseException) -> str:
     return f"HTTP {status}" if status else exc.__class__.__name__
 
 
-def _with_fallback(provider: str, model: str, call, on_model=None):
-    """Executa call(modelo) pela cadeia.
-
-    Se todos os modelos falharem por motivo de modelo (sobrecarga, quota, aposentado, JSON inutilizável), o erro
-    final é AiUnavailableError, que a fila repete depois, e lista o resultado de cada modelo.
-    Erros que trocar de modelo não resolve (chave inválida, permissão) sobem como vieram.
-    """
+def _walk_chain(provider: str, model: str, call, on_model=None):
+    """Uma passada pela cadeia de modelos; se todos falharem, levanta o erro final com `.chain_transient`."""
     chain = model_chain(provider, model)
     failures: list[tuple[str, BaseException]] = []
     for index, candidate in enumerate(chain):
@@ -106,13 +137,34 @@ def _with_fallback(provider: str, model: str, call, on_model=None):
                 final = AiUnavailableError(f"IA indisponível: nenhum modelo respondeu ({summary}).")
                 final.http_status = getattr(exc, "http_status", None)  # type: ignore[attr-defined]
                 if isinstance(exc, AiResponseError):
-                    raise AiResponseError(str(final)) from exc
+                    final = AiResponseError(str(final))
+                final.chain_transient = _worth_another_round([err for _, err in failures])  # type: ignore[attr-defined]
                 raise final from exc
             continue
         if on_model is not None:
             on_model(candidate)
         return result
     raise AiUnavailableError("IA indisponível: nenhum modelo respondeu.")  # cadeia vazia: não ocorre
+
+
+def _with_fallback(provider: str, model: str, call, on_model=None):
+    """Executa call(modelo) pela cadeia, com novas rodadas quando a falha é só sobrecarga passageira.
+
+    Se todos os modelos falharem por motivo de modelo (sobrecarga, quota, aposentado, JSON inutilizável), o erro
+    final é AiUnavailableError, que a fila repete depois, e lista o resultado de cada modelo.
+    Quando TODAS as falhas da passada são transitórias (503/5xx, timeout), a cadeia é repetida após um backoff
+    com jitter (TRANSIENT_RETRY_DELAYS) antes de desistir: o pico de "high demand" costuma passar em segundos.
+    Erros que trocar de modelo não resolve (chave inválida, permissão) sobem como vieram.
+    """
+    delays = transient_retry_delays()
+    for attempt in range(len(delays) + 1):
+        try:
+            return _walk_chain(provider, model, call, on_model)
+        except RuntimeError as exc:
+            if attempt >= len(delays) or not getattr(exc, "chain_transient", False):
+                raise
+            _pause(delays[attempt] * random.uniform(0.75, 1.25))  # jitter: workers paralelos não voltam em sincronia
+    raise AiUnavailableError("IA indisponível: nenhum modelo respondeu.")  # inalcançável
 
 
 def _detail_from_body(body: str, *, code: int, provider: str, model: str, operation: str, api_key: str) -> str:
@@ -232,7 +284,9 @@ def _request(
         raise err from exc
     except (URLError, TimeoutError, ConnectionError) as exc:
         _record(provider, model, None, ok=False, quota_error=True)
-        raise AiUnavailableError(f"IA indisponível: {exc}") from exc
+        unavailable = AiUnavailableError(f"IA indisponível: {exc}")
+        unavailable.transient = True  # type: ignore[attr-defined]  # timeout/queda de conexão: tenta outro modelo e repete
+        raise unavailable from exc
     except AiUnavailableError:
         raise
     except Exception as exc:
