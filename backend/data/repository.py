@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import threading
+import time
+from pathlib import Path
 
 from data.dbutil import open_connection, using_postgres
 from jobs.form_rules import ensure_default_rules
@@ -131,6 +134,8 @@ DEFAULT_SETTINGS = {
     "queue_max_attempts": "40",
     "queue_ttl_hours": "24",
     "worth_reverify_last_daily": "",
+    "standby_sync_last_daily": "",
+    "standby_last_sync_json": "",
     # Perfil de diversidade (identidade NUNCA vem de IA; 'not_informed' = não informar)
     "candidate_gender": "not_informed",
     "candidate_race": "not_informed",
@@ -259,27 +264,47 @@ def connect() -> sqlite3.Connection:
     return open_connection(str(DB_PATH), timeout=60.0)
 
 
+POSTGRES_SCHEMA_PATH = Path(__file__).with_name("schema_postgres.sql")
+POSTGRES_REQUIRED_TABLES = (
+    "settings", "jobs", "runs", "ai_decisions", "cover_letters", "resumes", "resume_files",
+    "form_field_rules", "applications", "form_answers", "ai_answer_cache",
+    "copilot_asks", "queue_jobs", "event_logs", "qpid_application_attempts", "qpid_application_results",
+)
+
+
+def missing_postgres_tables(db) -> list[str]:
+    rows = db.execute(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema()"
+    ).fetchall()
+    available = {row["table_name"] if isinstance(row, dict) else row[0] for row in rows}
+    return sorted(set(POSTGRES_REQUIRED_TABLES) - available)
+
+
+def postgres_schema_statements() -> list[str]:
+    """Instruções do schema_postgres.sql, uma a uma (comentários de linha inteira são ignorados)."""
+    lines = [line for line in POSTGRES_SCHEMA_PATH.read_text(encoding="utf-8").splitlines()
+             if not line.lstrip().startswith("--")]
+    return [statement.strip() for statement in "\n".join(lines).split(";\n") + [""] if statement.strip().rstrip(";")]
+
+
+def apply_postgres_schema(db) -> None:
+    """Idempotente (CREATE ... IF NOT EXISTS): cria só o que falta e não altera tabelas existentes."""
+    for statement in postgres_schema_statements():
+        db.execute(statement.rstrip(";"))
+
+
 def initialize() -> None:
     """Cria o banco e aplica pequenas migrações compatíveis com versões anteriores."""
     os.makedirs(RESUMES_DIR, exist_ok=True)
     if using_postgres():
-        required_tables = {
-            "settings", "jobs", "runs", "ai_decisions", "cover_letters", "resumes",
-            "form_field_rules", "applications", "form_answers", "ai_answer_cache",
-            "copilot_asks", "queue_jobs", "event_logs",
-        }
         with connect() as db:
-            rows = db.execute(
-                "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema = current_schema()"
-            ).fetchall()
-            available = {row["table_name"] for row in rows}
-            missing = sorted(required_tables - available)
+            missing = missing_postgres_tables(db)
             if missing:
-                raise RuntimeError(
-                    "Neon schema is incomplete. Run the PostgreSQL schema SQL in the Neon console; "
-                    "missing tables: " + ", ".join(missing)
-                )
+                # Banco vazio (ou incompleto): cria o que falta a partir do schema versionado, sem passo manual.
+                apply_postgres_schema(db)
+                missing = missing_postgres_tables(db)
+            if missing:
+                raise RuntimeError("PostgreSQL schema is incomplete; missing tables: " + ", ".join(missing))
             ensure_resume_files(db)
             backfill_resume_files(db, RESUMES_DIR)
             for key, value in DEFAULT_SETTINGS.items():
@@ -296,6 +321,10 @@ def initialize() -> None:
                 "CREATE INDEX IF NOT EXISTS jobs_status_seen_idx "
                 "ON jobs(status, first_seen_at DESC)"
             )
+            # Consultas de cada poll do painel e de cada claim da fila; o schema do Neon foi criado à mão, sem eles.
+            db.execute("CREATE INDEX IF NOT EXISTS jobs_seen_idx ON jobs(first_seen_at DESC)")
+            db.execute("CREATE INDEX IF NOT EXISTS queue_jobs_status_idx ON queue_jobs(status, next_run_at)")
+            db.execute("CREATE INDEX IF NOT EXISTS copilot_asks_status_idx ON copilot_asks(status)")
             ensure_new_columns(db, postgres=True)
             migrate_scoring_v2_defaults(db)
             migrate_filter_prompts(db)
@@ -305,134 +334,201 @@ def initialize() -> None:
         return
 
     with connect() as db:
-        db.executescript(SCHEMA)
-        # Additions are applied in place so an existing jobs.db remains usable.
-        columns = {row["name"] for row in db.execute("PRAGMA table_info(jobs)")}
-        if "language" not in columns:
-            db.execute("ALTER TABLE jobs ADD COLUMN language TEXT NOT NULL DEFAULT 'unknown'")
-        if "language_confidence" not in columns:
-            db.execute("ALTER TABLE jobs ADD COLUMN language_confidence REAL NOT NULL DEFAULT 0")
-        db.execute("""CREATE TABLE IF NOT EXISTS cover_letters (
-          id INTEGER PRIMARY KEY,
-          job_id INTEGER NOT NULL UNIQUE REFERENCES jobs(id) ON DELETE CASCADE,
-          language TEXT NOT NULL,
-          provider TEXT NOT NULL,
-          model TEXT NOT NULL,
-          body TEXT NOT NULL,
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL
-        )""")
-        db.execute("""CREATE TABLE IF NOT EXISTS resumes (
-          id INTEGER PRIMARY KEY,
-          language TEXT NOT NULL UNIQUE,
-          original_filename TEXT NOT NULL DEFAULT '',
-          stored_path TEXT NOT NULL,
-          file_sha256 TEXT NOT NULL,
-          extracted_text TEXT NOT NULL DEFAULT '',
-          analysis_json TEXT NOT NULL DEFAULT '',
-          analysis_summary TEXT NOT NULL DEFAULT '',
-          analyzed_at TEXT,
-          provider TEXT NOT NULL DEFAULT '',
-          model TEXT NOT NULL DEFAULT '',
-          analysis_status TEXT NOT NULL DEFAULT 'none',
-          analysis_error TEXT NOT NULL DEFAULT '',
-          analysis_message TEXT NOT NULL DEFAULT '',
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL
-        )""")
-        ensure_resume_files(db)
-        backfill_resume_files(db, RESUMES_DIR)
-        resume_cols = {row["name"] for row in db.execute("PRAGMA table_info(resumes)")}
-        if "analysis_status" not in resume_cols:
-            db.execute("ALTER TABLE resumes ADD COLUMN analysis_status TEXT NOT NULL DEFAULT 'none'")
-        if "analysis_error" not in resume_cols:
-            db.execute("ALTER TABLE resumes ADD COLUMN analysis_error TEXT NOT NULL DEFAULT ''")
-        if "analysis_message" not in resume_cols:
-            db.execute("ALTER TABLE resumes ADD COLUMN analysis_message TEXT NOT NULL DEFAULT ''")
-        # Backfill: resumes with summary count as successful analysis.
+        initialize_sqlite(db)
+
+
+def initialize_sqlite(db) -> None:
+    """Schema e migrações do SQLite numa conexão aberta (também usado para preparar um SQLite vazio)."""
+    db.executescript(SCHEMA)
+    # Additions are applied in place so an existing jobs.db remains usable.
+    columns = {row["name"] for row in db.execute("PRAGMA table_info(jobs)")}
+    if "language" not in columns:
+        db.execute("ALTER TABLE jobs ADD COLUMN language TEXT NOT NULL DEFAULT 'unknown'")
+    if "language_confidence" not in columns:
+        db.execute("ALTER TABLE jobs ADD COLUMN language_confidence REAL NOT NULL DEFAULT 0")
+    db.execute("""CREATE TABLE IF NOT EXISTS cover_letters (
+      id INTEGER PRIMARY KEY,
+      job_id INTEGER NOT NULL UNIQUE REFERENCES jobs(id) ON DELETE CASCADE,
+      language TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      model TEXT NOT NULL,
+      body TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )""")
+    db.execute("""CREATE TABLE IF NOT EXISTS resumes (
+      id INTEGER PRIMARY KEY,
+      language TEXT NOT NULL UNIQUE,
+      original_filename TEXT NOT NULL DEFAULT '',
+      stored_path TEXT NOT NULL,
+      file_sha256 TEXT NOT NULL,
+      extracted_text TEXT NOT NULL DEFAULT '',
+      analysis_json TEXT NOT NULL DEFAULT '',
+      analysis_summary TEXT NOT NULL DEFAULT '',
+      analyzed_at TEXT,
+      provider TEXT NOT NULL DEFAULT '',
+      model TEXT NOT NULL DEFAULT '',
+      analysis_status TEXT NOT NULL DEFAULT 'none',
+      analysis_error TEXT NOT NULL DEFAULT '',
+      analysis_message TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )""")
+    ensure_resume_files(db)
+    backfill_resume_files(db, RESUMES_DIR)
+    resume_cols = {row["name"] for row in db.execute("PRAGMA table_info(resumes)")}
+    if "analysis_status" not in resume_cols:
+        db.execute("ALTER TABLE resumes ADD COLUMN analysis_status TEXT NOT NULL DEFAULT 'none'")
+    if "analysis_error" not in resume_cols:
+        db.execute("ALTER TABLE resumes ADD COLUMN analysis_error TEXT NOT NULL DEFAULT ''")
+    if "analysis_message" not in resume_cols:
+        db.execute("ALTER TABLE resumes ADD COLUMN analysis_message TEXT NOT NULL DEFAULT ''")
+    # Backfill: resumes with summary count as successful analysis.
+    db.execute(
+        """UPDATE resumes SET analysis_status='ok',
+               analysis_message=COALESCE(NULLIF(analysis_message,''), 'Análise concluída com sucesso.')
+           WHERE IFNULL(analysis_summary,'') != '' AND analysis_status IN ('none', '')"""
+    )
+    db.execute("""CREATE TABLE IF NOT EXISTS form_field_rules (
+      id INTEGER PRIMARY KEY,
+      key TEXT NOT NULL,
+      aliases TEXT NOT NULL DEFAULT '',
+      mode TEXT NOT NULL DEFAULT 'text',
+      value_from TEXT NOT NULL DEFAULT '',
+      value TEXT NOT NULL DEFAULT '',
+      sort_order INTEGER NOT NULL DEFAULT 0
+    )""")
+    db.execute("""CREATE TABLE IF NOT EXISTS applications (
+      id INTEGER PRIMARY KEY,
+      job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+      channel TEXT NOT NULL,
+      recipient TEXT NOT NULL DEFAULT '',
+      resume_id INTEGER,
+      cover_letter_id INTEGER,
+      status TEXT NOT NULL,
+      detail TEXT NOT NULL DEFAULT '',
+      attempted_at TEXT NOT NULL
+    )""")
+    db.execute("""CREATE TABLE IF NOT EXISTS form_answers (
+      id INTEGER PRIMARY KEY,
+      job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+      question TEXT NOT NULL,
+      answer TEXT NOT NULL,
+      provider TEXT NOT NULL DEFAULT '',
+      model TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL
+    )""")
+    # Cache GLOBAL de respostas de IA por pergunta normalizada ('open' ou 'choices').
+    db.execute("""CREATE TABLE IF NOT EXISTS ai_answer_cache (
+      id INTEGER PRIMARY KEY,
+      question_norm TEXT NOT NULL UNIQUE,
+      question_raw TEXT NOT NULL,
+      kind TEXT NOT NULL DEFAULT 'open',
+      answer TEXT NOT NULL,
+      provider TEXT NOT NULL DEFAULT '',
+      model TEXT NOT NULL DEFAULT '',
+      hits INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )""")
+    ensure_copilot_asks(db)
+    decision_cols = {row["name"] for row in db.execute("PRAGMA table_info(ai_decisions)")}
+    if "resume_language" not in decision_cols:
+        db.execute("ALTER TABLE ai_decisions ADD COLUMN resume_language TEXT NOT NULL DEFAULT ''")
+    if "apply_channel" not in decision_cols:
+        db.execute("ALTER TABLE ai_decisions ADD COLUMN apply_channel TEXT NOT NULL DEFAULT ''")
+    if "apply_result" not in decision_cols:
+        db.execute("ALTER TABLE ai_decisions ADD COLUMN apply_result TEXT NOT NULL DEFAULT ''")
+    ensure_default_rules(db)
+    for key, value in DEFAULT_SETTINGS.items():
         db.execute(
-            """UPDATE resumes SET analysis_status='ok',
-                   analysis_message=COALESCE(NULLIF(analysis_message,''), 'Análise concluída com sucesso.')
-               WHERE IFNULL(analysis_summary,'') != '' AND analysis_status IN ('none', '')"""
+            "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING",
+            (key, value),
         )
-        db.execute("""CREATE TABLE IF NOT EXISTS form_field_rules (
-          id INTEGER PRIMARY KEY,
-          key TEXT NOT NULL,
-          aliases TEXT NOT NULL DEFAULT '',
-          mode TEXT NOT NULL DEFAULT 'text',
-          value_from TEXT NOT NULL DEFAULT '',
-          value TEXT NOT NULL DEFAULT '',
-          sort_order INTEGER NOT NULL DEFAULT 0
-        )""")
-        db.execute("""CREATE TABLE IF NOT EXISTS applications (
-          id INTEGER PRIMARY KEY,
-          job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-          channel TEXT NOT NULL,
-          recipient TEXT NOT NULL DEFAULT '',
-          resume_id INTEGER,
-          cover_letter_id INTEGER,
-          status TEXT NOT NULL,
-          detail TEXT NOT NULL DEFAULT '',
-          attempted_at TEXT NOT NULL
-        )""")
-        db.execute("""CREATE TABLE IF NOT EXISTS form_answers (
-          id INTEGER PRIMARY KEY,
-          job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-          question TEXT NOT NULL,
-          answer TEXT NOT NULL,
-          provider TEXT NOT NULL DEFAULT '',
-          model TEXT NOT NULL DEFAULT '',
-          created_at TEXT NOT NULL
-        )""")
-        # Cache GLOBAL de respostas de IA por pergunta normalizada ('open' ou 'choices').
-        db.execute("""CREATE TABLE IF NOT EXISTS ai_answer_cache (
-          id INTEGER PRIMARY KEY,
-          question_norm TEXT NOT NULL UNIQUE,
-          question_raw TEXT NOT NULL,
-          kind TEXT NOT NULL DEFAULT 'open',
-          answer TEXT NOT NULL,
-          provider TEXT NOT NULL DEFAULT '',
-          model TEXT NOT NULL DEFAULT '',
-          hits INTEGER NOT NULL DEFAULT 0,
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL
-        )""")
-        ensure_copilot_asks(db)
-        decision_cols = {row["name"] for row in db.execute("PRAGMA table_info(ai_decisions)")}
-        if "resume_language" not in decision_cols:
-            db.execute("ALTER TABLE ai_decisions ADD COLUMN resume_language TEXT NOT NULL DEFAULT ''")
-        if "apply_channel" not in decision_cols:
-            db.execute("ALTER TABLE ai_decisions ADD COLUMN apply_channel TEXT NOT NULL DEFAULT ''")
-        if "apply_result" not in decision_cols:
-            db.execute("ALTER TABLE ai_decisions ADD COLUMN apply_result TEXT NOT NULL DEFAULT ''")
-        ensure_default_rules(db)
-        for key, value in DEFAULT_SETTINGS.items():
-            db.execute(
-                "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING",
-                (key, value),
-            )
-        ensure_new_columns(db, postgres=False)
-        migrate_scoring_v2_defaults(db)
-        migrate_filter_prompts(db)
-        migrate_selection_prompt(db)
-        migrate_discard_excluded_region_jobs(db)
-        ensure_log_table(db)
+    ensure_new_columns(db, postgres=False)
+    migrate_scoring_v2_defaults(db)
+    migrate_filter_prompts(db)
+    migrate_selection_prompt(db)
+    migrate_discard_excluded_region_jobs(db)
+    ensure_log_table(db)
+
+
+# A tabela inteira (prompts, perfil, JSON de uso, segredos cifrados) era relida a cada chamada. Com banco em rede
+# isso é uma conexão + dezenas de KB por leitura; guardamos em memória por alguns segundos. SQLite local não
+# precisa (conexão é barata) e continua lendo direto.
+SETTINGS_CACHE_SECONDS = 30.0
+_settings_cache: dict[str, object] = {"at": float("-inf"), "data": None}
+_settings_cache_lock = threading.Lock()
+
+
+def invalidate_settings_cache() -> None:
+    with _settings_cache_lock:
+        _settings_cache["at"] = float("-inf")
+        _settings_cache["data"] = None
 
 
 def settings() -> dict[str, str]:
-    """Lê as preferências salvas no SQLite."""
+    """Lê as preferências salvas (cópia; em banco de rede vem do cache de 30 s)."""
+    if not using_postgres():
+        with connect() as db:
+            return {row["key"]: row["value"] for row in db.execute("SELECT key,value FROM settings")}
+    with _settings_cache_lock:
+        data = _settings_cache["data"]
+        if data is not None and time.monotonic() - float(_settings_cache["at"]) < SETTINGS_CACHE_SECONDS:
+            return dict(data)  # type: ignore[arg-type]
+    try:
+        with connect() as db:
+            fresh = {row["key"]: row["value"] for row in db.execute("SELECT key,value FROM settings")}
+    except Exception:
+        with _settings_cache_lock:
+            stale = _settings_cache["data"]
+        if stale is not None:  # banco fora do ar: o último valor conhecido é melhor que derrubar o painel
+            return dict(stale)  # type: ignore[arg-type]
+        raise
+    with _settings_cache_lock:
+        _settings_cache["data"] = fresh
+        _settings_cache["at"] = time.monotonic()
+    return dict(fresh)
+
+
+def get_setting(key: str, default: str = "") -> str:
+    """Uma chave só: usa o cache quente, senão lê 1 linha (em vez da tabela inteira)."""
+    if using_postgres():
+        with _settings_cache_lock:
+            data = _settings_cache["data"]
+            if data is not None and time.monotonic() - float(_settings_cache["at"]) < SETTINGS_CACHE_SECONDS:
+                return str(data.get(key, default))  # type: ignore[union-attr]
     with connect() as db:
-        return {row["key"]: row["value"] for row in db.execute("SELECT key,value FROM settings")}
+        row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return str(row["value"]) if row else default
+
+
+def _remember_settings(values: dict[str, str]) -> None:
+    """Depois de gravar: o cache já reflete o novo valor (sem reler a tabela inteira na próxima leitura)."""
+    with _settings_cache_lock:
+        data = _settings_cache["data"]
+        if isinstance(data, dict):
+            data.update(values)
+
+
+_UPSERT_SETTING = "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value"
 
 
 def save_settings(data: dict[str, str]) -> None:
     """Atualiza somente os campos enviados pelo formulário atual."""
+    values = {key: data.get(key, "") for key in DEFAULT_SETTINGS if key in data}
+    set_settings_many(values)
+
+
+def set_settings_many(values: dict[str, str]) -> None:
+    """Várias chaves numa conexão só."""
+    if not values:
+        return
     with connect() as db:
-        for key in DEFAULT_SETTINGS:
-            if key in data:
-                db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, data.get(key, "")))
+        for key, value in values.items():
+            db.execute(_UPSERT_SETTING, (key, value))
+    _remember_settings(values)
 
 
 def set_setting(key: str, value: str) -> None:
-    with connect() as db:
-        db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+    set_settings_many({key: value})

@@ -14,7 +14,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus, urlparse
 from urllib.request import Request, urlopen
 
-from data.repository import connect, initialize, settings, save_settings, set_setting
+from data.dbutil import using_postgres
+from data.repository import connect, get_setting, initialize, settings, save_settings, set_setting, set_settings_many
 from data.secrets import SecretStore
 from jobs.apply_channels import apply_via_email, job_contact_emails, record_blocked
 from dates_br import BRASILIA, format_cycle_range, parse_utc
@@ -55,8 +56,9 @@ def _boot_usage_tracker() -> None:
     from integrations.usage_tracker import STORE_KEY, configure_persistence
 
     configure_persistence(
-        lambda: settings().get(STORE_KEY, "") or "",
+        lambda: get_setting(STORE_KEY, ""),
         lambda value: set_setting(STORE_KEY, value),
+        batched=using_postgres(),  # banco em rede: contadores em lote (1 leitura + 1 gravação por minuto)
     )
 
 
@@ -135,7 +137,7 @@ Job description:
     return letter
 
 
-_secrets = SecretStore(connect)
+_secrets = SecretStore(connect, cache_ttl=300.0 if using_postgres() else 0.0)
 secret_get = _secrets.get
 secret_set = _secrets.set
 get_ai_key = _secrets.get
@@ -145,7 +147,7 @@ def _tokenharbor_source() -> tuple[str, list[str]]:
     """Chave (cofre) e modelos gratuitos (painel) do último recurso; sem chave o fallback fica desligado."""
     from integrations.ai_client import parse_model_list
 
-    return get_ai_key("tokenharbor"), parse_model_list(settings().get("tokenharbor_fallback_models", ""))
+    return get_ai_key("tokenharbor"), parse_model_list(get_setting("tokenharbor_fallback_models", ""))
 
 
 def _install_tokenharbor_fallback() -> None:
@@ -557,11 +559,79 @@ def _claim_daily_worth_check(today: str) -> bool:
         return cur.rowcount == 1
 
 
+def _claim_daily_standby_sync(today: str) -> bool:
+    """Reivindica a cópia de hoje de forma atômica (várias instâncias não copiam em dobro)."""
+    with connect() as db:
+        cur = db.execute(
+            "UPDATE settings SET value=? WHERE key='standby_sync_last_daily' AND value < ?", (today, today))
+        return cur.rowcount == 1
+
+
+def _safe_db_error(exc: BaseException) -> str:
+    """Texto de erro sem host/usuário da conexão (os drivers costumam incluí-los)."""
+    from data.dbutil import describe_db_error
+
+    return describe_db_error(exc)[1] if exc.__class__.__name__.endswith("OperationalError") else exc.__class__.__name__
+
+
+def standby_status() -> dict:
+    configured = bool((os.environ.get("DATABASE_URL_STANDBY") or "").strip())
+    try:
+        last = json.loads(get_setting("standby_last_sync_json", "") or "null")
+    except (ValueError, TypeError):
+        last = None
+    return {"configured": configured, "last": last if isinstance(last, dict) else None}
+
+
+def run_standby_sync() -> dict:
+    """Copia o banco ativo para o standby e registra o resultado (aba Uso). Nunca levanta."""
+    from data.dbcopy import sync_standby
+
+    try:
+        summary = sync_standby()
+        result = {"ok": True, "at": now_iso(), "error": "", **summary}
+        log_event("success", "standby", f"Standby atualizado: {summary['rows']} linha(s) em {summary['seconds']}s.")
+    except Exception as exc:
+        result = {"ok": False, "at": now_iso(), "tables": {}, "rows": 0, "seconds": 0, "error": _safe_db_error(exc)}
+        log_event("error", "standby", f"Falha ao atualizar o standby: {result['error']}")
+    try:
+        set_setting("standby_last_sync_json", json.dumps(result, ensure_ascii=False))
+    except Exception:
+        LOG.debug("Não foi possível registrar o resultado do standby", exc_info=True)
+    return result
+
+
+STANDBY_SYNC_HOUR = 4  # horário de Brasília: depois da verificação diária das 03:00
+STANDBY_RETRY_SECONDS = 3600
+
+
+def _daily_standby_sync_loop() -> None:
+    """Uma cópia por dia para o standby, a partir das 04:00 (Brasília). Dorme entre as checagens, sem tocar no banco."""
+    handled_day = ""
+    retry_after = 0.0
+    while True:
+        try:
+            today = datetime.now(BRASILIA).date().isoformat()
+            if datetime.now(BRASILIA).hour >= STANDBY_SYNC_HOUR and today != handled_day and time.monotonic() >= retry_after:
+                if not _claim_daily_standby_sync(today):
+                    handled_day = today  # outra instância já cuidou de hoje
+                elif run_standby_sync()["ok"]:
+                    handled_day = today
+                else:
+                    retry_after = time.monotonic() + STANDBY_RETRY_SECONDS
+                    with connect() as db:  # libera a reivindicação para a próxima tentativa
+                        db.execute("UPDATE settings SET value='' WHERE key='standby_sync_last_daily' AND value=?", (today,))
+        except Exception as exc:
+            LOG.warning("Falha no agendador do standby: %s", _safe_db_error(exc))
+            retry_after = time.monotonic() + STANDBY_RETRY_SECONDS
+        time.sleep(600)
+
+
 def sync_portfolio_now(*, force: bool = False) -> dict:
     """Sincroniza o portfólio público (se houver URL). Nunca levanta; registra no log do painel."""
     from candidate.portfolio_source import sync_portfolio
 
-    url = (settings().get("portfolio_profile_url") or "").strip()
+    url = get_setting("portfolio_profile_url", "").strip()
     with connect() as db:
         result = sync_portfolio(db, url, force=force, now_iso=now_iso())
     if result["status"] == "updated":
@@ -574,13 +644,25 @@ def sync_portfolio_now(*, force: bool = False) -> dict:
 def _daily_worth_check_loop() -> None:
     """Queue one browser-free liveness pass per Brasília calendar day, after 03:00."""
     portfolio_day = ""
+    handled_day = ""  # dia já resolvido (reivindicado por esta ou outra instância): sem consultar o banco de novo até virar o dia
     while True:
         try:
             today = datetime.now(BRASILIA).date().isoformat()
             if today != portfolio_day:  # no boot e uma vez por dia; só reprocessa se a version do portfólio mudou
                 portfolio_day = today
                 sync_portfolio_now()
-            if datetime.now(BRASILIA).hour >= 3 and _claim_daily_worth_check(today):
+            claimed = False
+            if datetime.now(BRASILIA).hour >= 3 and today != handled_day:
+                claimed = _claim_daily_worth_check(today)
+                if not claimed:
+                    handled_day = today  # outra instância (ou execução anterior) já cuidou de hoje
+            if claimed:
+                try:
+                    purged = queue.purge_terminal_older_than(14)
+                    if purged:
+                        log_event("info", "queue", f"Retenção: {purged} item(ns) terminado(s) há mais de 14 dias removido(s).")
+                except Exception:
+                    LOG.debug("Falha ao aplicar a retenção da fila", exc_info=True)
                 try:
                     with connect() as db:
                         count = int(db.execute(
@@ -615,6 +697,7 @@ def _daily_worth_check_loop() -> None:
                     )
                 else:
                     log_event("info", "worth-check", "Verificação diária: nenhuma vaga para checar.")
+                handled_day = today
         except Exception as exc:
             LOG.exception("Falha ao agendar verificação diária de vagas: %s", exc)
         time.sleep(60)
@@ -626,6 +709,8 @@ def _boot_worth_check_scheduler() -> None:
         daemon=True,
         name="daily-worth-check-scheduler",
     ).start()
+    if (os.environ.get("DATABASE_URL_STANDBY") or "").strip():
+        threading.Thread(target=_daily_standby_sync_loop, daemon=True, name="daily-standby-sync").start()
 
 
 queue = JobQueue(
@@ -741,7 +826,7 @@ def apify_monthly_usage_usd(token: str) -> tuple[float, str]:
 def load_apify_quota_snapshot() -> dict:
     from integrations.usage_tracker import APIFY_SNAPSHOT_KEY
 
-    raw = (settings().get(APIFY_SNAPSHOT_KEY) or "").strip()
+    raw = get_setting(APIFY_SNAPSHOT_KEY, "").strip()
     if not raw:
         return {}
     try:
@@ -800,7 +885,7 @@ def fresh_apify_quota() -> dict:
 
 
 TOKENHARBOR_QUOTA_URL = "https://tokenharbor.ai/api/cli/free-tier"  # na raiz do site, não em /v1; não consome a cota
-TOKENHARBOR_QUOTA_CACHE_SECONDS = 15  # mesmo tempo do Cache-Control da API
+TOKENHARBOR_QUOTA_CACHE_SECONDS = 60  # a cota muda devagar; o botão "Atualizar" da tela força a consulta
 _th_quota_lock = threading.Lock()
 _th_quota_cache: tuple[float, dict] | None = None
 
@@ -835,9 +920,8 @@ def _fetch_apify_quota_snapshot() -> dict:
     from integrations.usage_tracker import APIFY_SNAPSHOT_KEY, parse_apify_limits
 
     token = secret_get("apify_token")
-    cfg = settings()
     try:
-        local_limit = float(str(cfg.get("apify_monthly_credit_limit_usd", "5")).replace(",", "."))
+        local_limit = float(get_setting("apify_monthly_credit_limit_usd", "5").replace(",", "."))
     except ValueError:
         local_limit = 5.0
     if not token:
@@ -856,9 +940,13 @@ def _fetch_apify_quota_snapshot() -> dict:
     try:
         payload = fetch_json(f"{APIFY_API}/users/me/limits", headers=apify_headers(token), timeout=30)
         snap = parse_apify_limits(payload if isinstance(payload, dict) else {}, local_limit_usd=local_limit)
-        # Alinha também o last_usage legado usado pelo coletor.
-        set_setting("apify_last_usage_usd", f"{snap['used_usd']:.4f}")
-        set_setting("apify_last_usage_cycle", snap.get("cycle_label") or "")
+        # Alinha também o last_usage legado usado pelo coletor; tudo numa gravação só (era 3 conexões).
+        set_settings_many({
+            "apify_last_usage_usd": f"{snap['used_usd']:.4f}",
+            "apify_last_usage_cycle": snap.get("cycle_label") or "",
+            APIFY_SNAPSHOT_KEY: json.dumps(snap, ensure_ascii=False),
+        })
+        return snap
     except Exception as exc:
         snap = {
             "used_usd": 0.0,
@@ -2185,7 +2273,7 @@ class Collector:
                 errors.append(f"{source}: {exc.__class__.__name__}")
                 log_event("error", "collector", f"Falha ao consultar {source}: {exc}")
         apply_note = ""
-        if not self.stop_event.is_set() and settings().get("auto_apply") == "1":
+        if not self.stop_event.is_set() and get_setting("auto_apply", "") == "1":
             self._set_progress(f"Triagem/candidatura automática… {found} vaga(s) nova(s).", found)
             log_event("info", "auto-apply", "Iniciando triagem/candidatura automática do ciclo.")
             apply_note = process_auto_apply_batch(self.max_apply)

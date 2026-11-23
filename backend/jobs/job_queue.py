@@ -24,6 +24,28 @@ ACTIVE_STATUSES = ("pending", "running", "retry_wait")
 TERMINAL_STATUSES = ("succeeded", "failed", "cancelled")
 # Teto absoluto do jitter de retry (evita intervalos de horas).
 BACKOFF_CAP_SECONDS = 20 * 60
+# Fila vazia: o dispatcher não consulta o banco a cada segundo (no Neon isso mantém o compute ligado 24h e
+# esgota a cota do mês). Dorme até o próximo job agendado, no máximo este tempo; enqueue()/retry acordam na hora.
+IDLE_POLL_SECONDS = 3600  # só uma rede de segurança: enqueue, retry e o fim de um job acordam o dispatcher na hora
+MIN_WAIT_SECONDS = 1.0
+# Falha de cota/indisponibilidade da IA: pausa os jobs desse tipo por este intervalo (limites), em vez de cada job
+# da fila abrir ~15 conexões só para falhar de novo.
+KIND_PAUSE_MIN_SECONDS = 30
+KIND_PAUSE_MAX_SECONDS = 600
+ERROR_BACKOFF_MAX_SECONDS = 300  # banco fora do ar: espera crescente em vez de martelar a cada segundo
+PROGRESS_FLUSH_SECONDS = 5.0  # linhas de progresso são agrupadas: 1 gravação a cada 5 s em vez de 1 conexão por linha
+WORKERS_CACHE_SECONDS = 30.0
+
+
+PROGRESS_TAIL_CHARS = 600
+# Listagem do painel: sem o progress_log inteiro (até 12 KB por item, ~1 MB a cada consulta), só a cauda.
+QUEUE_LIST_SQL = (
+    "SELECT id, kind, payload, status, attempts, max_attempts, next_run_at, expires_at, last_error, result, "
+    "created_at, updated_at, LENGTH(progress_log) AS progress_len, "
+    f"CASE WHEN LENGTH(progress_log) > {PROGRESS_TAIL_CHARS} "
+    f"THEN SUBSTR(progress_log, LENGTH(progress_log) - {PROGRESS_TAIL_CHARS - 1}) ELSE progress_log END AS progress_tail "
+    "FROM queue_jobs ORDER BY id DESC LIMIT ?"
+)
 
 
 def _utc_now() -> datetime:
@@ -91,6 +113,31 @@ class NonRetryableError(Exception):
     """Queue should mark failed immediately (no retry_wait)."""
 
 
+def ensure_queue_schema(db) -> None:
+    """Tabela da fila no SQLite (também usada ao preparar um SQLite de destino para cópia)."""
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS queue_jobs (
+          id INTEGER PRIMARY KEY,
+          kind TEXT NOT NULL,
+          payload TEXT NOT NULL,
+          status TEXT NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          max_attempts INTEGER NOT NULL DEFAULT 40,
+          next_run_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          last_error TEXT NOT NULL DEFAULT '',
+          result TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        )"""
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS queue_jobs_status_idx ON queue_jobs(status, next_run_at)")
+    db.execute("CREATE INDEX IF NOT EXISTS queue_jobs_kind_idx ON queue_jobs(kind)")
+    cols = {row["name"] for row in db.execute("PRAGMA table_info(queue_jobs)")}
+    if "progress_log" not in cols:
+        db.execute("ALTER TABLE queue_jobs ADD COLUMN progress_log TEXT NOT NULL DEFAULT ''")
+
+
 
 class JobQueue:
     """Fila SQLite + pool de workers (padrão 3) para jobs de IA."""
@@ -109,6 +156,12 @@ class JobQueue:
         self._connect_fn = connect_fn
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._wake = threading.Event()  # enqueue/retry acordam o dispatcher ocioso
+        self._next_due_iso: str | None = None
+        self._paused_until: dict[str, float] = {}  # kind -> time.monotonic() em que volta a ser executado
+        self._progress_lock = threading.Lock()
+        self._progress_buffer: dict[int, list[str]] = {}
+        self._progress_flushed_at: dict[int, float] = {}
         self._dispatcher: threading.Thread | None = None
         self._executor: ThreadPoolExecutor | None = None
         self._inflight: dict[int, Future] = {}
@@ -122,33 +175,11 @@ class JobQueue:
         return open_connection(self.db_path, timeout=60.0)
 
     def _ensure_schema(self) -> None:
-        # Neon is provisioned with the complete schema before the app starts.
+        # No Postgres o schema vem de data/schema_postgres.sql (aplicado por repository.initialize).
         if using_postgres():
             return
         with self._connect() as db:
-            db.execute(
-                """CREATE TABLE IF NOT EXISTS queue_jobs (
-                  id INTEGER PRIMARY KEY,
-                  kind TEXT NOT NULL,
-                  payload TEXT NOT NULL,
-                  status TEXT NOT NULL,
-                  attempts INTEGER NOT NULL DEFAULT 0,
-                  max_attempts INTEGER NOT NULL DEFAULT 40,
-                  next_run_at TEXT NOT NULL,
-                  expires_at TEXT NOT NULL,
-                  last_error TEXT NOT NULL DEFAULT '',
-                  result TEXT NOT NULL DEFAULT '',
-                  created_at TEXT NOT NULL,
-                  updated_at TEXT NOT NULL
-                )"""
-            )
-            db.execute("CREATE INDEX IF NOT EXISTS queue_jobs_status_idx ON queue_jobs(status, next_run_at)")
-            db.execute("CREATE INDEX IF NOT EXISTS queue_jobs_kind_idx ON queue_jobs(kind)")
-            cols = {row["name"] for row in db.execute("PRAGMA table_info(queue_jobs)")}
-            if "progress_log" not in cols:
-                db.execute(
-                    "ALTER TABLE queue_jobs ADD COLUMN progress_log TEXT NOT NULL DEFAULT ''"
-                )
+            ensure_queue_schema(db)
 
     def _limits(self) -> tuple[int, int, int]:
         cfg = self.get_settings()
@@ -186,6 +217,7 @@ class JobQueue:
 
     def stop(self) -> None:
         self._stop.set()
+        self._wake.set()
         with self._lock:
             ex = self._executor
             self._executor = None
@@ -259,6 +291,7 @@ class JobQueue:
                 ).fetchone()
                 if existing:
                     log_event("info", "queue", f"Job #{existing['id']} ({kind}) já na fila; reutilizando.")
+                    self._wake.set()
                     return int(existing["id"])
         with self._connect() as db:
             row = db.execute(
@@ -281,10 +314,15 @@ class JobQueue:
             ).fetchone()
             job_id = int(row["id"])
         log_event("info", "queue", f"Enfileirado #{job_id} ({kind}).")
+        self._wake.set()
         return job_id
 
-    def append_progress(self, job_id: int | None, message: str, *, max_chars: int = 12000) -> None:
-        """Append-only na fila. Não apaga result/last_error. job_id None = no-op."""
+    def append_progress(self, job_id: int | None, message: str, *, max_chars: int = 12000, flush: bool = False) -> None:
+        """Append-only na fila. Não apaga result/last_error. job_id None = no-op.
+
+        As linhas ficam em memória e são gravadas em lote (a cada PROGRESS_FLUSH_SECONDS, ou já com flush=True):
+        cada gravação abre uma conexão com o banco, e uma linha por conexão consumia compute demais no Neon.
+        """
         if job_id is None:
             return
         try:
@@ -294,26 +332,41 @@ class JobQueue:
         text = re.sub(r"\s+", " ", str(message or "").strip())
         if not text:
             return
-        stamp = _utc_now().strftime("%H:%M:%S")
-        line = f"{stamp} {text[:1000]}"
-        with self._connect() as db:
-            row = db.execute(
-                "SELECT progress_log FROM queue_jobs WHERE id=?", (qid,)
-            ).fetchone()
-            if not row:
-                return
-            prev = str(row["progress_log"] or "")
-            merged = (prev + ("\n" if prev else "") + line).strip()
-            if len(merged) > max_chars:
-                merged = merged[-max_chars:]
-                # evita cortar no meio da primeira linha visível
-                nl = merged.find("\n")
-                if nl > 0:
-                    merged = merged[nl + 1 :]
-            db.execute(
-                "UPDATE queue_jobs SET progress_log=?, updated_at=? WHERE id=?",
-                (merged, _iso(_utc_now()), qid),
-            )
+        line = f"{_utc_now().strftime('%H:%M:%S')} {text[:1000]}"
+        with self._progress_lock:
+            self._progress_buffer.setdefault(qid, []).append(line)
+            due = flush or time.monotonic() - self._progress_flushed_at.get(qid, 0.0) >= PROGRESS_FLUSH_SECONDS
+        if due:
+            self.flush_progress(qid, max_chars=max_chars)
+
+    def flush_progress(self, job_id: int, *, max_chars: int = 12000) -> None:
+        """Grava as linhas pendentes de um job numa única conexão."""
+        with self._progress_lock:
+            lines = self._progress_buffer.pop(job_id, [])
+            self._progress_flushed_at[job_id] = time.monotonic()
+        if not lines:
+            return
+        try:
+            with self._connect() as db:
+                row = db.execute("SELECT progress_log FROM queue_jobs WHERE id=?", (job_id,)).fetchone()
+                if not row:
+                    return
+                prev = str(row["progress_log"] or "")
+                merged = (prev + ("\n" if prev else "") + "\n".join(lines)).strip()
+                if len(merged) > max_chars:
+                    merged = merged[-max_chars:]
+                    # evita cortar no meio da primeira linha visível
+                    nl = merged.find("\n")
+                    if nl > 0:
+                        merged = merged[nl + 1 :]
+                db.execute(
+                    "UPDATE queue_jobs SET progress_log=?, updated_at=? WHERE id=?",
+                    (merged, _iso(_utc_now()), job_id),
+                )
+        except Exception:
+            with self._progress_lock:  # banco indisponível: guarda as linhas para a próxima tentativa
+                self._progress_buffer[job_id] = lines + self._progress_buffer.get(job_id, [])
+            raise
 
     def list_jobs(self, *, limit: int = 100, include_terminal: bool = True) -> list[sqlite3.Row]:
         limit = max(1, min(300, limit))
@@ -372,6 +425,7 @@ class JobQueue:
             ok = cur.rowcount > 0
         if ok:
             log_event("info", "queue", f"Job #{job_id} reenfileirado para execução imediata.")
+            self._wake.set()
         return ok
 
     def retry_all(self, *, statuses: tuple[str, ...] = ("failed", "cancelled", "retry_wait", "running")) -> int:
@@ -400,7 +454,18 @@ class JobQueue:
             n = int(cur.rowcount or 0)
         if n:
             log_event("info", "queue", f"{n} job(s) reenfileirado(s) em lote.")
+            self._wake.set()
         return n
+
+    def purge_terminal_older_than(self, days: int = 14) -> int:
+        """Retenção: itens terminados (com histórico de até 12 KB cada) não ficam para sempre na tabela."""
+        cutoff = _iso(_utc_now() - timedelta(days=days))
+        with self._connect() as db:
+            cur = db.execute(
+                "DELETE FROM queue_jobs WHERE status IN ('succeeded','failed','cancelled') AND updated_at < ?",
+                (cutoff,),
+            )
+            return int(cur.rowcount or 0)
 
     def clear_terminal(self) -> int:
         with self._connect() as db:
@@ -413,13 +478,31 @@ class JobQueue:
 
     def counts(self) -> dict[str, int]:
         with self._connect() as db:
-            rows = db.execute("SELECT status, COUNT(*) AS n FROM queue_jobs GROUP BY status").fetchall()
+            return self.counts_in(db)
+
+    @staticmethod
+    def counts_in(db) -> dict[str, int]:
+        rows = db.execute("SELECT status, COUNT(*) AS n FROM queue_jobs GROUP BY status").fetchall()
         return {row["status"]: int(row["n"]) for row in rows}
+
+    def _active_pauses(self) -> dict[str, float]:
+        now = time.monotonic()
+        with self._lock:
+            for kind in [kind for kind, until in self._paused_until.items() if until <= now]:
+                del self._paused_until[kind]
+            return dict(self._paused_until)
+
+    def _pause_kind(self, kind: str, seconds: float) -> None:
+        seconds = max(KIND_PAUSE_MIN_SECONDS, min(KIND_PAUSE_MAX_SECONDS, seconds))
+        with self._lock:
+            self._paused_until[kind] = max(self._paused_until.get(kind, 0.0), time.monotonic() + seconds)
 
     def _claim_batch(self, limit: int) -> list[sqlite3.Row]:
         now = _utc_now()
         now_s = _iso(now)
         claimed: list[sqlite3.Row] = []
+        paused = sorted(self._active_pauses())
+        skip_sql = f" AND kind NOT IN ({','.join('?' * len(paused))})" if paused else ""
         with self._connect() as db:
             # Expire old jobs first.
             db.execute(
@@ -428,10 +511,10 @@ class JobQueue:
                 (now_s, now_s),
             )
             rows = db.execute(
-                """SELECT * FROM queue_jobs
-                   WHERE status IN ('pending','retry_wait') AND next_run_at <= ?
+                f"""SELECT * FROM queue_jobs
+                   WHERE status IN ('pending','retry_wait') AND next_run_at <= ?{skip_sql}
                    ORDER BY id ASC LIMIT ?""",
-                (now_s, limit),
+                (now_s, *paused, limit),
             ).fetchall()
             for row in rows:
                 if len(claimed) >= limit:
@@ -444,12 +527,36 @@ class JobQueue:
                 )
                 if cur.rowcount:
                     claimed.append(row)
+            # Mesma conexão: quando o dispatcher pode dormir até o próximo job agendado (retry_wait/pending futuro).
+            due = db.execute(
+                f"SELECT MIN(next_run_at) AS due FROM queue_jobs WHERE status IN ('pending','retry_wait'){skip_sql}",
+                tuple(paused),
+            ).fetchone()
+            self._next_due_iso = (due["due"] if due else None) or None
         return claimed
 
+    def _idle_wait_seconds(self) -> float:
+        """Quanto o dispatcher pode dormir: até o próximo job agendado ou o fim de uma pausa, no máximo IDLE_POLL_SECONDS."""
+        wait = float(IDLE_POLL_SECONDS)
+        due = _parse_iso(self._next_due_iso)
+        if due is not None:
+            wait = min(wait, (due - _utc_now()).total_seconds() + 0.5)
+        pauses = self._active_pauses()
+        if pauses:
+            wait = min(wait, min(pauses.values()) - time.monotonic() + 0.5)
+        return max(MIN_WAIT_SECONDS, wait)
+
     def _dispatch_loop(self) -> None:
+        workers, workers_read_at = 3, float("-inf")
+        error_delay = 0.0
         while not self._stop.is_set():
+            self._wake.clear()  # antes de olhar o banco: um enqueue durante o corpo do loop não se perde
+            delay = float(IDLE_POLL_SECONDS)
             try:
-                workers, _, _ = self._limits()
+                # A configuração é uma consulta ao banco: relê só de vez em quando, não a cada iteração.
+                if time.monotonic() - workers_read_at >= WORKERS_CACHE_SECONDS:
+                    workers, _, _ = self._limits()
+                    workers_read_at = time.monotonic()
                 with self._lock:
                     # Drop finished futures
                     done = [jid for jid, fut in self._inflight.items() if fut.done()]
@@ -459,18 +566,42 @@ class JobQueue:
                     capacity = max(0, workers - inflight)
                     executor = self._executor
                 if capacity and executor is not None:
-                    batch = self._claim_batch(capacity)
-                    for row in batch:
+                    for row in self._claim_batch(capacity):
                         job_id = int(row["id"])
                         fut = executor.submit(self._run_job, dict(row))
                         with self._lock:
                             self._inflight[job_id] = fut
+                # Sem polling: dorme até o próximo job agendado; um worker que termina, enqueue e retry acordam.
+                delay = self._idle_wait_seconds()
+                error_delay = 0.0
             except Exception:
-                LOG.exception("Falha no dispatcher da fila")
-                log_event("error", "queue", "Falha no dispatcher da fila.")
-            self._stop.wait(1.0)
+                workers_read_at = float("-inf")
+                error_delay = min(ERROR_BACKOFF_MAX_SECONDS, max(5.0, error_delay * 2))
+                delay = error_delay
+                LOG.exception("Falha no dispatcher da fila (nova tentativa em %.0fs)", delay)
+                try:
+                    log_event("error", "queue", f"Falha no dispatcher da fila (nova tentativa em {delay:.0f}s).")
+                except Exception:
+                    pass
+            self._wake.wait(delay)
 
     def _run_job(self, row: dict[str, Any]) -> None:
+        job_id = int(row["id"])
+        try:
+            self._run_job_inner(row)
+        finally:
+            try:
+                self.flush_progress(job_id)  # nenhuma linha fica pendente quando o job termina (ou é cancelado)
+            except Exception:
+                pass
+            with self._progress_lock:
+                self._progress_buffer.pop(job_id, None)
+                self._progress_flushed_at.pop(job_id, None)
+            with self._lock:
+                self._inflight.pop(job_id, None)  # libera a vaga antes de acordar o dispatcher
+            self._wake.set()  # há capacidade livre: o próximo job da fila pode começar já
+
+    def _run_job_inner(self, row: dict[str, Any]) -> None:
         job_id = int(row["id"])
         kind = str(row["kind"])
         attempts = int(row["attempts"]) + 1
@@ -499,7 +630,7 @@ class JobQueue:
         log_event("info", "queue", f"Executando #{job_id} ({kind}), tentativa {attempts}/{max_attempts}.")
         try:
             result = handler(payload) or "ok"
-            self.append_progress(job_id, f"concluído: {str(result)[:200]}")
+            self.append_progress(job_id, f"concluído: {str(result)[:200]}", flush=True)
             self._finish(job_id, "succeeded", attempts, "", str(result)[:1000])
             log_event("success", "queue", f"Job #{job_id} ({kind}) concluído.")
         except Exception as exc:
@@ -511,8 +642,10 @@ class JobQueue:
                 return
             if retryable and attempts < max_attempts and (expires is None or now < expires):
                 delay = backoff_seconds(attempts, rate_limited=is_rate_limit_error(exc))
+                if is_rate_limit_error(exc) or "aiunavailable" in exc.__class__.__name__.casefold():
+                    self._pause_kind(kind, delay)  # a IA está sem cota/fora: não deixa o resto da fila falhar em série
                 next_run = _iso(now + timedelta(seconds=delay))
-                self.append_progress(job_id, f"retry em ~{delay}s: {err[:180]}")
+                self.append_progress(job_id, f"retry em ~{delay}s: {err[:180]}", flush=True)
                 with self._connect() as db:
                     db.execute(
                         """UPDATE queue_jobs SET status='retry_wait', attempts=?, next_run_at=?, last_error=?, updated_at=?
@@ -525,7 +658,7 @@ class JobQueue:
                     f"Job #{job_id} ({kind}) em retry ({attempts}/{max_attempts}) em ~{delay}s: {err}",
                 )
             else:
-                self.append_progress(job_id, f"falhou: {err[:200]}")
+                self.append_progress(job_id, f"falhou: {err[:200]}", flush=True)
                 self._finish(job_id, "failed", attempts, err[:1000], "")
                 log_event("error", "queue", f"Job #{job_id} ({kind}) falhou em definitivo: {err}")
 

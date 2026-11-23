@@ -1,23 +1,19 @@
 import { useEffect, useRef, useState } from 'react'
 import { api, type CopilotAsk as PendingAsk } from './api'
 
-export function CopilotAsk({ notify }: { notify: (message: string, error?: boolean) => void }) {
-  const [ask, setAsk] = useState<PendingAsk | null>(null)
+// O pedido pendente chega dentro do /api/dashboard (sem polling próprio, que mantinha o banco acordado).
+export function CopilotAsk({ ask: incoming, notify, onResolved }: {
+  ask: PendingAsk | null
+  notify: (message: string, error?: boolean) => void
+  onResolved: () => void
+}) {
   const [answer, setAnswer] = useState('')
   const [file, setFile] = useState<File | null>(null)
   const [busy, setBusy] = useState(false)
+  const [resolvedId, setResolvedId] = useState<number | null>(null)
   const fileInput = useRef<HTMLInputElement>(null)
+  const ask = incoming && incoming.id !== resolvedId ? incoming : null
 
-  function refresh() {
-    if (document.hidden) return
-    api.pendingAsk().then(result => setAsk(result.ask)).catch(() => {})
-  }
-  useEffect(() => {
-    refresh()
-    const interval = window.setInterval(refresh, 3000)
-    document.addEventListener('visibilitychange', refresh)
-    return () => { window.clearInterval(interval); document.removeEventListener('visibilitychange', refresh) }
-  }, [])
   useEffect(() => { setAnswer(''); setFile(null); if (fileInput.current) fileInput.current.value = '' }, [ask?.id])
 
   async function respond() {
@@ -26,7 +22,7 @@ export function CopilotAsk({ notify }: { notify: (message: string, error?: boole
     try {
       const result = await api.answerAsk(ask.id, answer.trim(), file)
       notify(result.notice, !result.ok)
-      if (result.ok) { setAsk(null); refresh() }
+      if (result.ok) { setResolvedId(ask.id); onResolved() }
     } catch (err) { notify((err as Error).message, true) }
     finally { setBusy(false) }
   }
@@ -36,7 +32,7 @@ export function CopilotAsk({ notify }: { notify: (message: string, error?: boole
     try {
       const result = await api.askAction(ask.id, action)
       notify(result.notice, !result.ok)
-      if (result.ok) { setAsk(null); refresh() }
+      if (result.ok) { setResolvedId(ask.id); onResolved() }
     } catch (err) { notify((err as Error).message, true) }
     finally { setBusy(false) }
   }

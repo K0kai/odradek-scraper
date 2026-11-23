@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { api, type Assessment, type LogItem, type PortfolioStatus, type QueueData, type QueueItem, type ResumeRecord, type ResumesData, type UsageData } from './api'
+import { api, type Assessment, type LogItem, type PortfolioStatus, type QueueData, type QueueItem, type ResumeRecord, type ResumesData, type StandbyStatus, type UsageData } from './api'
+import { useIdlePolling } from './polling'
 import { formatDate } from './format'
 import { AssessmentView } from './JobCard'
 import { apifyUsage, QuotaBar, TokenHarborCard } from './Quota'
@@ -15,17 +16,13 @@ const statuses: Record<string, string> = {
   succeeded: 'Concluído', failed: 'Falhou', cancelled: 'Cancelado',
 }
 
-function usePolling<T>(loader: () => Promise<T>, setData: (value: T) => void, setError: (error: string) => void, delay: number) {
+// Consulta ao abrir e a cada `delay` ms (null = só ao abrir/manual); para sozinha com a aba parada (ver polling.ts).
+function usePolling<T>(loader: () => Promise<T>, setData: (value: T) => void, setError: (error: string) => void, delay: number | null) {
   const refresh = useCallback(() => {
     if (document.hidden) return
     loader().then(data => { setData(data); setError('') }).catch(error => setError(error.message))
   }, [loader, setData, setError])
-  useEffect(() => {
-    refresh()
-    const timer = window.setInterval(refresh, delay)
-    document.addEventListener('visibilitychange', refresh)
-    return () => { window.clearInterval(timer); document.removeEventListener('visibilitychange', refresh) }
-  }, [refresh, delay])
+  useIdlePolling(refresh, delay)
   return refresh
 }
 
@@ -69,6 +66,24 @@ function QueueDecisionView({ item }: { item: QueueItem }) {
   </div>
 }
 
+// A lista traz só o final do histórico; o completo é buscado quando o usuário abre o card (e acompanhado se estiver rodando).
+function QueueProgress({ item }: { item: QueueItem }) {
+  const [open, setOpen] = useState(item.status === 'running')
+  const [full, setFull] = useState<string | null>(null)
+  const [error, setError] = useState('')
+  const wantsFull = open && !!item.progress_more
+  const load = useCallback(() => {
+    api.queueProgress(item.id).then(result => { setFull(result.progress); setError('') }).catch(err => setError(err.message))
+  }, [item.id])
+  useIdlePolling(load, wantsFull && item.status === 'running' ? 10000 : null)
+  useEffect(() => { if (wantsFull && item.status !== 'running') load() }, [wantsFull, item.status, load])
+  const text = wantsFull && full !== null ? full : item.progress
+  return <details open={open} onToggle={event => setOpen((event.currentTarget as HTMLDetailsElement).open)}>
+    <summary>Histórico do processamento{item.progress_more && !(wantsFull && full !== null) ? ' (parcial)' : ''}</summary>
+    {error && <p className="inline-message">{error}</p>}<pre>{text}</pre>
+  </details>
+}
+
 function QueueCard({ item, statusLabels, action }: { item: QueueItem; statusLabels: Record<string, string>; action: (id: number, name: 'cancel' | 'retry') => Promise<void> }) {
   const [busy, setBusy] = useState(false)
   async function run(name: 'cancel' | 'retry') { setBusy(true); try { await action(item.id, name) } finally { setBusy(false) } }
@@ -77,7 +92,7 @@ function QueueCard({ item, statusLabels, action }: { item: QueueItem; statusLabe
     <div className="operation-meta"><span>Tentativas: {item.attempts}/{item.max_attempts}</span>{item.next_run_at && <span>Próxima: {formatDate(item.next_run_at, true)}</span>}</div>
     <QueueDecisionView item={item} />
     {item.last_step && <p>{item.last_step}</p>}{item.outcome && <p className="operation-outcome">{item.outcome}</p>}
-    {item.progress && <details open={item.status === 'running'}><summary>Histórico do processamento</summary><pre>{item.progress}</pre></details>}
+    {item.progress && <QueueProgress item={item} />}
     <div className="job-actions">{['pending', 'running', 'retry_wait'].includes(item.status) && <button className="secondary" disabled={busy} onClick={() => run('cancel')}>Cancelar</button>}{item.kind !== 'linkedin_apply' && ['running', 'retry_wait', 'failed', 'cancelled'].includes(item.status) && <button className="secondary" disabled={busy} onClick={() => run('retry')}>Reenfileirar</button>}</div>
   </article>
 }
@@ -87,7 +102,7 @@ export function QueueView({ notify, statusLabels }: { notify: (message: string, 
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const [confirmClear, setConfirmClear] = useState(false)
-  const refresh = usePolling(api.queue, setData, setError, 6000)
+  const refresh = usePolling(api.queue, setData, setError, data?.items.some(item => item.status === 'running') ? 10000 : 30000)
   async function action(name: 'retry-all' | 'evaluate-new' | 'clear') {
     if (name === 'clear' && !confirmClear) { setConfirmClear(true); return }
     setBusy(true)
@@ -111,7 +126,7 @@ export function LogsView({ notify }: { notify: (message: string, error?: boolean
   const [busy, setBusy] = useState(false)
   const [confirmClear, setConfirmClear] = useState(false)
   const loader = useCallback(() => api.logs().then(result => result.items), [])
-  const refresh = usePolling(loader, setData, setError, 8000)
+  const refresh = usePolling(loader, setData, setError, 30000)
   async function clear() {
     if (!confirmClear) { setConfirmClear(true); return }
     setBusy(true)
@@ -125,11 +140,28 @@ export function LogsView({ notify }: { notify: (message: string, error?: boolean
   </section>
 }
 
+function StandbyCard({ standby, notify, onDone }: { standby?: StandbyStatus; notify: (message: string, error?: boolean) => void; onDone: () => void }) {
+  const [busy, setBusy] = useState(false)
+  if (!standby?.configured) return null
+  const last = standby.last
+  async function sync() {
+    setBusy(true)
+    try { const result = await api.standbySync(); notify(result.notice, !result.ok) }
+    catch (err) { notify((err as Error).message, true) }
+    finally { setBusy(false); onDone() }
+  }
+  return <article className="usage-card-new"><p className="eyebrow">BANCO STANDBY</p><h3>Cópia de segurança</h3>
+    {last ? <><div className="usage-big">{last.ok ? 'Em dia' : 'Com falha'} <small>{formatDate(last.at, true)}</small></div>
+      <p className="usage-caption">{last.ok ? `${last.rows} linha(s) em ${last.seconds}s.` : last.error}</p></> : <p className="usage-caption">Nenhuma cópia feita ainda. A rotina diária roda de madrugada.</p>}
+    <div className="job-actions"><button className="secondary" disabled={busy} onClick={sync}>{busy ? 'Copiando…' : 'Sincronizar standby agora'}</button></div>
+  </article>
+}
+
 export function UsageView({ notify }: { notify: (message: string, error?: boolean) => void }) {
   const [data, setData] = useState<UsageData | null>(null)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
-  const refresh = usePolling(api.usage, setData, setError, 15000)  // o servidor limita as consultas externas (15 s com coleta ativa, 5 min parado)
+  const refresh = usePolling(api.usage, setData, setError, 60000)  // o servidor limita as consultas externas (15 s com coleta ativa, 5 min parado)
   async function update() {
     setBusy(true)
     try { const result = await api.refreshUsage(); setData(result.usage); notify(result.notice, !result.ok) }
@@ -142,6 +174,7 @@ export function UsageView({ notify }: { notify: (message: string, error?: boolea
     {error && <p className="banner error" role="alert">{error} <button onClick={refresh}>Tentar novamente</button></p>}
     {!data ? <p className="empty">Carregando uso…</p> : <div className="usage-grid-new"><article className="usage-card-new"><p className="eyebrow">APIFY</p><h3>Consumo do ciclo</h3>{apify?.error && <p className="inline-message">{apify.error}</p>}<div className="usage-big">US$ {used.toFixed(2)} <small>de US$ {limit.toFixed(2)}</small></div><QuotaBar percent={percent} label="Consumo da cota Apify" /><p className="usage-caption">{percent.toFixed(0)}% do limite · {apify?.cycle_label || 'Ciclo não informado'}</p><p className="usage-caption">Atualiza sozinha. Última consulta: {formatDate(apify?.fetched_at || null, true)}</p></article>
       <TokenHarborCard quota={data.tokenharbor} />
+      <StandbyCard standby={data.standby} notify={notify} onDone={refresh} />
       <article className="usage-card-new"><p className="eyebrow">INTELIGÊNCIA ARTIFICIAL</p><h3>{data.provider === 'gemini' ? 'Gemini' : data.provider === 'openai' ? 'OpenAI' : data.provider} <small>{data.model}</small></h3><p className="usage-caption">Estimativa local das chamadas feitas por este aplicativo.</p><div className="usage-metrics-new"><div><span>Chamadas hoje</span><strong>{data.ai.day.calls_ok || 0}</strong></div><div><span>Erros de quota hoje</span><strong>{data.ai.day.calls_quota_error || 0}</strong></div><div><span>Tokens hoje</span><strong>{data.ai.day.tokens_in || 0} / {data.ai.day.tokens_out || 0}</strong></div><div><span>Chamadas no mês</span><strong>{data.ai.month.calls_ok || 0}</strong></div><div><span>Tokens no mês</span><strong>{data.ai.month.tokens_in || 0} / {data.ai.month.tokens_out || 0}</strong></div></div></article></div>}
   </section></>
 }
@@ -210,7 +243,8 @@ function PortfolioCard({ notify }: { notify: (message: string, error?: boolean) 
   const [status, setStatus] = useState<PortfolioStatus | null>(null)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
-  const refresh = usePolling(api.portfolio, setStatus, setError, 30000)
+  const refresh = usePolling(api.portfolio, setStatus, setError, null)  // sob demanda: só ao abrir e ao sincronizar
+  useEffect(() => { refresh() }, [refresh])
   async function sync() {
     setBusy(true)
     try { const result = await api.syncPortfolio(); setStatus(result.status); notify(result.notice, !result.ok) }
@@ -228,7 +262,7 @@ function PortfolioCard({ notify }: { notify: (message: string, error?: boolean) 
 export function ResumesView({ notify }: { notify: (message: string, error?: boolean) => void }) {
   const [data, setData] = useState<ResumesData | null>(null)
   const [error, setError] = useState('')
-  const refresh = usePolling(api.resumes, setData, setError, 10000)
+  const refresh = usePolling(api.resumes, setData, setError, 60000)  // após enviar/reanalisar o card chama refresh()
   return <section className="section"><div className="section-head"><div><p className="eyebrow">PERFIL PROFISSIONAL</p><h2>Currículos</h2></div><button className="secondary" onClick={refresh}>Atualizar</button></div>
     {error && <p className="banner error" role="alert">{error} <button onClick={refresh}>Tentar novamente</button></p>}
     {!data ? <p className="empty">Carregando currículos…</p> : <div className="resume-grid"><ResumeCard language="pt" record={data.pt} refresh={refresh} notify={notify} /><ResumeCard language="en" record={data.en} refresh={refresh} notify={notify} /><PortfolioCard notify={notify} /></div>}

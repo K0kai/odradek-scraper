@@ -10,9 +10,9 @@ from app import (
 )
 from integrations.ai_client import split_model_label
 from jobs.apply_channels import job_contact_emails
+from jobs.job_queue import QUEUE_LIST_SQL
 from jobs.job_filters import _worth_match_expr, normalize_worth_sort, worth_date_bounds_utc, worth_order_sql
 from web.panel_log import list_logs
-from candidate.resume_pipeline import get_resume
 
 
 JOB_SELECT = (
@@ -68,16 +68,35 @@ def _job_api_record(row) -> dict:
     return data
 
 
+# A visão geral só mostra título, link, empresa, local e status: sem descrição, carta nem auditoria (centenas de KB
+# por consulta, a cada poll). Os campos pesados seguem no contrato, vazios.
+DASHBOARD_JOB_SELECT = (
+    "SELECT jobs.id, jobs.title, jobs.company, jobs.location, jobs.source, jobs.url, "
+    "jobs.posted_at, jobs.first_seen_at, jobs.status FROM jobs "
+)
+
+
+def _dashboard_job_record(row) -> dict:
+    data = dict(row)
+    if urlparse(data.get("url") or "").scheme not in {"http", "https"}:
+        data["url"] = ""
+    return {**data, "description": "", "notes": "", "cover_letter": "", "has_cover_letter": False,
+            "match_score": None, "assessment": None, "contact_emails": []}
+
+
 def dashboard_api_payload() -> dict:
+    from jobs.copilot_asks import pending_ask_in
+
     with connect() as db:
         counts = {row["status"]: row["n"] for row in db.execute("SELECT status, COUNT(*) n FROM jobs GROUP BY status")}
-        rows = db.execute(JOB_SELECT + "ORDER BY jobs.first_seen_at DESC LIMIT 20").fetchall()
+        rows = db.execute(DASHBOARD_JOB_SELECT + "ORDER BY jobs.first_seen_at DESC LIMIT 10").fetchall()
         runs = [dict(row) for row in db.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 8")]
+        ask = pending_ask_in(db)  # o modal do assistente deixou de ter polling próprio (era 1 conexão a cada 3 s)
     state = collector.snapshot()
-    # Só lê o cache (o coletor o atualiza a cada ~15 s): este endpoint é consultado a cada 6 s e não deve chamar a Apify.
+    # Só lê o cache (o coletor o atualiza a cada ~15 s): este endpoint é consultado com frequência e não deve chamar a Apify.
     quota = load_apify_quota_snapshot() if state.get("state") in ("running", "stopping") else None
-    return {"counts": counts, "jobs": [{**_job_api_record(row), "description": "", "notes": "", "assessment": None} for row in rows], "runs": runs,
-            "collector": state, "status_labels": STATUSES, "apify_quota": quota}
+    return {"counts": counts, "jobs": [_dashboard_job_record(row) for row in rows], "runs": runs,
+            "collector": state, "status_labels": STATUSES, "apify_quota": quota, "pending_ask": ask}
 
 
 def jobs_api_payload(*, page: int = 1, page_size: int = 15, status: str = "worth",
@@ -272,24 +291,41 @@ def _queue_decision(decision: dict | None) -> dict | None:
 
 
 def queue_api_payload() -> dict:
-    records = [dict(row) for row in queue.list_jobs(limit=100)]
-    payloads = [_queue_payload_of(record) for record in records]
+    # Uma conexão só: lista (sem o histórico completo), contagens e contexto das vagas.
     with connect() as db:
+        records = [dict(row) for row in db.execute(QUEUE_LIST_SQL, (100,)).fetchall()]
+        counts = queue.counts_in(db)
+        payloads = [_queue_payload_of(record) for record in records]
         jobs, decisions = _queue_job_context(db, _queue_job_ids(payloads))
     items = []
     for record, payload in zip(records, payloads):
-        progress = (record.get("progress_log") or "").splitlines()
+        tail = (record.get("progress_tail") or "")
+        truncated = int(record.get("progress_len") or 0) > len(tail)
+        lines = tail.splitlines()
+        if truncated and lines:
+            lines = lines[1:]  # a primeira linha da cauda pode estar cortada ao meio
         subject = _queue_subject(str(record.get("kind") or ""), payload, jobs)
         job_id = subject.get("job_id") if subject and subject["type"] == "job" else None
         items.append({key: record.get(key) for key in (
             "id", "kind", "status", "attempts", "max_attempts", "next_run_at",
             "created_at", "updated_at",
-        )} | {"last_step": (progress[-1] if progress else "")[:280],
-             "progress": "\n".join(progress[-80:])[-8000:],
+        )} | {"last_step": (lines[-1] if lines else "")[:280],
+             "progress": "\n".join(lines),
+             "progress_more": truncated,  # há mais no histórico: o card busca em /api/queue/{id}/progress ao abrir
              "outcome": (record.get("last_error") or record.get("result") or "")[:500],
              "subject": subject,
              "decision": _queue_decision(decisions.get(job_id)) if job_id else None})
-    return {"counts": queue.counts(), "items": items}
+    return {"counts": counts, "items": items}
+
+
+def queue_progress_api_payload(queue_id: int) -> dict | None:
+    """Histórico completo (últimas 80 linhas / 8000 caracteres) de um item da fila; None se não existir."""
+    with connect() as db:
+        row = db.execute("SELECT progress_log FROM queue_jobs WHERE id=?", (queue_id,)).fetchone()
+    if not row:
+        return None
+    lines = (row["progress_log"] or "").splitlines()
+    return {"progress": "\n".join(lines[-80:])[-8000:]}
 
 
 def queue_item_detail_api_payload(queue_id: int) -> dict | None:
@@ -314,12 +350,18 @@ def logs_api_payload(limit: int = 200) -> dict:
 
 
 def usage_api_payload() -> dict:
-    from integrations.usage_tracker import STORE_KEY, load_store, summarize_ai_usage
+    from integrations.usage_tracker import STORE_KEY, flush_pending, load_store, summarize_ai_usage
 
+    try:
+        flush_pending()  # contadores em lote: a tela mostra também o que ainda estava em memória
+    except Exception:
+        pass
     cfg = settings()
     provider = (cfg.get("ai_provider") or "gemini").casefold()
     store = load_store(cfg.get(STORE_KEY) or "")
-    return {"provider": provider, "model": cfg.get("ai_model") or "",
+    from app import standby_status
+
+    return {"provider": provider, "model": cfg.get("ai_model") or "", "standby": standby_status(),
             "apify": fresh_apify_quota(),  # atualiza sozinha: 15 s com coleta ativa, 5 min parado
             "tokenharbor": tokenharbor_quota_snapshot(),
             "ai": summarize_ai_usage(store, provider=provider)}
@@ -327,7 +369,13 @@ def usage_api_payload() -> dict:
 
 def resumes_api_payload() -> dict:
     with connect() as db:
-        rows = {lang: get_resume(db, lang) for lang in ("pt", "en")}
+        # Só o que a tela usa: o texto extraído do PDF (dezenas de KB) não vai para o navegador.
+        found = db.execute(
+            "SELECT language, original_filename, analysis_status, analysis_message, analysis_error, analysis_summary, "
+            "analysis_json, analyzed_at, provider, model FROM resumes WHERE language IN ('pt','en')"
+        ).fetchall()
+    rows = {lang: None for lang in ("pt", "en")}
+    rows.update({row["language"]: row for row in found})
     result = {}
     for lang, row in rows.items():
         result[lang] = None if row is None else {

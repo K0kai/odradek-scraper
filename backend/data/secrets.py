@@ -1,5 +1,7 @@
 """Secret storage with encrypted database and local keyring fallbacks."""
 import os
+import threading
+import time
 from typing import Callable
 
 
@@ -17,8 +19,20 @@ SECRET_MASTER_KEY_ENV = "SECRET_ENCRYPTION_KEY"
 
 
 class SecretStore:
-    def __init__(self, connect: Callable):
+    def __init__(self, connect: Callable, *, cache_ttl: float = 0.0):
         self._connect = connect
+        # cache_ttl > 0 (banco em rede): a leitura do banco, decifrada, fica em memória; antes cada chamada abria
+        # uma conexão (2 por consulta de cota, 1 por avaliação/carta). set() invalida. Env/keyring não entram no cache.
+        self._cache_ttl = cache_ttl
+        self._cache: dict[str, tuple[str | None, float]] = {}
+        self._lock = threading.Lock()
+
+    def invalidate(self, name: str | None = None) -> None:
+        with self._lock:
+            if name is None:
+                self._cache.clear()
+            else:
+                self._cache.pop(name.casefold(), None)
 
     def _secret_from_environment(self, name: str) -> str:
         for env_name in SECRET_ENV_VARS.get(name.casefold(), ()):
@@ -77,6 +91,7 @@ class SecretStore:
                     "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
                     (db_key, encrypted),
                 )
+            self.invalidate(name)
             return
         if os.environ.get("RENDER"):
             raise RuntimeError(
@@ -92,8 +107,29 @@ class SecretStore:
             ) from exc
 
 
+    def _stored(self, name: str) -> str | None:
+        """Valor salvo no banco (None = não há), com cache. Banco fora do ar: usa o último valor conhecido, se houver."""
+        key = name.casefold()
+        now = time.monotonic()
+        with self._lock:
+            hit = self._cache.get(key)
+        if hit is not None and self._cache_ttl > 0 and now - hit[1] < self._cache_ttl:
+            return hit[0]
+        try:
+            stored = self._secret_from_database(name)
+        except RuntimeError:
+            raise  # chave mestra ausente/errada: erro de configuração, não de conexão
+        except Exception:
+            if hit is not None:
+                return hit[0]
+            return None  # sem banco e sem cache: cai para variável de ambiente/cofre local em vez de derrubar a chamada
+        if self._cache_ttl > 0:
+            with self._lock:
+                self._cache[key] = (stored, now)
+        return stored
+
     def get(self, name: str) -> str:
-        stored = self._secret_from_database(name)
+        stored = self._stored(name)
         if stored is not None:
             return stored
         return self._secret_from_environment(name) or self._secret_from_keyring(name)

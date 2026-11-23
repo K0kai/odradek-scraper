@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -266,12 +267,48 @@ def record_from_ai_result(
 
 
 _PERSIST: tuple[Callable[[], str], Callable[[str], None]] | None = None
+# Banco em rede: cada chamada de IA virava 2 conexões (ler a tabela de settings + gravar o JSON). Com batched=True
+# os incrementos ficam em memória e saem juntos (1 leitura + 1 gravação) a cada FLUSH_INTERVAL_SECONDS, ao abrir a
+# tela de uso (flush_pending) e no shutdown.
+_BATCHED = False
+FLUSH_INTERVAL_SECONDS = 60.0
+_PENDING: list[dict[str, Any]] = []
+_LAST_FLUSH = 0.0
+_PENDING_LOCK = threading.Lock()
 
 
-def configure_persistence(get_raw: Callable[[], str], set_raw: Callable[[str], None]) -> None:
+def configure_persistence(
+    get_raw: Callable[[], str], set_raw: Callable[[str], None], *, batched: bool = False
+) -> None:
     """Liga o tracker ao store de settings do app (evita import circular)."""
-    global _PERSIST
+    global _PERSIST, _BATCHED, _LAST_FLUSH
     _PERSIST = (get_raw, set_raw)
+    _BATCHED = batched
+    _LAST_FLUSH = time.monotonic()  # a primeira gravação em lote só ocorre FLUSH_INTERVAL_SECONDS depois
+
+
+def flush_pending() -> None:
+    """Grava os incrementos acumulados numa única leitura + gravação. Seguro chamar sem nada pendente."""
+    global _LAST_FLUSH
+    if _PERSIST is None:
+        return
+    with _PENDING_LOCK:
+        pending = list(_PENDING)
+        _PENDING.clear()
+        _LAST_FLUSH = time.monotonic()
+    if not pending:
+        return
+    get_raw, set_raw = _PERSIST
+    try:
+        with _LOCK:
+            store = load_store(get_raw())
+            for item in pending:
+                record_ai_call(store, **item)
+            set_raw(dump_store(store))
+    except Exception:
+        with _PENDING_LOCK:  # banco indisponível: não perde a contagem, tenta no próximo flush
+            _PENDING[:0] = pending[-500:]
+        raise
 
 
 def try_record_ai_result(
@@ -286,6 +323,15 @@ def try_record_ai_result(
     if _PERSIST is None:
         return
     try:
+        if _BATCHED:
+            tin, tout = extract_tokens(provider, result)
+            with _PENDING_LOCK:
+                _PENDING.append(dict(provider=provider, model=model, tokens_in=tin, tokens_out=tout,
+                                     ok=ok, quota_error=quota_error, now=_utc_now()))
+                due = time.monotonic() - _LAST_FLUSH >= FLUSH_INTERVAL_SECONDS
+            if due:
+                flush_pending()
+            return
         get_raw, set_raw = _PERSIST
         record_from_ai_result(
             get_raw=get_raw,

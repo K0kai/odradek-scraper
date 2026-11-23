@@ -24,6 +24,10 @@ class AppDbCase(unittest.TestCase):
         self.env.start(); self.addCleanup(self.env.stop)
         self.settings = patch.multiple(repository, DB_PATH=root / "test.db", RESUMES_DIR=str(root / "resumes"))
         self.settings.start(); self.addCleanup(self.settings.stop)
+        # log_event grava em panel_log.DB_PATH: sem isto os testes escreviam no event_logs do jobs.db real.
+        from web import panel_log
+        self.log_db = patch.object(panel_log, "DB_PATH", str(root / "test.db"))
+        self.log_db.start(); self.addCleanup(self.log_db.stop)
         repository.initialize()
         key = patch.object(app, "get_ai_key", return_value="test-key")
         key.start(); self.addCleanup(key.stop)

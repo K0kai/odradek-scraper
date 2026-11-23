@@ -86,18 +86,23 @@ def create_ask(
 def get_pending_ask(connect_fn: ConnectFn) -> dict | None:
     """Ask visível no painel: só pending (ainda sem resposta do humano)."""
     with connect_fn() as db:
-        # Asks antigos em awaiting_ai (spinner eterno) → fecha na leitura.
-        db.execute(
-            "UPDATE copilot_asks SET status=?, hint=? WHERE status=?",
-            (STATUS_ANSWERED, "", STATUS_AWAITING_AI),
-        )
-        row = db.execute(
-            f"""SELECT id, job_id, question, status, answer, hint, kind, file_path, created_at
-               FROM copilot_asks
-               WHERE status IN ({','.join('?' * len(PANEL_OPEN_STATUSES))})
-               ORDER BY id DESC LIMIT 1""",
-            PANEL_OPEN_STATUSES,
-        ).fetchone()
+        return pending_ask_in(db)
+
+
+def pending_ask_in(db) -> dict | None:
+    """Mesma leitura, numa conexão que o chamador já abriu (o dashboard embute o ask e economiza um poll)."""
+    # Asks antigos em awaiting_ai (spinner eterno) → fecha na leitura.
+    db.execute(
+        "UPDATE copilot_asks SET status=?, hint=? WHERE status=?",
+        (STATUS_ANSWERED, "", STATUS_AWAITING_AI),
+    )
+    row = db.execute(
+        f"""SELECT id, job_id, question, status, answer, hint, kind, file_path, created_at
+           FROM copilot_asks
+           WHERE status IN ({','.join('?' * len(PANEL_OPEN_STATUSES))})
+           ORDER BY id DESC LIMIT 1""",
+        PANEL_OPEN_STATUSES,
+    ).fetchone()
     if not row:
         return None
     return {

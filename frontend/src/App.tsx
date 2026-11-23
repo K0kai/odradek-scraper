@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
-import { api, type Dashboard, type JobFilters, type JobList } from './api'
+import { api, subscribeDatabaseNotice, type Dashboard, type DatabaseNotice, type JobFilters, type JobList } from './api'
+import { useIdlePolling } from './polling'
 import { AssistantView, LogsView, QueueView, ResumesView, UsageView } from './Operations'
 import { CopilotAsk } from './CopilotAsk'
 import { ApifyQuotaStrip } from './Quota'
@@ -29,14 +30,14 @@ function readLocation(): { view: View; filters: JobFilters } {
   }
 }
 
-function useVisiblePolling(callback: () => void, delay: number, key: string) {
-  useEffect(() => {
-    const tick = () => { if (!document.hidden) callback() }
-    tick()
-    const interval = window.setInterval(tick, delay)
-    document.addEventListener('visibilitychange', tick)
-    return () => { window.clearInterval(interval); document.removeEventListener('visibilitychange', tick) }
-  }, [callback, delay, key])
+function DatabaseBanner() {
+  const [notice, setNotice] = useState<DatabaseNotice | null>(null)
+  useEffect(() => subscribeDatabaseNotice(setNotice), [])
+  if (!notice) return null
+  const when = notice.asOf ? new Date(notice.asOf).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }) : ''
+  return <div className="banner error" role="alert">
+    Banco de dados indisponível{notice.message ? ` — ${notice.message}` : ''}. Mostrando os dados{when ? ` de ${when}` : ' mais recentes'}; alterações ficam desativadas até a conexão voltar.
+  </div>
 }
 
 export function App() {
@@ -51,7 +52,10 @@ export function App() {
   const [busy, setBusy] = useState(false)
   const [authRequired, setAuthRequired] = useState(false)
   const [revision, setRevision] = useState(0)
+  const [visited, setVisited] = useState<Set<View>>(() => new Set([initial.view]))
   const statusLabels = dashboard?.status_labels || {}
+
+  useEffect(() => { setVisited(old => old.has(view) ? old : new Set(old).add(view)) }, [view])
 
   useEffect(() => { api.session().then(data => setAuthRequired(data.auth_required)).catch(() => {}) }, [])
 
@@ -75,8 +79,10 @@ export function App() {
     api.jobs(filters).then(data => { setJobs(data); setError('') }).catch(e => setError(e.message))
   }, [view, JSON.stringify(filters), revision])
 
-  useVisiblePolling(refreshDashboard, 6000, 'dashboard')
-  useVisiblePolling(refreshJobs, 10000, JSON.stringify(filters))
+  // Cada consulta acorda o banco: o ritmo rápido só vale enquanto algo está acontecendo (coleta ou pergunta do copiloto).
+  const collectorBusy = dashboard?.collector.state === 'running' || dashboard?.collector.state === 'stopping'
+  useIdlePolling(refreshDashboard, collectorBusy || dashboard?.pending_ask ? 6000 : 15000)
+  useIdlePolling(refreshJobs, view === 'jobs' ? 30000 : null)
 
   function reload() { setRevision(value => value + 1) }
   function show(next: View) {
@@ -118,9 +124,10 @@ export function App() {
     </aside>
     <main className="main">
       <header className="topbar"><div><p className="eyebrow">PAINEL DE OPERAÇÃO</p><h1>{viewLabels[view]}</h1></div><div className="topbar-actions"><button className="secondary" onClick={reload}>Atualizar</button>{authRequired && <form method="post" action="/logout"><button className="secondary" type="submit">Sair</button></form>}</div></header>
+      <DatabaseBanner />
       {error && <div className="banner error" role="alert">{error} <button onClick={reload}>Tentar novamente</button></div>}
       {notice && <div className="banner" role="status">{notice}</div>}
-      <CopilotAsk notify={notify} />
+      <CopilotAsk ask={dashboard?.pending_ask ?? null} notify={notify} onResolved={reload} />
       {view === 'overview' ? <>
         <section className="hero"><div><p className="eyebrow">COLETA</p><h2>{dashboard?.collector.state === 'running' ? 'Buscando novas oportunidades' : 'Pronto para uma nova busca'}</h2><p>{dashboard?.collector.message || 'Carregando estado da coleta…'}</p></div><div className="hero-actions"><button disabled={busy || dashboard?.collector.state === 'running'} onClick={() => collectorAction('start')}>Iniciar bot</button><button className="secondary" disabled={busy || dashboard?.collector.state === 'stopped'} onClick={() => collectorAction('stop')}>Parar bot</button></div></section>
         {dashboard?.collector.state === 'running' || dashboard?.collector.state === 'stopping' ? <ApifyQuotaStrip quota={dashboard.apify_quota} /> : null}
@@ -138,8 +145,9 @@ export function App() {
         {!jobs ? <p className="empty">Carregando vagas…</p> : jobs.items.length ? <div className="job-list">{jobs.items.map(job => <JobCard job={job} statusLabels={statusLabels} onChange={reload} key={job.id} />)}</div> : <p className="empty">Nenhuma vaga corresponde aos filtros. Ajuste o status, o match ou o período.</p>}
         {jobs && jobs.pages > 1 && <div className="pagination"><button className="secondary" disabled={jobs.page <= 1} onClick={() => setFilters(old => ({ ...old, page: String(jobs.page - 1) }))}>Anterior</button><span>Página {jobs.page} de {jobs.pages}</span><button className="secondary" disabled={jobs.page >= jobs.pages} onClick={() => setFilters(old => ({ ...old, page: String(jobs.page + 1) }))}>Próxima</button></div>}
       </> : view === 'triage' ? <TriageView statusLabels={statusLabels} notify={notify} /> : view === 'queue' ? <QueueView statusLabels={statusLabels} notify={notify} /> : view === 'logs' ? <LogsView notify={notify} /> : view === 'usage' ? <UsageView notify={notify} /> : view === 'resumes' ? <ResumesView notify={notify} /> : view === 'assistant' ? <AssistantView notify={notify} /> : null}
-      <div hidden={view !== 'settings'}><SettingsView notify={notify} /></div>
-      <div hidden={view !== 'rules'}><RulesView notify={notify} /></div>
+      {/* Montadas só depois da primeira visita (carregam várias consultas) e mantidas para não perder rascunhos. */}
+      {visited.has('settings') && <div hidden={view !== 'settings'}><SettingsView notify={notify} /></div>}
+      {visited.has('rules') && <div hidden={view !== 'rules'}><RulesView notify={notify} /></div>}
     </main>
   </div>
 }

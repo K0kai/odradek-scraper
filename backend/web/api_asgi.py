@@ -6,6 +6,7 @@ import logging
 import hmac
 import os
 import re
+import threading
 from contextlib import asynccontextmanager
 from email import policy
 from email.parser import BytesParser
@@ -18,7 +19,9 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
 import app as core
-from web import panel_queries, panel_settings
+from data import db_state
+from data.dbutil import describe_db_error
+from web import panel_queries, panel_settings, panel_snapshot
 from jobs.form_rules import list_rules, save_rules_from_form
 from jobs.bulk_ignore import apply as apply_bulk_ignore, criteria_from_body, preview as preview_bulk_ignore
 from jobs.job_queue import KIND_RESUME
@@ -34,19 +37,85 @@ _dist = Path(core.FRONTEND_DIST)
 _log = logging.getLogger(__name__)
 
 
+BOOT_RETRY_MIN_SECONDS = 10.0
+BOOT_RETRY_MAX_SECONDS = 300.0
+_boot_done: set[str] = set()
+_boot_stop = threading.Event()
+
+
+def _boot_steps() -> list[tuple[str, object]]:
+    return [("schema", core.initialize), ("logging", core._boot_logging), ("queue", core._boot_queue),
+            ("scheduler", core._boot_worth_check_scheduler)]
+
+
+def run_boot_steps() -> None:
+    """Passos que dependem do banco, na ordem. Cada um que conclui não repete; o primeiro que falhar levanta."""
+    for name, step in _boot_steps():
+        if name in _boot_done:
+            continue
+        step()  # type: ignore[operator]
+        _boot_done.add(name)
+
+
+def _boot_retry_loop() -> None:
+    delay = BOOT_RETRY_MIN_SECONDS
+    while not _boot_stop.wait(delay):
+        try:
+            run_boot_steps()
+        except Exception as exc:
+            delay = min(BOOT_RETRY_MAX_SECONDS, delay * 2)
+            _log.warning("Boot ainda sem banco (%s); nova tentativa em %.0fs.", describe_db_error(exc)[0], delay)
+            continue
+        _log.info("Banco disponível: serviços de segundo plano iniciados.")
+        return
+
+
+def _flush_on_shutdown() -> None:
+    from data.dbutil import close_pools
+    from integrations.usage_tracker import flush_pending
+    from web.panel_log import flush_logs
+
+    for step in (flush_pending, flush_logs, close_pools):
+        try:
+            step()
+        except Exception:
+            pass
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    core.initialize()
-    core._boot_logging()
-    core._boot_queue()
-    core._boot_worth_check_scheduler()
+    _boot_stop.clear()
+    _boot_done.clear()
+    try:
+        run_boot_steps()
+    except Exception as exc:
+        # Banco fora (cota, senha, rede): abre a porta mesmo assim. O painel serve o último estado em modo leitura e
+        # os serviços (logs, fila, agendador) sobem sozinhos quando o banco voltar, em vez de o deploy cair em loop.
+        _log.error("Banco indisponível no boot (%s); painel em modo leitura, nova tentativa em segundo plano.",
+                   describe_db_error(exc)[0])
+        threading.Thread(target=_boot_retry_loop, daemon=True, name="boot-retry").start()
     try:
         yield
     finally:
+        _boot_stop.set()
         core.queue.stop()
+        _flush_on_shutdown()
 
 
 api = FastAPI(title="Odradek API", lifespan=lifespan)
+
+try:
+    import psycopg
+
+    @api.exception_handler(psycopg.OperationalError)
+    async def database_unavailable(_: Request, exc: psycopg.OperationalError):
+        """Banco fora do ar (cota do Neon, senha, rede): 503 com a causa, em vez de um 500 genérico em todas as telas."""
+        reason, message = describe_db_error(exc)
+        db_state.mark_down(reason, message)
+        _log.error("Banco de dados indisponível (%s): %s", reason, exc.__class__.__name__)
+        return JSONResponse({"error": message, "database": reason}, status_code=503, headers={"Cache-Control": "no-store"})
+except ImportError:  # SQLite local sem psycopg instalado
+    pass
 
 
 @api.middleware("http")
@@ -77,7 +146,7 @@ async def guard(request: Request, call_next):
         request.headers.get("sec-fetch-site"), request.headers.get("referer"), request.url.scheme,
     ):
         return JSONResponse({"error": "Origem não permitida"}, status_code=403)
-    public_path = request.url.path in {"/health", "/odradek-icon.png", "/favicon.ico"}
+    public_path = request.url.path in {"/health", "/health/db", "/odradek-icon.png", "/favicon.ico"}
     login_path = request.url.path in {"/login", "/logout"}
     if not public_path and requires_auth():
         if not configured():
@@ -146,12 +215,21 @@ def session(request: Request):
 
 @api.get("/health", include_in_schema=False)
 def health():
+    """Liveness: não toca no banco. Um health check do Render ou um pinger a cada poucos minutos mantinha o Neon
+    sempre acordado; o estado do banco fica em /health/db (consulta manual)."""
+    return {"ok": True, "service": "odradek-scraper"}
+
+
+@api.get("/health/db", include_in_schema=False)
+def health_db():
     try:
         with core.connect() as db:
             db.execute("SELECT 1")
         return {"ok": True, "service": "odradek-scraper", "database": "ok"}
-    except Exception:
-        return JSONResponse({"ok": False, "service": "odradek-scraper", "database": "unavailable"}, status_code=503)
+    except Exception as exc:
+        reason, _ = describe_db_error(exc)
+        return JSONResponse({"ok": False, "service": "odradek-scraper", "database": "unavailable", "reason": reason},
+                            status_code=503)
 
 
 @api.get("/", include_in_schema=False)
@@ -169,15 +247,17 @@ api.mount("/ui/assets", StaticFiles(directory=str(_dist / "assets"), check_dir=F
 
 @api.get("/api/dashboard")
 def dashboard() -> dict:
-    return panel_queries.dashboard_api_payload()
+    return panel_snapshot.serve("dashboard", panel_queries.dashboard_api_payload)
 
 
 @api.get("/api/jobs")
 def jobs(page: int = 1, page_size: int = 15, status: str = "worth", min_match: int = 0,
          sort: str = "", date_from: str = "", date_to: str = "") -> dict:
     try:
-        return panel_queries.jobs_api_payload(page=page, page_size=page_size, status=status,
-                                     min_match=min_match, sort=sort, date_from=date_from, date_to=date_to)
+        return panel_snapshot.serve(
+            f"jobs:{page}:{page_size}:{status}:{min_match}:{sort}:{date_from}:{date_to}",
+            lambda: panel_queries.jobs_api_payload(page=page, page_size=page_size, status=status,
+                                                   min_match=min_match, sort=sort, date_from=date_from, date_to=date_to))
     except ValueError:
         return JSONResponse({"error": "Parâmetros de filtro inválidos"}, status_code=400)
 
@@ -185,8 +265,10 @@ def jobs(page: int = 1, page_size: int = 15, status: str = "worth", min_match: i
 @api.get("/api/triage")
 def triage(tab: str = "discarded", page: int = 1, page_size: int = 15, min_match: int = 0,
            sort: str = "", date_from: str = "", date_to: str = "", q: str = "") -> dict:
-    return panel_queries.triage_api_payload(tab=tab, page=page, page_size=page_size, min_match=min_match,
-                                            sort=sort, date_from=date_from, date_to=date_to, q=q)
+    return panel_snapshot.serve(
+        f"triage:{tab}:{page}:{page_size}:{min_match}:{sort}:{date_from}:{date_to}:{q}",
+        lambda: panel_queries.triage_api_payload(tab=tab, page=page, page_size=page_size, min_match=min_match,
+                                                 sort=sort, date_from=date_from, date_to=date_to, q=q))
 
 
 @api.post("/api/triage/reviewed")
@@ -229,7 +311,15 @@ def bulk_ignore_apply(body: dict = Body(...)):
 
 @api.get("/api/queue")
 def queue() -> dict:
-    return panel_queries.queue_api_payload()
+    return panel_snapshot.serve("queue", panel_queries.queue_api_payload)
+
+
+@api.get("/api/queue/{queue_id}/progress")
+def queue_item_progress(queue_id: int):
+    detail = panel_queries.queue_progress_api_payload(queue_id)
+    if detail is None:
+        return _error("Item da fila não encontrado.", 404)
+    return detail
 
 
 @api.get("/api/queue/{queue_id}/assessment")
@@ -242,17 +332,27 @@ def queue_item_assessment(queue_id: int):
 
 @api.get("/api/logs")
 def logs(limit: int = 200) -> dict:
-    return panel_queries.logs_api_payload(limit)
+    return panel_snapshot.serve(f"logs:{limit}", lambda: panel_queries.logs_api_payload(limit))
 
 
 @api.get("/api/usage")
 def usage() -> dict:
-    return panel_queries.usage_api_payload()
+    return panel_snapshot.serve("usage", panel_queries.usage_api_payload)
+
+
+@api.post("/api/db/standby-sync")
+async def standby_sync():
+    if not core.standby_status()["configured"]:
+        return _error("Configure DATABASE_URL_STANDBY para ter um banco standby.", 400)
+    result = await run_in_threadpool(core.run_standby_sync)
+    notice = (f"Standby atualizado ({result['rows']} linhas em {result['seconds']}s)." if result["ok"]
+              else f"Falha ao atualizar o standby: {result['error']}")
+    return JSONResponse({"ok": result["ok"], "notice": notice, "result": result}, status_code=200 if result["ok"] else 502)
 
 
 @api.get("/api/resumes")
 def resumes() -> dict:
-    return panel_queries.resumes_api_payload()
+    return panel_snapshot.serve("resumes", panel_queries.resumes_api_payload)
 
 
 @api.get("/api/copilot-asks/pending")
@@ -265,7 +365,7 @@ def pending_ask() -> dict:
 def settings_group(group: str) -> dict:
     if group not in panel_settings.SETTINGS_API_GROUPS:
         return JSONResponse({"error": "Grupo de configuração inválido"}, status_code=404)
-    return panel_settings.settings_api_payload(group)
+    return panel_snapshot.serve(f"settings:{group}", lambda: panel_settings.settings_api_payload(group))
 
 
 @api.get("/api/extension-token")

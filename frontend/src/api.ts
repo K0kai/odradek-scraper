@@ -75,6 +75,7 @@ export type Dashboard = {
   collector: Collector
   status_labels: Record<string, string>
   apify_quota: ApifyQuota | null
+  pending_ask?: CopilotAsk | null
 }
 
 export type JobList = {
@@ -135,7 +136,8 @@ export type QueueItem = {
   created_at: string
   updated_at: string
   last_step: string
-  progress: string
+  progress: string       // só o final do histórico; o completo vem de /api/queue/{id}/progress
+  progress_more?: boolean
   outcome: string
   subject: QueueSubject | null
   decision: QueueDecision | null
@@ -169,11 +171,14 @@ export type TokenHarborQuota = {
   models_enabled?: boolean
   fetched_at?: string
 }
+export type StandbySync = { ok: boolean; at: string; error: string; rows: number; seconds: number; tables: Record<string, number> }
+export type StandbyStatus = { configured: boolean; last: StandbySync | null }
 export type UsageData = {
   provider: string
   model: string
   apify: ApifyQuota
   tokenharbor: TokenHarborQuota
+  standby?: StandbyStatus
   ai: {
     day_label: string
     month_label: string
@@ -228,7 +233,31 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     } catch { /* Keep the HTTP error. */ }
     throw new Error(message)
   }
-  return response.json() as Promise<T>
+  const data = await response.json() as T
+  if (!init?.method || init.method === 'GET') reportDatabaseState(data)
+  return data
+}
+
+// Com o banco fora o servidor devolve o último estado conhecido marcado com `stale`. A UI mostra um aviso global.
+export type DatabaseNotice = { reason: string; message: string; asOf: string }
+type Listener = (notice: DatabaseNotice | null) => void
+const databaseListeners = new Set<Listener>()
+let databaseNotice: DatabaseNotice | null = null
+
+function reportDatabaseState(data: unknown) {
+  const payload = data && typeof data === 'object' ? data as { stale?: boolean; database?: string; database_message?: string; as_of?: string } : {}
+  const next = payload.stale
+    ? { reason: payload.database || 'unavailable', message: payload.database_message || '', asOf: payload.as_of || '' }
+    : null
+  if (JSON.stringify(next) === JSON.stringify(databaseNotice)) return
+  databaseNotice = next
+  databaseListeners.forEach(listener => listener(next))
+}
+
+export function subscribeDatabaseNotice(listener: Listener): () => void {
+  databaseListeners.add(listener)
+  listener(databaseNotice)
+  return () => { databaseListeners.delete(listener) }
 }
 
 function postForm<T>(path: string, fields: Record<string, string>): Promise<T> {
@@ -267,6 +296,8 @@ export const api = {
   notes: (id: number, notes: string) => request<{ notice: string }>(`/api/jobs/${id}/notes`, { method: 'POST', body: JSON.stringify({ notes }) }),
   queue: () => request<QueueData>('/api/queue'),
   logs: () => request<{ items: LogItem[] }>('/api/logs'),
+  queueProgress: (id: number) => request<{ progress: string }>(`/api/queue/${id}/progress`),
+  standbySync: () => request<{ ok: boolean; notice: string; result: StandbySync }>('/api/db/standby-sync', { method: 'POST' }),
   queueAssessment: (id: number) => request<{ assessment: Assessment | null }>(`/api/queue/${id}/assessment`),
   queueItem: (id: number, action: 'cancel' | 'retry') => request<{ notice: string }>(`/api/queue/${id}/${action}`, { method: 'POST' }),
   queueAction: (action: 'retry-all' | 'evaluate-new' | 'clear') => request<{ notice: string }>(`/api/queue/${action}`, { method: 'POST' }),

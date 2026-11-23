@@ -11,7 +11,7 @@ A **personal, educational** project for exploring the following in a local envir
 
 The interface code lives in `frontend/`. The API, collection, and business modules live in `backend/`. The SQLite database and persistent files remain in the project root to preserve existing local data.
 
-Database access uses Neon/PostgreSQL when `DATABASE_URL` is set. Without it, the app uses the local `jobs.db` SQLite fallback, including isolated local tests.
+Database access uses PostgreSQL (Supabase/Neon) when `DATABASE_URL` is set. Without it, the app uses the local `jobs.db` SQLite fallback, including isolated local tests.
 
 Within `backend/`, `web/` contains routes, authentication, and panel responses; `data/` contains database and secrets; `jobs/` contains queues, filters, and rules; `candidate/` contains resume processing and candidate context; `integrations/` contains external clients. `app.py` coordinates collection and workflows.
 
@@ -72,15 +72,20 @@ Open `http://127.0.0.1:8765`. Local access is open by default. Set `PANEL_PASSWO
 
 Each click on **Iniciar bot** (Start bot) runs a single collection cycle and stops automatically. To search again, click **Iniciar bot** once more. There is no recurring schedule or automatic interval; **Parar bot** (Stop bot) interrupts the current cycle.
 
-## Deployment with Neon/PostgreSQL
+## Deployment with PostgreSQL (Supabase or Neon) and a standby
 
-- The application uses local SQLite when `DATABASE_URL` is not set, and PostgreSQL when it points to Neon.
-- Run the complete PostgreSQL schema (tables, indexes, and default values) in the Neon SQL Editor before starting the application.
-- To copy local data to Neon, stop the hosted service and run `python backend/migrate_sqlite_to_neon.py` on the computer containing `jobs.db`, with `DATABASE_URL` set to the Neon connection string. The script imports tables and data, preserves local settings, and replaces the initial rules and first-boot logs with the local versions.
+- The application uses local SQLite when `DATABASE_URL` is not set, and PostgreSQL (Supabase, Neon or any other) when it points to one. On an empty Postgres, startup creates the whole versioned schema from `backend/data/schema_postgres.sql` by itself; no manual SQL is needed.
+- **Recommended: Supabase as primary, Neon as standby.** Neon Free has 100 CU-hours of compute per month and, once exceeded, refuses every connection until the next cycle (the dashboard answers 503 with the cause). Supabase Free runs on a fixed instance with no compute-hour quota (500 MB database, 5 GB egress; paused after 1 week of inactivity).
+  1. In Supabase, create the project and copy the **pooler** URL (Connect › Session pooler or Transaction pooler, port 5432/6543). Use the pooler, not the direct connection: the direct one is IPv6-only and Render cannot reach it. The app already disables prepared statements, which transaction mode requires.
+  2. Copy the current data: `cd backend && python db_copy.py --from "$NEON_URL" --to "$SUPABASE_URL"` (SQLite or Postgres on either side; `--dry-run` only counts rows). The target is replaced in a single transaction and id sequences are realigned. The script refuses to copy onto the active `DATABASE_URL` without `--force`.
+  3. On Render, set `DATABASE_URL` (Supabase) and `DATABASE_URL_STANDBY` (Neon). Every day after 04:00 (Brasília time) the app copies the primary to the standby; the result shows on **Uso** (Usage), which also has a **Sincronizar standby agora** (sync standby now) button.
+  4. If the primary goes down, swap `DATABASE_URL` for the standby URL on Render and restart. When the primary is back, run `db_copy.py --from standby --to primary` and revert the variable.
+- With the database down the server stays up: `/health` answers 200 without touching the database (use it as Render's Health Check Path), `/health/db` tests the connection and reports the reason, the screens show the last known state with a read-only notice, and startup finishes on its own when the database returns.
+- To spend little Neon compute: in its console, cap compute at **0.25 CU** (with autoscaling up to 2 CU the quota runs out 8x faster) and make sure no pinger or Health Check hits a route that queries the database. The app batches writes (logs, AI usage), reuses connections (`psycopg-pool`; `DB_POOL_DISABLED=1` turns it off, `DB_POOL_MAX` tunes the limit), and the UI stops polling the server after ~10 minutes without interaction.
+- To copy local data (`jobs.db`) to Postgres, stop the hosted service and run `python backend/migrate_sqlite_to_neon.py` (a shortcut for `db_copy.py` from `jobs.db` to `DATABASE_URL`).
 - Configure the same `DATABASE_URL` as a secret environment variable in Render. Never save it in the repository.
 - Render does not provide the operating system credential store used by local `keyring`. To save and update keys through the dashboard, configure `SECRET_ENCRYPTION_KEY` **once** under **Environment**. Generate a Fernet key locally with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`, copy the result to Render, and keep a secure backup: saved secrets cannot be decrypted without that same key. API keys are encrypted with Fernet before being stored as internal values in the Postgres `settings` table. Environment variables such as `GEMINI_API_KEY`, `OPENAI_API_KEY`, `ADZUNA_APP_ID`, `ADZUNA_APP_KEY`, `APIFY_TOKEN`, and `SMTP_PASSWORD` are still accepted as fallbacks, but secrets saved to the database through the dashboard take priority.
-- Résumés and uploaded files are stored in the filesystem, not in the database. Configure a persistent disk in Render and set `RESUMES_DIR` and `COPILOT_UPLOADS_DIR` to directories on that disk. Copy the local files there before using the migrated records.
-- The dashboard has no authentication. Do not expose it publicly until access protection is in place.
+- Résumé PDFs live in the database (`resume_files`); other uploaded files in `COPILOT_UPLOADS_DIR` still need a persistent disk. On Render, `PANEL_PASSWORD` is required and protects the dashboard and API with a 7-day cookie session.
 - The server does not submit job applications through a browser. For jobs with an application form, use **Abrir vaga + extensão** (Open job + extension) and manually import your profile using the extension's button; review the fields and submit the application in Chrome. The AI never sends email on its own: for approved jobs with a contact email in the posting, the card lists the detected addresses and a confirmed **Enviar por e-mail** (send by email) button sends the cover letter and resume through SMTP. The `/api/autofill-rules` endpoint shares only field names and aliases with the extension.
 
 ## Privacy and what to keep out of version control
