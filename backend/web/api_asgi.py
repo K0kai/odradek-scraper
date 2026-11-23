@@ -447,6 +447,20 @@ def _collector_action(action: str, max_apply: int | None = None):
     return {"ok": True, "notice": notice, "collector": core.collector.snapshot()}
 
 
+@api.post("/api/jobs/{job_id}/send-email")  # antes de /{action}, que responderia 404 a este caminho
+def send_job_email(job_id: int, body: dict = Body(...)):
+    recipients = body.get("recipients")
+    if not isinstance(recipients, list) or not all(isinstance(item, str) for item in recipients) or len(recipients) > 10:
+        return _error("Destinatários inválidos")
+    try:
+        detail = core.send_application_email(job_id, recipients)
+    except ValueError as exc:
+        return _error(str(exc))
+    except Exception as exc:
+        return _error(f"Falha ao enviar o e-mail: {exc}", 502)
+    return {"ok": True, "notice": detail, "id": job_id}
+
+
 @api.post("/api/jobs/{job_id}/{action}")
 def update_job(job_id: int, action: str, body: dict = Body(...)):
     if action not in {"status", "notes"}:

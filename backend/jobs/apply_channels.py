@@ -28,6 +28,11 @@ def extract_emails(text: str) -> list[str]:
     return found
 
 
+def job_contact_emails(job: dict) -> list[str]:
+    """E-mails de contato que aparecem na descrição, URL ou nome da empresa da vaga."""
+    return extract_emails(" ".join((job.get("description") or "", job.get("url") or "", job.get("company") or "")))
+
+
 def send_smtp_email(
     *,
     cfg: dict[str, str],
@@ -111,9 +116,9 @@ def apply_via_email(
     cover_letter_id: int | None,
     smtp_password: str,
     now_iso: str,
+    recipients: list[str] | None = None,
 ) -> tuple[bool, str]:
-    blob = " ".join((job.get("description") or "", job.get("url") or "", job.get("company") or ""))
-    recipients = extract_emails(blob)
+    recipients = recipients if recipients is not None else job_contact_emails(job)
     if not recipients:
         return False, "Nenhum e-mail de contato encontrado na vaga."
     if not (cfg.get("smtp_host") or "").strip():

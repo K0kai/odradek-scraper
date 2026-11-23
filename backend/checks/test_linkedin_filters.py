@@ -452,6 +452,64 @@ class TriageEndToEndTests(AppDbCase):
             self.assertEqual(db.execute("SELECT status FROM jobs WHERE id=1").fetchone()["status"], "worth")
 
 
+class EmailConfirmationTests(AppDbCase):
+    """A IA aprova e prepara a carta, mas o e-mail só sai quando o usuário confirma no card."""
+
+    def triage_email_job(self):
+        self.seed_resume("pt")
+        self.seed_job(description=JOB_HTML + "<p>Envie seu CV para rh@acme.com ou noreply@acme.com</p>")
+        with patch.object(app, "_assessment_caller", TriageEndToEndTests.fake_caller(base_raw())), \
+                patch.object(app, "ai_generate_letter", lambda *a, **k: "Carta."), \
+                patch("jobs.apply_channels.send_smtp_email") as smtp:
+            message = app.process_auto_job(1)
+        return message, smtp
+
+    def test_triage_never_sends_email_and_waits_for_confirmation(self):
+        message, smtp = self.triage_email_job()
+        smtp.assert_not_called()
+        self.assertIn("aguardando sua confirmação", message)
+        with repository.connect() as db:
+            job = db.execute("SELECT status, notes FROM jobs WHERE id=1").fetchone()
+            sent = db.execute("SELECT COUNT(*) AS n FROM applications WHERE channel='email'").fetchone()["n"]
+        self.assertEqual(job["status"], "worth")
+        self.assertIn("rh@acme.com", job["notes"])
+        self.assertIn("nada foi enviado", job["notes"])
+        self.assertEqual(sent, 0)
+
+    def test_confirmed_send_only_accepts_addresses_found_in_the_job(self):
+        self.triage_email_job()
+        repository.save_settings({"smtp_host": "smtp.test"})
+        with patch("jobs.apply_channels.send_smtp_email") as smtp, \
+                patch("candidate.resume_storage.materialize_pdf", return_value="/tmp/cv.pdf"):
+            with self.assertRaises(ValueError):
+                app.send_application_email(1, ["intruso@elsewhere.com"])
+            smtp.assert_not_called()
+            detail = app.send_application_email(1, ["RH@acme.com", "intruso@elsewhere.com"])
+        self.assertEqual(smtp.call_args.kwargs["to_addrs"], ["rh@acme.com"])
+        self.assertIn("rh@acme.com", detail)
+        with repository.connect() as db:
+            self.assertEqual(db.execute("SELECT status FROM jobs WHERE id=1").fetchone()["status"], "applied")
+            self.assertEqual(db.execute("SELECT status FROM applications WHERE channel='email'").fetchone()["status"], "sent")
+        with self.assertRaises(ValueError):  # não reenvia uma vaga já aplicada
+            app.send_application_email(1, ["rh@acme.com"])
+
+    def test_failed_smtp_keeps_the_job_for_another_attempt(self):
+        self.triage_email_job()
+        repository.save_settings({"smtp_host": "smtp.test"})
+        with patch("jobs.apply_channels.send_smtp_email", side_effect=OSError("smtp down")), \
+                patch("candidate.resume_storage.materialize_pdf", return_value="/tmp/cv.pdf"):
+            with self.assertRaises(RuntimeError):
+                app.send_application_email(1, ["rh@acme.com"])
+        with repository.connect() as db:
+            self.assertEqual(db.execute("SELECT status FROM jobs WHERE id=1").fetchone()["status"], "worth")
+
+    def test_job_payload_lists_contact_emails_without_noreply(self):
+        self.triage_email_job()
+        from web import panel_queries
+        item = panel_queries.jobs_api_payload(status="worth")["items"][0]
+        self.assertEqual(item["contact_emails"], ["rh@acme.com"])
+
+
 class IndiaExclusionTests(unittest.TestCase):
     def test_location_in_india_is_excluded_by_country_city_or_state(self):
         for location in ("India", "Bengaluru, Karnataka, India", "Hyderabad, Telangana", "Greater Pune Area", "Noida"):

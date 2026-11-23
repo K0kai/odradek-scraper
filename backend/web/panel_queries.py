@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 
 from app import STATUSES, collector, connect, load_apify_quota_snapshot, queue, settings
 from integrations.ai_client import split_model_label
+from jobs.apply_channels import job_contact_emails
 from jobs.job_filters import _worth_match_expr, normalize_worth_sort, worth_date_bounds_utc, worth_order_sql
 from web.panel_log import list_logs
 from candidate.resume_pipeline import get_resume
@@ -52,6 +53,7 @@ def _compact_assessment(raw: object) -> dict | None:
 def _job_api_record(row) -> dict:
     """Keep the browser contract independent from database row implementations."""
     data = dict(row)
+    data["contact_emails"] = job_contact_emails(data)[:3]  # antes de truncar a descrição
     data["assessment"] = _compact_assessment(data.pop("assessment_json", None))
     data["description"] = re.sub(r"<[^>]+>", " ", data.get("description") or "")[:1800]
     data["match_score"] = int(data["match_score"]) if data.get("match_score") is not None else None

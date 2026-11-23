@@ -16,7 +16,7 @@ from urllib.request import Request, urlopen
 
 from data.repository import connect, initialize, settings, save_settings, set_setting
 from data.secrets import SecretStore
-from jobs.apply_channels import apply_via_email, record_blocked
+from jobs.apply_channels import apply_via_email, job_contact_emails, record_blocked
 from dates_br import BRASILIA, format_cycle_range, parse_utc
 
 from jobs.job_queue import (
@@ -383,10 +383,6 @@ def process_auto_job(job_id: int, progress: ProgressFn = noop_progress) -> str:
         progress(f"Falha ao gerar a carta: {exc}")
         return f"vaga {job_id}: falha na carta"
 
-    with connect() as db:
-        letter_row = db.execute("SELECT * FROM cover_letters WHERE job_id=?", (job_id,)).fetchone()
-    cover_body = letter_row["body"] if letter_row else ""
-    stamp = now_iso()
     score = int(decision["match_score"])
     progress("Carta de apresentação pronta")
 
@@ -401,40 +397,75 @@ def process_auto_job(job_id: int, progress: ProgressFn = noop_progress) -> str:
         )
         return f"vaga {job_id}: vale a pena olhar (LinkedIn, score {score})"
 
-    from candidate.resume_storage import materialize_pdf
-    with connect() as db:
-        resume_path = materialize_pdf(db, resume, RESUMES_DIR)
-    ok, detail = apply_via_email(
-        connect,
-        job,
-        cfg,
-        cover_letter=cover_body,
-        resume_path=resume_path,
-        resume_id=int(resume["id"]),
-        cover_letter_id=cover_id,
-        smtp_password=secret_get("smtp_password"),
-        now_iso=stamp,
-    )
-    channel = "email"
-    if not ok:
-        progress(f"Envio por e-mail indisponível, movida para 'Vale a pena olhar': {detail}")
+    # A IA nunca envia e-mail sozinha: com contato detectado, a vaga espera a confirmação do usuário no card
+    # (send_application_email). Sem contato, só a candidatura manual pela extensão resta.
+    recipients = job_contact_emails(job)
+    if not recipients:
+        detail = "Nenhum e-mail de contato encontrado na vaga."
+        progress(f"{detail} Movida para 'Vale a pena olhar' (candidatura manual pela extensão)")
         record_blocked(connect, job_id, detail, now_iso(), int(resume["id"]), cover_id)
         mark_worth_looking(
             job_id,
             score=score,
             reason=decision["reason"],
-            detail=f"Envio por e-mail indisponível ({detail}). Abra a vaga no Chrome e use Odradek Autofill.",
+            detail=f"Envio por e-mail indisponível ({detail}) Abra a vaga no Chrome e use Odradek Autofill.",
         )
         return f"vaga {job_id}: vale a pena olhar — {detail}"
+    shown = ", ".join(recipients[:3])
+    progress(f"E-mail de contato detectado ({shown}). Nada foi enviado: aguardando sua confirmação no card da vaga")
+    mark_worth_looking(
+        job_id,
+        score=score,
+        reason=decision["reason"],
+        detail=f"E-mail de contato detectado ({shown}). Revise a carta e confirme o envio no card da vaga; nada foi enviado.",
+    )
+    return f"vaga {job_id}: vale a pena olhar — e-mail de contato detectado, aguardando sua confirmação (score {score})"
+
+
+def send_application_email(job_id: int, recipients: list[str]) -> str:
+    """Envio por e-mail confirmado pelo usuário no card. Só aceita endereços detectados na própria vaga."""
+    from candidate.resume_storage import materialize_pdf
+
+    cfg = settings()
+    with connect() as db:
+        job_row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if not job_row:
+            raise ValueError("Vaga não encontrada.")
+        job = dict(job_row)
+        if job["status"] == "applied":
+            raise ValueError("Esta vaga já está marcada como aplicada.")
+        letter = db.execute("SELECT id, body FROM cover_letters WHERE job_id=?", (job_id,)).fetchone()
+        decision = db.execute(
+            "SELECT resume_language FROM ai_decisions WHERE job_id=? ORDER BY id DESC LIMIT 1", (job_id,)
+        ).fetchone()
+        language = (decision["resume_language"] if decision and decision["resume_language"] else job.get("language")) or "pt"
+        resume = get_resume(db, language) or get_resume(db, "en" if language == "pt" else "pt")
+        detected = {email.casefold(): email for email in job_contact_emails(job)}
+        chosen = list(dict.fromkeys(detected[item.strip().casefold()] for item in recipients if item.strip().casefold() in detected))[:3]
+        if not chosen:
+            raise ValueError("Escolha ao menos um e-mail de contato detectado na vaga.")
+        if not letter or not (letter["body"] or "").strip():
+            raise ValueError("A vaga não tem carta de apresentação; gere a carta antes de enviar.")
+        if not resume or not (resume["analysis_summary"] or "").strip():
+            raise ValueError("Nenhum currículo analisado para anexar.")
+        resume_path = materialize_pdf(db, resume, RESUMES_DIR)
+    ok, detail = apply_via_email(
+        connect, job, cfg,
+        cover_letter=letter["body"], resume_path=resume_path, resume_id=int(resume["id"]),
+        cover_letter_id=int(letter["id"]), smtp_password=secret_get("smtp_password"), now_iso=now_iso(),
+        recipients=chosen,
+    )
+    if not ok:
+        log_event("error", "email", f"Vaga #{job_id}: envio por e-mail falhou: {detail}")
+        raise RuntimeError(detail)
     with connect() as db:
         db.execute("UPDATE jobs SET status='applied', applied_at=?, notes=? WHERE id=?", (now_iso(), detail[:900], job_id))
         db.execute(
             "UPDATE ai_decisions SET apply_channel=?, apply_result=? WHERE id=(SELECT MAX(id) FROM ai_decisions WHERE job_id=?)",
-            (channel, detail[:500], job_id),
+            ("email", detail[:500], job_id),
         )
-    log_event("success", "auto-apply", f"Vaga #{job_id} aplicada via {channel}: {detail}")
-    progress(f"Candidatura enviada via {channel}: {detail}")
-    return f"vaga {job_id}: aplicada via {channel} — {detail}"
+    log_event("success", "email", f"Vaga #{job_id} aplicada via e-mail (confirmado no painel): {detail}")
+    return detail
 
 
 def enqueue_new_jobs_for_triage(limit: int | None = None) -> str:

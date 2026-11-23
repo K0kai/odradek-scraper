@@ -30,6 +30,32 @@ export function AssessmentView({ assessment, open }: { assessment: Assessment; o
   </details>
 }
 
+function EmailApply({ job, onSent }: { job: Job; onSent: () => void }) {
+  const emails = job.contact_emails || []
+  const [picked, setPicked] = useState<string[]>(emails)
+  const [confirming, setConfirming] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [message, setMessage] = useState('')
+  async function send() {
+    setBusy(true); setMessage('')
+    try { const result = await api.sendEmail(job.id, picked); setMessage(result.notice); setConfirming(false); onSent() }
+    catch (error) { setMessage((error as Error).message) }
+    finally { setBusy(false) }
+  }
+  function toggle(email: string) { setConfirming(false); setPicked(current => current.includes(email) ? current.filter(item => item !== email) : [...current, email]) }
+  return <div className="job-details email-apply">
+    <strong>Candidatura por e-mail</strong>
+    <p className="section-description">A IA não envia sozinha. Estes contatos foram detectados no texto da vaga; confira se pertencem à empresa. O e-mail leva a carta acima e o currículo em PDF.</p>
+    <ul className="assessment-list">{emails.map(email => <li key={email}><label><input type="checkbox" checked={picked.includes(email)} onChange={() => toggle(email)} /> {email}</label></li>)}</ul>
+    <div className="job-actions">
+      {!confirming
+        ? <button disabled={busy || picked.length === 0} onClick={() => setConfirming(true)}>Enviar por e-mail…</button>
+        : <><button disabled={busy} onClick={send}>{busy ? 'Enviando…' : `Confirmar envio para ${picked.join(', ')}`}</button><button className="secondary" disabled={busy} onClick={() => setConfirming(false)}>Cancelar</button></>}
+    </div>
+    {message && <p className="inline-message" role="status">{message}</p>}
+  </div>
+}
+
 export function JobCard({ job, statusLabels, onChange, actions }: {
   job: Job
   statusLabels: Record<string, string>
@@ -81,6 +107,7 @@ export function JobCard({ job, statusLabels, onChange, actions }: {
         <a className="open-link" href={`/cover-letter.pdf?job_id=${job.id}`}>Baixar carta em PDF</a>
       </div>
     </details>}
+    {job.status !== 'applied' && job.has_cover_letter && (job.contact_emails?.length ?? 0) > 0 && <EmailApply job={job} onSent={onChange} />}
     <div className="job-actions">
       {job.url && <a className="open-link" href={job.url} target="_blank" rel="noreferrer">Abrir vaga</a>}
       {job.status !== 'applied' && <button className="secondary" disabled={busy} onClick={() => changeStatus('applied')}>Marcar aplicada</button>}

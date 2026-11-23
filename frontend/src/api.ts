@@ -55,6 +55,7 @@ export type Job = {
   match_score: number | null
   has_cover_letter: boolean
   cover_letter: string
+  contact_emails?: string[]
   assessment?: Assessment | null
 }
 
@@ -243,6 +244,7 @@ export const api = {
   }),
   collector: (action: 'start' | 'stop') => request<{ notice: string }>(`/api/collector/${action}`, { method: 'POST' }),
   status: (id: number, status: string) => request<{ notice: string }>(`/api/jobs/${id}/status`, { method: 'POST', body: JSON.stringify({ status }) }),
+  sendEmail: (id: number, recipients: string[]) => request<{ notice: string }>(`/api/jobs/${id}/send-email`, { method: 'POST', body: JSON.stringify({ recipients }) }),
   notes: (id: number, notes: string) => request<{ notice: string }>(`/api/jobs/${id}/notes`, { method: 'POST', body: JSON.stringify({ notes }) }),
   queue: () => request<QueueData>('/api/queue'),
   logs: () => request<{ items: LogItem[] }>('/api/logs'),
